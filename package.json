@@ -1,0 +1,63 @@
+{
+  "name": "pi-agent-deck",
+  "version": "0.9.0",
+  "description": "Pi 中文多 Agent 扩展：Claude 风格工具、后台任务面板、上下文续接与 Jev 模型/思考强度选配",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "multi-agent",
+    "subagent"
+  ],
+  "files": [
+    "src",
+    "agents",
+    "README.md",
+    "DEVELOPMENT.md",
+    "LICENSE",
+    "docs/jev-routing.md",
+    "docs/0.8.0-release.md",
+    "docs/0.9.0-release.md",
+    "docs/evidence/0.9.0/tui-preview.html",
+    "docs/publishing.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit && node --check src/runner.mjs && node --check src/router.mjs && node --check src/persistence.mjs",
+    "test": "node --import ./test/environment.mjs --import tsx --test --test-concurrency=1 test/*.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": ">=0.84.3",
+    "@earendil-works/pi-coding-agent": ">=0.84.3",
+    "@earendil-works/pi-ai": ">=0.84.3",
+    "@earendil-works/pi-tui": ">=0.84.3",
+    "typebox": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.84.3",
+    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@earendil-works/pi-ai": "^0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axgiroud312-byte/pi-agent-deck.git"
+  },
+  "homepage": "https://github.com/axgiroud312-byte/pi-agent-deck#readme",
+  "bugs": {
+    "url": "https://github.com/axgiroud312-byte/pi-agent-deck/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

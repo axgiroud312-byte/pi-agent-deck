@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "note": "Heuristic starting profiles, not benchmark results. Pi off maps to Sol none. Verify quality and latency on local tasks.",
+  "sources": [
+    "https://developers.openai.com/api/docs/models/gpt-6-astra",
+    "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+  ],
+  "profiles": [
+    {
+      "id": "sol_none",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "off",
+      "criteria": "Fixed-format extraction or transformation of supplied facts, with virtually no reasoning. Trial profile; avoid uncertain or multi-step work."
+    },
+    {
+      "id": "sol_low",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "low",
+      "criteria": "Short, explicit, well-bounded task: locate known symbols, explain a small function, or apply a straightforward change."
+    },
+    {
+      "id": "sol_medium",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "medium",
+      "criteria": "Routine development, local diagnosis, tests and ordinary review with clear scope and acceptance. Default starting point for everyday engineering."
+    },
+    {
+      "id": "sol_high",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "high",
+      "criteria": "Substantial but bounded module debugging, refactoring, or review needing several linked reasoning steps."
+    },
+    {
+      "id": "sol_xhigh",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "xhigh",
+      "criteria": "Unusually difficult bounded reasoning where extra deliberation is useful; compare against Astra on actual outcomes."
+    },
+    {
+      "id": "sol_max",
+      "modelId": "gpt-5.6-sol",
+      "thinking": "max",
+      "criteria": "Exceptional bounded tasks where maximum Sol deliberation is plausibly justified and latency is secondary; require evaluation evidence for frequent use."
+    },
+    {
+      "id": "astra_low",
+      "modelId": "gpt-6-astra",
+      "thinking": "low",
+      "criteria": "Strong interpretation of complex instructions or subtle constraints, but a short reasoning path; not a universal upgrade over Sol high."
+    },
+    {
+      "id": "astra_medium",
+      "modelId": "gpt-6-astra",
+      "thinking": "medium",
+      "criteria": "Complex work spanning modules or competing constraints, requiring stronger integration and judgment."
+    },
+    {
+      "id": "astra_high",
+      "modelId": "gpt-6-astra",
+      "thinking": "high",
+      "criteria": "Deep diagnosis or review of interacting systems, concurrency, state transitions, security boundaries, or high-impact architectural choices."
+    },
+    {
+      "id": "astra_xhigh",
+      "modelId": "gpt-6-astra",
+      "thinking": "xhigh",
+      "criteria": "Very difficult evidence-rich problems with many interacting constraints or hypotheses, where extended reasoning is justified."
+    },
+    {
+      "id": "astra_max",
+      "modelId": "gpt-6-astra",
+      "thinking": "max",
+      "criteria": "Hardest quality-first tasks needing maximal deliberation; use sparingly until real evaluations demonstrate benefit."
+    }
+  ]
+}
+
