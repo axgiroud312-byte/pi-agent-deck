@@ -50,7 +50,7 @@
 
 主 Agent 决定数量、角色、依赖和验收。Jev 只为新任务选择模型与思考强度，不修改角色配置。Runner 在后台选配；先记录 PID，再进行远程请求。启动与取消共享 spawn.lock；持久取消标记在显式继续时清除。已选参数原子写回 request.json，继续时不重新选配。
 
-模型策略与组合集中于 `model-profiles.json`。审查（id=reviewer 或 reportProfile=审查）仅允许 GPT-5.6 Sol / xhigh、max；非审查禁止 GPT-5.6 Sol；GPT-6 Sol/Luna 最低 high；Astra 保留 low 到 max。共 13 个组合，分为审查 2 个、非审查 11 个。关闭 Jev、显式覆盖、模型别名、失败回退均不能绕过策略。继承值可调整到同一提供商的合规组合；显式冲突派遣前报错。候选还必须经过模型支持档位和有效映射筛选。Sol/Luna 的 Chat Completions 工具档位 off 低于策略下限，因此无有效候选。组合用途描述属于启发式策略，不能写成实测排名。
+模型策略与组合集中于 `model-profiles.json`。审查（id=reviewer 或 reportProfile=审查）仅允许 GPT-5.6 Sol / xhigh、max；非审查禁止 GPT-5.6 Sol；GPT-6 Sol/Luna 最低 high；Astra 写入 policy.disabledModels，对所有子 Agent 停用。共 8 个组合，分为审查 2 个、非审查 6 个。关闭 Jev、显式覆盖、模型别名、失败回退均不能绕过策略。模型菜单和角色生成过滤停用模型，保存角色仍执行策略校验。主会话模型不受子 Agent 停用策略影响。继承值可调整到同一提供商的合规组合；显式冲突派遣前报错。候选还必须经过模型支持档位和有效映射筛选。Sol/Luna 的 Chat Completions 工具档位 off 低于策略下限，因此无有效候选。组合用途描述属于启发式策略，不能写成实测排名。
 
 RunnerRequest.review 保存创建时的审查标记；删除 routing 后继续仍使用该快照。runtime 与独立 runner 在进程启动边界执行 router.mjs 的同一校验。旧排队任务违反策略则持久化失败；旧终态继续在修改请求和消息队列前拒绝。自动补充若因策略失败，设置 policyBlocked 防止无限重试，保留旧结果和待处理文字。旧记录没有审查标记时仅能可靠识别内置 reviewer；自定义审查须补标记后新建任务。已运行进程不自动换模或终止。
 

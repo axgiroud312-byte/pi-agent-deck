@@ -7,6 +7,7 @@ import { parseAgentDefinition, validateAgentDefinition } from "./agents.ts";
 import { parseDeckConfig, readDeckConfig, writeDeckConfig, type DeckConfig } from "./config.ts";
 import { frame, plain } from "./presentation.ts";
 import { withDiskLock } from "./persistence.mjs";
+import { EXECUTION_POLICY } from "./router.mjs";
 import type { AgentDefinition } from "./types.ts";
 import { selectMenu as choose } from "./menu.ts";
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -116,7 +117,7 @@ async function readOptional(file: string): Promise<string | undefined> {
 }
 
 async function chooseModel(ctx: ExtensionContext): Promise<string | undefined> {
-  const models = ctx.modelRegistry.getAvailable();
+  const models = ctx.modelRegistry.getAvailable().filter((model) => !EXECUTION_POLICY.disabledModels.includes(model.id));
   const providers = [...new Set(models.map((model) => model.provider))].sort();
   const provider = await choose(ctx, "选择模型来源", [
     { value: "inherit", label: "自动选配（始终遵守角色策略）" },

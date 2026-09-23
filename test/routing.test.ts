@@ -19,17 +19,18 @@ const luna6 = { ...sol6, id: "gpt-6-luna" };
 const reviewer = discoverAgents(process.cwd()).find((agent) => agent.id === "reviewer")!;
 const context = (models = [sol, astra, sol6, luna6], model = sol6) => ({ model, modelRegistry: { getAvailable: () => models, find: (provider: string, id: string) => models.find((item) => item.provider === provider && item.id === id) } });
 const plan = () => prepareRouting(role, "调查认证失败，报告根因与证据", context(), structuredClone(DEFAULT_CONFIG), "high");
-function answer(p: RoutingPlan, choice = "astra_high") {
+function answer(p: RoutingPlan, choice = "luna6_xhigh") {
   const probabilities = Object.fromEntries([...p.candidates.map((item) => item.id), "no_match"].map((id) => [id, id === choice ? 1 : 0]));
   return { model: "jev-1.13.0", answers: { execution_profile: { type: "choice", choice, confidence: 1, probabilities } }, usage: { input_tokens: 200, output_tokens: 0 } };
 }
 const fake = (body: any, status = 200) => (async () => Response.json(body, { status })) as typeof fetch;
 
-test("四模型共 13 组合；非审查池 11 个，审查池仅 GPT-5.6 Sol 的两档", async () => {
+test("停用 Astra 后三模型共 8 组合；非审查池 6 个，审查池仅 GPT-5.6 Sol 的两档", async () => {
   const p = plan();
-  assert.equal(MODEL_PROFILES.length, 13);
-  assert.equal(p.candidates.length, 11);
-  assert.equal(new Set(p.candidates.map((item) => item.id)).size, 11);
+  assert.equal(MODEL_PROFILES.length, 8);
+  assert.equal(p.candidates.length, 6);
+  assert.equal(new Set(p.candidates.map((item) => item.id)).size, 6);
+  assert.ok(p.candidates.every((item) => !item.model.endsWith("/gpt-6-astra")));
   assert.ok(p.candidates.every((item) => !item.model.endsWith("/gpt-5.6-sol")));
   assert.deepEqual(p.fallback, { model: "openai-codex/gpt-6-sol", thinking: "high" });
   for (const model of [sol6, luna6]) {
@@ -103,36 +104,53 @@ test("显式角色与覆盖值不能绕过专用模型和强度下限；自动�
   }
 });
 
-test("明确配置限制候选并跳过 Jev；未限定模型的低强度可选择 Astra", async () => {
-  const byModel = prepareRouting({ ...role, model: "openai-codex/gpt-6-astra" }, "调查", context(), DEFAULT_CONFIG, "medium");
-  assert.equal(byModel.candidates.length, 5);
+test("明确配置限制候选并跳过 Jev；剩余模型不接受固定的 low 强度", async () => {
+  const byModel = prepareRouting({ ...role, model: "openai-codex/gpt-6-luna" }, "调查", context(), DEFAULT_CONFIG, "medium");
+  assert.equal(byModel.candidates.length, 3);
   const byThinking = prepareRouting({ ...role, thinking: "high" }, "调查", context(), DEFAULT_CONFIG, "medium");
-  assert.equal(byThinking.candidates.length, 3);
+  assert.equal(byThinking.candidates.length, 2);
   assert.ok(byThinking.candidates.every((item) => item.thinking === "high"));
   const both = prepareRouting({ ...role, model: "openai-codex/gpt-6-sol", thinking: "high" }, "调查", context(), DEFAULT_CONFIG, "low",
-    { model: "openai-codex/gpt-6-astra", thinking: "max" });
+    { model: "openai-codex/gpt-6-luna", thinking: "max" });
   assert.equal((await selectExecution(both, { fetch: (() => { throw new Error("must not call"); }) as any })).mode, "fixed");
-  assert.equal(both.immediate!.model, "openai-codex/gpt-6-astra");
+  assert.equal(both.immediate!.model, "openai-codex/gpt-6-luna");
   assert.equal(both.immediate!.thinking, "max");
-  const low = prepareRouting({ ...role, thinking: "low" }, "调查", context(), DEFAULT_CONFIG, "medium");
-  assert.equal(low.immediate!.model, "openai-codex/gpt-6-astra");
-  assert.equal(low.immediate!.thinking, "low");
+  assert.throws(() => prepareRouting({ ...role, thinking: "low" }, "调查", context(), DEFAULT_CONFIG, "medium"), /不支持固定/);
   const legacy = { ...sol, id: "legacy" };
   const mapped = prepareRouting({ ...role, model: "openai-codex/legacy", thinking: "minimal" }, "调查", context([legacy], legacy), DEFAULT_CONFIG, "medium");
   assert.equal(mapped.immediate!.thinking, "low");
-  assert.throws(() => prepareRouting({ ...role, model: "openai-codex/gpt-6-astra", thinking: "off" }, "调查", context(), DEFAULT_CONFIG, "medium"), /不支持固定/);
+  assert.throws(() => prepareRouting({ ...role, model: "openai-codex/gpt-6-astra", thinking: "off" }, "调查", context(), DEFAULT_CONFIG, "medium"), /已停用/);
+});
+
+test("Astra 在所有强度、显式覆盖、角色固定、继承与关闭 Jev 情况下都不能启动", async () => {
+  for (const enabled of [true, false]) {
+    const config = { ...DEFAULT_CONFIG, routing: { ...DEFAULT_CONFIG.routing, enabled } };
+    for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+      assert.throws(() => prepareRouting(role, "调查", context(), config, thinking, { model: "openai-codex/gpt-6-astra", thinking }), /已停用/);
+      assert.throws(() => prepareRouting({ ...role, model: "openai-codex/gpt-6-astra", thinking }, "调查", context(), config, "high"), /已停用/);
+      const inherited = prepareRouting(role, "调查", context([astra, sol6, luna6], astra), config, thinking);
+      const selected = await selectExecution(inherited, { apiKey: "" });
+      assert.equal(selected.model, "openai-codex/gpt-6-sol");
+      assert.ok(["high", "xhigh", "max"].includes(selected.thinking));
+    }
+    const luna = prepareRouting(role, "调查", context([astra, luna6], astra), config, "low");
+    assert.deepEqual(luna.fallback, { model: "openai-codex/gpt-6-luna", thinking: "high" });
+    assert.throws(() => prepareRouting(role, "调查", context([astra, { ...sol6, provider: "other" }], astra), config, "max"), /没有符合模型策略/);
+  }
 });
 
 test("旧选配快照的违规候选被过滤，违规回退和 immediate 在网络请求前拒绝", async () => {
   const p = plan();
-  const legacy = { ...p, candidates: [...p.candidates, { id: "sol_low", model: "openai-codex/gpt-5.6-sol", thinking: "low" as const, criteria: "old" }] };
+  const legacy = { ...p, candidates: [...p.candidates, { id: "sol_low", model: "openai-codex/gpt-5.6-sol", thinking: "low" as const, criteria: "old" },
+    ...(["low", "medium", "high", "xhigh", "max"] as const).map((thinking) => ({ id: `astra_${thinking}`, model: "openai-codex/gpt-6-astra", thinking, criteria: "old" }))] };
   const result = await selectExecution(legacy, { apiKey: "fake", fetch: (async (_url, options) => {
     const body = JSON.parse(options!.body as string);
     assert.equal(body.questions.execution_profile.criteria.sol_low, undefined);
+    assert.ok(Object.keys(body.questions.execution_profile.criteria).every((id) => !id.startsWith("astra_")));
     return Response.json(answer(p));
   }) as typeof fetch });
   assert.equal(result.mode, "jev");
-  for (const choice of [{ model: "openai-codex/gpt-5.6-sol", thinking: "max" as const }, { model: "openai-codex/gpt-6-luna", thinking: "low" as const }]) {
+  for (const choice of [{ model: "openai-codex/gpt-5.6-sol", thinking: "max" as const }, { model: "openai-codex/gpt-6-luna", thinking: "low" as const }, { model: "openai-codex/gpt-6-astra", thinking: "low" as const }]) {
     await assert.rejects(selectExecution({ ...p, fallback: choice }, { apiKey: "" }), /模型策略不允许/);
     await assert.rejects(selectExecution({ ...p, immediate: { ...choice, mode: "disabled", reason: "old", elapsedMs: 0 } }), /模型策略不允许/);
   }
@@ -170,11 +188,11 @@ test("真实本地 HTTP 验证 TypeSafe 请求结构和分布解析，输入只�
   }) as typeof fetch });
   assert.equal(body.model, "jev-1.13.0");
   assert.equal(body.questions.execution_profile.type, "choice");
-  assert.equal(Object.keys(body.questions.execution_profile.criteria).length, 12);
+  assert.equal(Object.keys(body.questions.execution_profile.criteria).length, 7);
   assert.deepEqual(body.state, p.state);
   assert.equal(decision.mode, "jev");
-  assert.equal(decision.model, "openai-codex/gpt-6-astra");
-  assert.equal(decision.thinking, "high");
+  assert.equal(decision.model, "openai-codex/gpt-6-luna");
+  assert.equal(decision.thinking, "xhigh");
   assert.equal(decision.confidence, 1);
   assert.equal(decision.usage!.input_tokens, 200);
   assert.ok(decision.elapsedMs >= 0);
@@ -184,10 +202,11 @@ test("未知选择、缺项、非法分布与非 JSON 都回退，原始错误�
   const p = plan();
   const mutations = [
     (body: any) => { body.answers.execution_profile.choice = "unapproved"; },
-    (body: any) => { delete body.answers.execution_profile.probabilities.astra_low; },
-    (body: any) => { body.answers.execution_profile.probabilities.astra_low = 2; },
+    (body: any) => { delete body.answers.execution_profile.probabilities.sol6_high; },
+    (body: any) => { body.answers.execution_profile.probabilities.sol6_high = 2; },
     (body: any) => { body.answers.execution_profile.confidence = "sure"; },
-    (body: any) => { body.answers.execution_profile.choice = "astra_medium"; },
+    (body: any) => { body.answers.execution_profile.choice = "luna6_high"; },
+    (body: any) => { body.answers.execution_profile.choice = "astra_low"; },
   ];
   for (const mutate of mutations) {
     const body = answer(p); mutate(body);

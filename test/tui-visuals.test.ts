@@ -194,7 +194,21 @@ test("全局菜单编辑 Jev 开关和时限，保存仅更新修改字段，取
 test("角色菜单选择模型和思考强度，保留其他权限、时限和提示词", async () => {
   const f = await role();
   const h = settingsContext(["模型", "fixture", "模型 B", "思考强度", "高 ·", "保存并返回"]);
+  h.ctx.modelRegistry.getAvailable = () => [{ provider: "fixture", id: "model-b", name: "模型 B" }, { provider: "fixture", id: "gpt-6-astra", name: "Astra" }];
+  const menu = h.ctx.ui.custom;
+  let checkedModelMenu = false;
+  h.ctx.ui.custom = (factory: any) => menu((...args: any[]) => {
+    const component = factory(...args);
+    const rendered = component.render(100).join("\n");
+    if (rendered.includes("选择 fixture 模型")) {
+      checkedModelMenu = true;
+      assert.match(rendered, /模型 B/);
+      assert.doesNotMatch(rendered, /Astra|gpt-6-astra/);
+    }
+    return component;
+  });
   await editAgentConfig(h.ctx, f.agent);
+  assert.equal(checkedModelMenu, true);
   const saved = parseAgentDefinition(await fs.readFile(f.file, "utf8"), f.file, "用户");
   assert.equal(saved.model, "fixture/model-b"); assert.equal(saved.thinking, "high");
   assert.equal(saved.writePermission, false); assert.deepEqual(saved.disallowedTools, ["bash"]);

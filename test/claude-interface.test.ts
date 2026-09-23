@@ -62,6 +62,22 @@ setTimeout(()=>console.log(JSON.stringify({type:"message_end",message:{role:"ass
 const input = { description: "检查入口", prompt: "阅读入口并报告证据。", subagent_type: "Explore" };
 const receipt = (result: any) => JSON.parse(result.content[0].text);
 
+test("公开 Agent 接口拒绝 Astra 的完整模型名和配置别名，不创建任务或 Session", async (t) => {
+  const h = await harness(t);
+  const models = [...h.ctx.modelRegistry.getAvailable(), { provider: "fixture", id: "gpt-6-astra", reasoning: true }];
+  h.ctx.modelRegistry.getAvailable = () => models;
+  h.ctx.modelRegistry.find = (provider: string, id: string) => models.find((model: any) => model.provider === provider && model.id === id);
+  await writeDeckConfig({ modelAliases: { blockedAstra: "fixture/gpt-6-astra" } });
+  let sessionCreations = 0;
+  h.ctx.sessionManager.getSessionFile = () => { sessionCreations++; return undefined; };
+  for (const model of ["fixture/gpt-6-astra", "blockedAstra"]) {
+    await assert.rejects(h.call("Agent", { ...input, model }), /gpt-6-astra 已停用/);
+  }
+  assert.equal(sessionCreations, 0);
+  assert.equal((await listRuns(Number.MAX_SAFE_INTEGER, h.parent)).length, 0);
+  await assert.rejects(fs.access(path.join(h.cwd, "executions.jsonl")));
+});
+
 test("无效参数和不可用模型在创建任务、Session、名称绑定和消息队列前拒绝", async (t) => {
   const h = await harness(t);
   let sessionCreations = 0;

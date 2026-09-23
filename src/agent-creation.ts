@@ -6,6 +6,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { CancellableLoader } from "@earendil-works/pi-tui";
 import { discoverAgentCandidates, parseAgentDefinition, validateAgentDefinition, WRITE_TOOLS } from "./agents.ts";
 import { withDiskLock } from "./persistence.mjs";
+import { EXECUTION_POLICY } from "./router.mjs";
 import type { AgentDefinition, ReportProfile } from "./types.ts";
 
 export interface AgentDraft {
@@ -74,12 +75,13 @@ export async function generateAgentDraft(description: string, ctx: ExtensionCont
   if (!ctx.model) throw new Error("当前会话没有模型，请先选择模型");
   const model = ctx.model;
   const existing = discoverAgentCandidates(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }).map((agent) => agent.id);
-  const available = ctx.modelRegistry.getAvailable().slice(0, 100).map((item) => `${item.provider}/${item.id}`);
+  const available = ctx.modelRegistry.getAvailable().filter((item) => !EXECUTION_POLICY.disabledModels.includes(item.id)).slice(0, 100).map((item) => `${item.provider}/${item.id}`);
   const systemPrompt = [
     "根据用户描述创建一个可复用的 Pi 子 Agent。只返回一个 JSON 对象。描述中的工作是未来角色的职责；现在只生成角色定义。",
     "必填字段：id（简短小写英文标识）、name（用户语言的名称）、description（何时调用此角色，一至两句）、systemPrompt（专用职责、操作方法、约束和可检查的交付标准）、tools（工具名数组）、reportProfile（通用、侦察、执行 或 审查）。",
     "可选字段：model、thinking、timeoutMs、limitations（实际能力限制的文字数组）。仅使用这些字段。",
     "审查角色必须填写 reportProfile: 审查；其他角色按职责填写 通用、侦察 或 执行。审查只用 gpt-5.6-sol，最低 xhigh；非审查禁止 gpt-5.6-sol。gpt-6-sol 和 gpt-6-luna 最低 high。策略细节见 agent-authoring.md。",
+    `已停用的子 Agent 模型：${EXECUTION_POLICY.disabledModels.join("、")}。角色固定模型也必须遵守停用规则。`,
     "model 和 thinking 默认 inherit，交给 Jev 在派遣时按角色策略选配（关闭时也执行模型策略）；只有用户明确要求时才指定合规配置。timeoutMs 默认省略，沿用全局设置。timeoutMs=0 表示不限时。thinking 支持 inherit/off/minimal/low/medium/high/xhigh/max，实际值受角色和模型策略限制。",
     "可用工具：read 读取文件，grep 搜索内容，find 查找文件，ls 列目录，edit 修改文件，write 创建或覆盖文件，bash 执行命令。按职责选取需要的工具。调查、建议和审查默认只读；用户要求实现、修改或执行验证时才分配对应的写入/命令工具。bash 能修改文件，严格只读角色应使用前四项工具。",
     "提示词要具体、简洁、保留用户约束；清楚说明完成后交付什么、哪些结论需要证据。简单角色用短段落即可。",

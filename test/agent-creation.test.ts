@@ -100,6 +100,23 @@ test("模型配置格式错误自动修正一次，连续错误不保存角色",
   assert.deepEqual(await fs.readdir(path.join(getAgentDir(), "agents")), before);
 });
 
+test("主会话 Astra 仍可生成角色，但固定 Astra 的子角色拒绝保存", async () => {
+  const astra = { provider: "fixture", id: "gpt-6-astra" };
+  const h = harness(async (model, context) => {
+    assert.equal(model, astra);
+    assert.match(context.systemPrompt, /已停用的子 Agent 模型：gpt-6-astra/);
+    assert.doesNotMatch(context.systemPrompt.split("可指定的模型：")[1].split("。")[0], /gpt-6-astra/);
+    return response({ ...base, id: "astra-created-reviewer" });
+  });
+  h.ctx.model = astra;
+  h.ctx.modelRegistry.getAvailable = () => [astra, { provider: "fixture", id: "model" }];
+  h.ctx.modelRegistry.find = () => ({});
+  const draft = await generateAgentDraft("生成审查角色", h.ctx, new AbortController().signal);
+  assert.equal(draft.id, "astra-created-reviewer");
+  await assert.rejects(saveGeneratedAgent({ ...base, id: "disabled-astra", reportProfile: "侦察", model: "fixture/gpt-6-astra", thinking: "medium" }, h.ctx), /gpt-6-astra 已停用/);
+  await assert.rejects(fs.access(path.join(getAgentDir(), "agents", "disabled-astra.md")));
+});
+
 test("非法路径、系统设备名、未知工具字段和不存在的模型被拒绝", () => {
   const h = harness();
   for (const change of [{ id: "../escape" }, { id: "con" }, { id: "general" }, { tools: ["mcp"] }, { hooks: {} }, { thinking: "magic" }, { reportProfile: "review" }, { reportProfile: undefined }, { thinking: "high" }, { model: "missing/model" }, { maxConcurrent: 0 }]) {

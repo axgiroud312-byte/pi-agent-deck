@@ -12,6 +12,7 @@ export function executionPolicyViolation(choice, review) {
   const modelId = choice.model?.slice(choice.model.indexOf("/") + 1);
   if (review && modelId !== EXECUTION_POLICY.reviewModel) return `审查 Agent 只能使用 ${EXECUTION_POLICY.reviewModel}。`;
   if (!review && modelId === EXECUTION_POLICY.reviewModel) return `${EXECUTION_POLICY.reviewModel} 仅供审查 Agent 使用；请选择 reviewer 或标记 reportProfile: 审查 的角色。`;
+  if (EXECUTION_POLICY.disabledModels.includes(modelId)) return `${modelId} 已停用，子 Agent 不能使用该模型。`;
   const minimum = EXECUTION_POLICY.minimumThinking[modelId];
   if (minimum && THINKING_ORDER.indexOf(choice.thinking) < THINKING_ORDER.indexOf(minimum)) return `${modelId} 的最低思考强度为 ${minimum}，不能使用 ${choice.thinking}。`;
 }
@@ -66,7 +67,7 @@ export async function selectExecution(plan, options = {}) {
   if (plan.immediate) { assertExecutionPolicy(plan.immediate, review); return { ...plan.immediate }; }
   plan = { ...plan, candidates: plan.candidates.filter((candidate) => !executionPolicyViolation(candidate, review)) };
   const fallback = (reason) => ({ ...plan.fallback, mode: "fallback", reason, elapsedMs: Date.now() - startedAt, routerModel: plan.routerModel });
-  if (!plan.candidates.length) return fallback("当前提供商没有可用的 Astra / Sol / Luna 候选，使用合规回退配置。");
+  if (!plan.candidates.length) return fallback("当前提供商没有可用的 Sol / Luna 候选，使用合规回退配置。");
   let apiKey;
   try { apiKey = (options.apiKey ?? resolveJevKey(plan.credentialFile).apiKey ?? "").trim(); }
   catch { return fallback("无法读取 Jev 密钥，请打开 /agent-router 检查；使用合规回退配置。"); }

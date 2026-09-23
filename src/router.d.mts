@@ -24,7 +24,7 @@ export interface RoutingPlan {
   immediate?: RoutingDecision;
 }
 export const MODEL_PROFILES: ModelProfile[];
-export const EXECUTION_POLICY: { reviewModel: string; minimumThinking: Record<string, ThinkingLevel> };
+export const EXECUTION_POLICY: { reviewModel: string; disabledModels: string[]; minimumThinking: Record<string, ThinkingLevel> };
 export function isReviewAgent(agent: { id: string; reportProfile?: string }): boolean;
 export function isReviewRequest(request: { review?: boolean; routing?: RoutingPlan }, run: { agentId: string }): boolean;
 export function executionPolicyViolation(choice: ExecutionChoice, review: boolean): string | undefined;

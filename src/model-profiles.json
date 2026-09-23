@@ -1,8 +1,7 @@
 {
-  "version": 2,
+  "version": 3,
   "note": "Hard role and minimum-effort policy. Profile descriptions are heuristics, not benchmark results. Filter by authenticated provider, actual supported levels and tool transport.",
   "sources": [
-    "https://developers.openai.com/api/docs/models/gpt-6-astra",
     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
     "https://developers.openai.com/api/docs/models/gpt-6-sol",
     "https://developers.openai.com/api/docs/models/gpt-6-luna"
@@ -36,7 +35,7 @@
       "id": "sol6_max",
       "modelId": "gpt-6-sol",
       "thinking": "max",
-      "criteria": "Maximum GPT-6 Sol deliberation for exceptional bounded problems. Compare actual outcomes with Astra; higher effort is not a guaranteed capability upgrade."
+      "criteria": "Maximum GPT-6 Sol deliberation for exceptional bounded engineering problems; higher effort is not a guaranteed capability upgrade."
     },
     {
       "id": "luna6_high",
@@ -54,37 +53,7 @@
       "id": "luna6_max",
       "modelId": "gpt-6-luna",
       "thinking": "max",
-      "criteria": "Maximum GPT-6 Luna deliberation for exceptional focused tasks with strong acceptance checks. Do not assume this substitutes for Sol or Astra on broad ambiguous work."
-    },
-    {
-      "id": "astra_low",
-      "modelId": "gpt-6-astra",
-      "thinking": "low",
-      "criteria": "Strong interpretation of complex instructions or subtle constraints, but a short reasoning path; not a universal upgrade over Sol high."
-    },
-    {
-      "id": "astra_medium",
-      "modelId": "gpt-6-astra",
-      "thinking": "medium",
-      "criteria": "Complex work spanning modules or competing constraints, requiring stronger integration and judgment."
-    },
-    {
-      "id": "astra_high",
-      "modelId": "gpt-6-astra",
-      "thinking": "high",
-      "criteria": "Deep diagnosis of interacting systems, concurrency, state transitions, security boundaries, or high-impact architectural choices."
-    },
-    {
-      "id": "astra_xhigh",
-      "modelId": "gpt-6-astra",
-      "thinking": "xhigh",
-      "criteria": "Very difficult evidence-rich problems with many interacting constraints or hypotheses, where extended reasoning is justified."
-    },
-    {
-      "id": "astra_max",
-      "modelId": "gpt-6-astra",
-      "thinking": "max",
-      "criteria": "Hardest quality-first tasks needing maximal deliberation; use sparingly until real evaluations demonstrate benefit."
+      "criteria": "Maximum GPT-6 Luna deliberation for exceptional focused tasks with strong acceptance checks. Do not assume this substitutes for Sol on broad ambiguous work."
     }
   ],
   "policy": {
@@ -93,6 +62,9 @@
       "gpt-5.6-sol": "xhigh",
       "gpt-6-sol": "high",
       "gpt-6-luna": "high"
-    }
+    },
+    "disabledModels": [
+      "gpt-6-astra"
+    ]
   }
 }

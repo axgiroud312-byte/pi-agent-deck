@@ -47,11 +47,11 @@ export function prepareRouting(agent: AgentDefinition, task: string, ctx: Routin
   };
   if (!canUse(fallbackModel)) {
     // Never change a fixed model, or cross the inherited provider/account boundary.
-    const preferred = review ? [EXECUTION_POLICY.reviewModel] : ["gpt-6-sol", "gpt-6-astra", "gpt-6-luna"];
+    const preferred = review ? [EXECUTION_POLICY.reviewModel] : ["gpt-6-sol", "gpt-6-luna"];
     const compatible = !fixedModel ? preferred.flatMap((id) => available.filter((model) => model.provider === provider && model.id === id)).find(canUse) : undefined;
     if (!compatible) throw new Error(review
       ? `审查 Agent 只能使用 ${provider}/${EXECUTION_POLICY.reviewModel}，最低 xhigh；当前没有满足角色固定强度和模型策略的可用配置。请调整明确配置并检查模型支持档位。`
-      : `当前提供商没有符合模型策略的配置${fixedThinking !== undefined ? `，不支持固定思考强度 ${fixedThinking}` : ""}。GPT-6 Sol/Luna 最低 high，其推理工具调用需使用 Responses 接口；GPT-5.6 Sol 仅供审查。`);
+      : `当前提供商没有符合模型策略的配置${fixedThinking !== undefined ? `，不支持固定思考强度 ${fixedThinking}` : ""}。GPT-6 Sol/Luna 最低 high，其推理工具调用需使用 Responses 接口；GPT-5.6 Sol 仅供审查；GPT-6 Astra 已停用。`);
     fallbackModel = compatible;
   }
   const requestedThinking = fixedThinking ?? inheritedThinking;
@@ -75,7 +75,7 @@ export function prepareRouting(agent: AgentDefinition, task: string, ctx: Routin
       || effectiveThinking(model, profile.thinking) !== profile.thinking) continue;
     plan.candidates.push({ id: profile.id, model: `${model.provider}/${model.id}`, thinking: profile.thinking, criteria: profile.criteria });
   }
-  if (!plan.candidates.length) return immediate("fallback", `当前提供商没有满足固定设置的可用 Astra / Sol / Luna 组合，使用合规回退配置。${adjustment}`);
+  if (!plan.candidates.length) return immediate("fallback", `当前提供商没有满足固定设置的可用 Sol / Luna 组合，使用合规回退配置。${adjustment}`);
   if (plan.candidates.length === 1) return { ...plan, immediate: { ...plan.candidates[0], mode: "fixed", profileId: plan.candidates[0].id, reason: "当前角色策略、固定设置和模型可用性只允许这一个组合。", elapsedMs: 0 } };
   return plan;
 }
