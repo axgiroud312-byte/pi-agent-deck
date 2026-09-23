@@ -28,7 +28,8 @@ tools: ["read", "grep", "find", "ls"]
 - `model` 和 `thinking` 默认 `inherit`，派遣时按 [README 的模型策略](../README.md#jev-负责模型与思考强度) 选配；关闭 Jev 也执行同一策略。模型使用 Pi 的完整 `provider/model` 标识，显式配置冲突时拒绝保存或派遣。继承值可以调整为同一提供商的合规组合；无可用组合则报错。
 - 审查只用 GPT-5.6 Sol / `xhigh` 或 `max`；非审查禁止 GPT-5.6 Sol，GPT-6 Sol/Luna 最低 `high`。Astra 对所有子 Agent 停用：不能固定、通过别名指定或作为回退。继承主会话的 Astra 时，非审查角色改用同一提供商的 GPT-6 Sol，其次 GPT-6 Luna；无可用合规模型则报错。具体以 `model-profiles.json` 的策略为准。旧自定义审查角色补标记后新建任务，已有任务不从提示词猜测审查类型。
 - 工具仅支持 `read`、`grep`、`find`、`ls`、`bash`、`edit`、`write`。调查、建议、审查默认只读；实现、修改或执行验证按需求分配写入或命令工具。`bash` 可修改文件，不属于严格只读工具。
-- 可选 `timeoutMs`：省略跟随全局，0 不限时，正整数为毫秒。任务数量、分工、依赖和验收由主 Agent 决定。Jev 只选择每个任务的模型与思考强度。
+- 可选 `timeoutMs`：省略跟随全局，0 不限时，正整数为毫秒。主会话最多 8 个活跃子任务；数量、分工、依赖和验收由主 Agent 决定。Jev 只选择模型与思考强度。
+- 派发前核对工具能力。返回结果后进程自动释放，原任务和会话保留；SendMessage 默认继续工作，delivery: QueueOnly 只传信息、不启动空闲任务。
 - 可选 `disallowedTools` 排除工具；写入意图默认从有效工具推导，无需额外填写 `writePermission`。
 - 角色提示词不会增加实际工具能力。用户要求浏览器、MCP、记忆、hooks 或隔离时，如实说明本插件的支持范围。仅凭角色定义不能获得这些功能。
 - 创建角色不等于执行角色任务。只有用户同时要求执行时，保存后再用 `Agent` 派遣，传入简短 `description`、完整 `prompt` 和角色 ID `subagent_type`。`name` 是可选任务实例名称，不是角色 ID；已有任务用 `SendMessage` 继续。

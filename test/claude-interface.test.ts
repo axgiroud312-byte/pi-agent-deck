@@ -105,6 +105,26 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 const input = { description: "检查入口", prompt: "阅读入口并报告证据。", subagent_type: "Explore" };
 const receipt = (result: any) => JSON.parse(result.content[0].text);
 
+test("第 9 个公开 Agent 调用不创建 Session、任务文件或名称绑定", async (t) => {
+  const h = await harness(t, 60_000);
+  const created = await Promise.all(Array.from({ length: 8 }, (_, i) => h.call("Agent", { ...input, name: `slot-${i}` })));
+  const before = await listRuns(Number.MAX_SAFE_INTEGER, h.parent);
+  const taskDirectories = await fs.readdir(path.dirname(runDirectory(before[0].runId)));
+  const sessionDirectory = path.dirname(before[0].childSessionPath);
+  const sessions = await fs.readdir(sessionDirectory);
+  await assert.rejects(h.call("Agent", { ...input, name: "slot-ninth" }), /8\/8/);
+  assert.equal((await listRuns(Number.MAX_SAFE_INTEGER, h.parent)).length, 8);
+  assert.deepEqual(await fs.readdir(path.dirname(runDirectory(before[0].runId))), taskDirectories);
+  assert.deepEqual(await fs.readdir(sessionDirectory), sessions);
+  await assert.rejects(resolveTaskTarget("slot-ninth", h.parent), /找不到/);
+  const context = await h.handlers.get("before_agent_start")({}, h.ctx);
+  assert.match(context.message.content, /8\/8/);
+  assert.match(context.message.content, /不能运行命令\/测试/);
+  await h.call("TaskStop", { task_id: receipt(created[0]).agentId });
+  const ninth = receipt(await h.call("Agent", { ...input, name: "slot-ninth" }));
+  assert.ok(ninth.agentId);
+});
+
 test("公开 Agent 接口拒绝 Astra 的完整模型名和配置别名，不创建任务或 Session", async (t) => {
   const h = await harness(t);
   const models = [...h.ctx.modelRegistry.getAvailable(), { provider: "fixture", id: "gpt-6-astra", reasoning: true }];
@@ -370,14 +390,16 @@ test("问题必须用匹配的 reply_to 回答；普通补充和错误 ID 均不
   await assert.rejects(h.call("SendMessage", { to: id, message: "重复回答", reply_to: questionId }), /问题不存在|失效/);
 });
 
-test("TaskStop 停止运行或排队任务并清理消息，重复停止保持真实终态", async (t) => {
+test("同工作区写任务可独立执行；TaskStop 清理消息并保留真实终态", async (t) => {
   const h = await harness(t, 6000);
   const first = receipt(await h.call("Agent", { ...input, subagent_type: "general-purpose", name: "writer-one" })).agentId;
-  await until(async () => Boolean((await readRun(first))?.writerLease));
+  await until(async () => Boolean((await readRun(first))?.childPid));
   const second = receipt(await h.call("Agent", { ...input, subagent_type: "worker", name: "writer-two" }));
-  await until(async () => (await readRun(second.agentId))?.status === "排队中");
+  await until(async () => Boolean((await readRun(second.agentId))?.childPid));
+  assert.equal((await readRun(first))?.writerLease, undefined);
+  assert.equal((await readRun(second.agentId))?.status, "运行中");
   await h.call("SendMessage", { to: "writer-two", message: "不应继续" });
-  assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-two" })).status, "cancelled");
+  assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-two" })).status, "stopped");
   assert.ok(!(await executions(h.cwd)).some((item) => item.type === "prompt" && String(item.message).includes("不应继续")));
   assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-one" })).status, "stopped");
   assert.equal(receipt(await h.call("TaskStop", { task_id: first })).status, "stopped");

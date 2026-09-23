@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // This provider is fully local. Every response is selected from the Pi transcript;
 // it never opens a socket or loads an account credential.
@@ -11,9 +12,16 @@ function record(value: unknown): void {
   if (file) fs.appendFileSync(file, `${JSON.stringify(value)}\n`, "utf8");
 }
 
-const respond = async (context: { messages: unknown[] }, options: { signal?: AbortSignal } | undefined, state: { callCount: number }) => {
+const respond = async (context: { messages: unknown[]; tools?: { name: string }[] }, options: { signal?: AbortSignal } | undefined, state: { callCount: number }) => {
   const transcript = JSON.stringify(context.messages);
-  record({ type: "provider_call", call: state.callCount, transcript });
+  record({ type: "provider_call", call: state.callCount, transcript, tools: context.tools?.map((tool) => tool.name) });
+  if (transcript.includes("DECK_CAPABILITY_CASE")) return fauxAssistantMessage("CAPABILITIES_CHECKED");
+  if (transcript.includes("DECK_FAILURE_CASE")) return fauxAssistantMessage("", { stopReason: "error" });
+  if (transcript.includes("DECK_ABORTED_CASE")) return fauxAssistantMessage("", { stopReason: "aborted" });
+  if (transcript.includes("DECK_TOOL_CASE")) {
+    const completed = context.messages.some((message: any) => message.role === "toolResult" && message.toolName === "deck_pause");
+    return completed ? fauxAssistantMessage("TOOL_BOUNDARY_DONE") : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+  }
 
   if (transcript.includes("DECK_STOP_CASE")) {
     // Leave the model response pending until the runner aborts this process.
@@ -40,4 +48,13 @@ provider.setResponses(Array.from({ length: 12 }, () => respond));
 
 export default function localProvider(pi: ExtensionAPI): void {
   pi.registerProvider(provider.provider);
+  pi.on("before_agent_start", async () => { record({ type: "active_tools", tools: pi.getActiveTools() }); });
+  pi.registerTool({ name: "deck_pause", label: "local fixture", description: "A controlled local long tool", parameters: Type.Object({}),
+    async execute() {
+      record({ type: "long_tool_start" });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      record({ type: "long_tool_end" });
+      return { content: [{ type: "text", text: "tool completed" }], details: {} };
+    },
+  });
 }

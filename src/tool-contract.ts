@@ -1,5 +1,5 @@
 import { Type } from "typebox";
-import type { AgentDefinition, RunDetails, RunStatus } from "./types.ts";
+import type { AgentDefinition, MessageDelivery, RunDetails, RunStatus } from "./types.ts";
 import type { DeckConfig } from "./config.ts";
 import type { RoutingContext } from "./routing.ts";
 
@@ -14,7 +14,8 @@ export const AgentParameters = Type.Object({
 
 export const SendMessageParameters = Type.Object({
   to: Type.String({ minLength: 1, description: "当前主会话内的任务 ID 或实例名称。" }),
-  message: Type.String({ minLength: 1, description: "完整补充要求或问题答复，按纯文本处理。运行中则排队，结束后在原会话继续。" }),
+  message: Type.String({ minLength: 1, description: "完整补充要求或问题答复，按纯文本处理。" }),
+  delivery: Type.Optional(Type.Union([Type.Literal("QueueOnly"), Type.Literal("TriggerTurn")], { description: "本插件扩展。默认 TriggerTurn：空闲时在原会话继续；QueueOnly：仅发信息，不启动空闲任务。运行中均补充到当前执行；不能与 reply_to 同用。" })),
   summary: Type.Optional(Type.String({ minLength: 1, description: "可选消息摘要，只用于预览和记录；不会替换完整 message。" })),
   reply_to: Type.Optional(Type.String({ minLength: 1, description: "回答待处理问题时填写其问题 ID；普通补充消息请省略。" })),
 }, { additionalProperties: false });
@@ -24,7 +25,7 @@ export const TaskStopParameters = Type.Object({
 }, { additionalProperties: false });
 
 export interface AgentInput { description: string; prompt: string; subagent_type?: string; model?: string; name?: string; run_in_background?: true }
-export interface MessageInput { to: string; message: string; summary: string; replyTo?: string }
+export interface MessageInput { to: string; message: string; summary: string; replyTo?: string; delivery?: MessageDelivery }
 
 function fields(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("参数必须是对象。");
@@ -49,10 +50,13 @@ export function parseAgentInput(value: unknown): AgentInput {
 }
 export function messagePreview(message: string): string { return message.trim().split(/\r?\n/, 1)[0].slice(0, 200); }
 export function parseMessageInput(value: unknown): MessageInput {
-  const input = fields(value, ["to", "message", "summary", "reply_to"]);
+  const input = fields(value, ["to", "message", "summary", "reply_to", "delivery"]);
   textField(input, "message");
   const message = input.message as string;
-  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message), replyTo: textField(input, "reply_to", true) };
+  const replyTo = textField(input, "reply_to", true);
+  if (input.delivery !== undefined && input.delivery !== "QueueOnly" && input.delivery !== "TriggerTurn") throw new Error("delivery 必须为 QueueOnly 或 TriggerTurn。");
+  if (replyTo && input.delivery !== undefined) throw new Error("reply_to 不能与 delivery 同时指定。");
+  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message), replyTo, ...(input.delivery ? { delivery: input.delivery as MessageDelivery } : {}) };
 }
 export function parseStopInput(value: unknown): { task_id: string } { return { task_id: textField(fields(value, ["task_id"]), "task_id")! }; }
 
@@ -82,17 +86,18 @@ export function requireAvailableModel(model: string | undefined, ctx: RoutingCon
 export function runTitle(run: Pick<RunDetails, "description" | "objective">): string { return run.description || run.objective; }
 export function runRoleLabel(run: Pick<RunDetails, "instanceName" | "agentName">): string { return run.instanceName ? `${run.instanceName} · 角色：${run.agentName}` : run.agentName; }
 const STATUSES: Record<RunStatus, string> = { "选配中": "selecting", "排队中": "queued", "运行中": "async_launched", "等待批准": "awaiting_approval", "等待决定": "awaiting_input", "停止中": "stopping", "停止未确认": "stop_unconfirmed", "已停止": "stopped", "已完成": "completed", "失败": "failed", "已取消": "cancelled", "失联": "lost" };
-export function publicTaskResult(run: RunDetails, message: string, delivery?: "queued" | "resumed") {
+export function publicTaskResult(run: RunDetails, message: string, delivery?: "queued" | "resumed" | "deferred") {
   return {
     agentId: run.runId, name: run.instanceName, description: runTitle(run), agentType: run.agentId,
     status: STATUSES[run.status], statusText: run.status,
+    resourceState: run.resourceState, queuedMessageCount: run.queuedMessageCount ?? 0,
     resolvedModel: run.routingPending ? undefined : run.model,
     thinking: run.routingPending ? undefined : run.thinking,
     ...(run.pendingQuestion ? { pendingQuestion: run.pendingQuestion } : {}),
     delivery, message,
   };
 }
-export function taskToolResult(run: RunDetails, message: string, delivery?: "queued" | "resumed", success?: boolean) {
+export function taskToolResult(run: RunDetails, message: string, delivery?: "queued" | "resumed" | "deferred", success?: boolean) {
   const publicResult = { ...publicTaskResult(run, message, delivery), ...(success === undefined ? {} : { success }) };
   return { content: [{ type: "text" as const, text: JSON.stringify(publicResult, null, 2) }], details: { publicResult, run } };
 }

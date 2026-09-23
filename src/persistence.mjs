@@ -100,27 +100,3 @@ export async function readCompletions(directory) {
   completionCache.set(root, { mtime, results });
   return [...results];
 }
-
-export async function releaseCapacity(lease) {
-  if (!lease) return;
-  try {
-    const file = path.join(lease.directory, `${lease.token}.json`);
-    const current = await readJson(file);
-    if (current.token === lease.token) await fs.unlink(file);
-  } catch (error) { if (error.code !== "ENOENT") throw error; }
-}
-
-export async function releaseWriter(lease) {
-  if (!lease?.leasePath || !lease.ownerToken) return false;
-  const root = path.dirname(path.dirname(lease.leasePath));
-  return withDiskLock(path.join(root, "writers.lock"), async () => {
-    let current;
-    try { current = await readJson(path.join(lease.leasePath, "lease.json")); }
-    catch (error) { if (error.code === "ENOENT") return false; throw error; }
-    if (current.runId !== lease.runId || current.ownerToken !== lease.ownerToken) return false;
-    const retired = `${lease.leasePath}.retired-${randomUUID()}`;
-    await fs.rename(lease.leasePath, retired);
-    await fs.rm(retired, { recursive: true, force: true });
-    return true;
-  });
-}

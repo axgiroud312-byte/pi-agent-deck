@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { acquireWriterLease, releaseWriterLease, type WriterLease } from "./admission.ts";
-import type { RunDetails, RunStatus } from "./types.ts";
+import type { MessageDelivery, RunDetails, RunStatus, WriterLease } from "./types.ts";
+import { reserveRunSlot } from "./run-capacity.ts";
 import { assertRequestExecutionPolicy, selectExecution, applyExecutionArgs, isReviewRequest, type RoutingPlan, type RoutingDecision } from "./router.mjs";
 import { atomicJson, persistCompletion } from "./persistence.mjs";
 import { RpcConnection } from "./rpc-connection.ts";
@@ -36,9 +36,9 @@ export interface RunNotification { kind: "state" | "progress" | "question" | "re
 type ManagedRun = {
   run: PersistedRun; request: RunnerRequest; rpc?: RpcConnection; ready: boolean;
   busy: boolean; starting?: Promise<void>; abort: AbortController;
-  messages: string[]; serial: number; error?: string; final: boolean;
+  messages: string[]; serial: number; error?: string; final: boolean; interrupted?: boolean;
   questionTool?: { id: string; question: string; options: string[] };
-  writes: Promise<void>; timer?: NodeJS.Timeout; writerWait?: NodeJS.Timeout;
+  writes: Promise<void>; timer?: NodeJS.Timeout; releaseSlot?: () => void;
 };
 const owned = new Map<string, ManagedRun>();
 const listeners = new Set<(event: RunNotification) => void>();
@@ -59,6 +59,7 @@ function event(entry: ManagedRun, kind: RunDetails["events"][number]["kind"], te
 }
 function save(entry: ManagedRun): Promise<void> {
   entry.run.updatedAt = Date.now();
+  entry.run.queuedMessageCount = entry.messages.length;
   const snapshot = structuredClone(entry.run);
   entry.writes = entry.writes.then(() => writeJsonAtomic(statusPath(snapshot.runId), snapshot));
   void entry.writes.catch(() => {});
@@ -98,14 +99,18 @@ async function registerParent(run: RunDetails): Promise<void> {
 }
 
 export async function initializeRun(details: RunDetails, request: RunnerRequest, background: boolean): Promise<PersistedRun> {
-  const directory = runDirectory(details.runId);
-  await fs.promises.mkdir(directory, { recursive: true });
-  const persisted: PersistedRun = { ...details, cwd: details.cwd || request.cwd, background, ownerPid: process.pid, attemptStartedAt: details.startedAt, updatedAt: Date.now() };
-  await writeJsonAtomic(path.join(directory, "request.json"), request);
-  await writeJsonAtomic(path.join(directory, "status.json"), persisted);
-  await registerParent(details);
-  manage(persisted, request);
-  return persisted;
+  const release = isTerminalStatus(details.status) ? undefined : reserveRunSlot(details.parentSessionId, details.runId);
+  try {
+    const directory = runDirectory(details.runId);
+    await fs.promises.mkdir(directory, { recursive: true });
+    const persisted: PersistedRun = { ...details, cwd: details.cwd || request.cwd, background, ownerPid: process.pid, attemptStartedAt: details.startedAt, updatedAt: Date.now() };
+    await writeJsonAtomic(path.join(directory, "request.json"), request);
+    await writeJsonAtomic(path.join(directory, "status.json"), persisted);
+    await registerParent(details);
+    const entry = manage(persisted, request);
+    entry.releaseSlot = release;
+    return persisted;
+  } catch (error) { release?.(); throw error; }
 }
 
 export async function readRun(runId: string, strict = false): Promise<PersistedRun | undefined> {
@@ -187,25 +192,44 @@ function rpcArgs(args: string[]): string[] {
 async function finish(entry: ManagedRun, status: RunStatus, error?: string): Promise<void> {
   if (!entry.busy) return;
   entry.busy = false;
+  entry.ready = false;
   clearTimeout(entry.timer);
-  clearTimeout(entry.writerWait);
-  entry.run.status = status;
-  entry.run.endedAt = Date.now();
+  const endedAt = Date.now();
   entry.run.pendingQuestion = undefined;
-  entry.run.currentAction = undefined;
+  entry.run.currentAction = "正在保存结果并释放进程";
   if (error) { entry.run.stderr = error; event(entry, "错误", error); }
-  const lease = entry.run.writerLease;
   entry.run.writerLease = undefined;
-  const saved = save(entry);
-  const snapshot = structuredClone(entry.run);
-  if (lease) await releaseWriterLease(lease);
-  await saved;
-  await persistCompletion(runDirectory(snapshot.runId), snapshot);
-  notify(snapshot, "result");
-  // Only this process's explicitly dispatched tasks may be waiting for a writer.
-  for (const queued of owned.values()) {
-    if (queued.run.status === "排队中" && !queued.starting && !queued.abort.signal.aborted) void launchRunner(queued.run.runId);
+  entry.run.resourceState = entry.rpc ? "releasing" : "released";
+  // Persist the result before advertising a terminal state or closing Pi.
+  await persistCompletion(runDirectory(entry.run.runId), { ...entry.run, status, endedAt, currentAction: undefined });
+  await save(entry);
+  const rpc = entry.rpc;
+  if (rpc) {
+    // A QueueOnly steer may arrive just after Pi settled. Keep unconsumed input
+    // in the parent's mailbox, without launching another model turn.
+    if (!entry.abort.signal.aborted) {
+      try {
+        const queue = await rpc.request("clear_queue");
+        entry.messages.push(...(queue?.steering ?? []), ...(queue?.followUp ?? []));
+      } catch { /* Process failure is already represented by the execution outcome. */ }
+    }
+    await rpc.close();
+    if (entry.rpc === rpc) entry.rpc = undefined;
   }
+  entry.run.childPid = undefined;
+  entry.run.resourceState = "released";
+  entry.run.status = status;
+  entry.run.endedAt = endedAt;
+  entry.run.currentAction = undefined;
+  entry.releaseSlot?.();
+  entry.releaseSlot = undefined;
+  const saved = save(entry);
+  notify(entry.run, "result");
+  await saved;
+}
+
+function inTask<T>(runId: string, action: () => Promise<T>): Promise<T> {
+  return withFileMutationQueue(`${runDirectory(runId)}/input`, action);
 }
 
 function handleEvent(entry: ManagedRun, data: any): void {
@@ -252,35 +276,47 @@ function handleEvent(entry: ManagedRun, data: any): void {
     if (message.stopReason === "stop" && text?.trim() && entry.request.naturalOutput) entry.final = true;
     // Pi may retry a failed request automatically; only the last assistant outcome matters.
     entry.error = ["error", "aborted"].includes(message.stopReason) ? message.errorMessage ?? "模型执行未完成" : undefined;
+    entry.interrupted = message.stopReason === "aborted";
     if (message.usage) {
       for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) entry.run.usage[key] += message.usage[key] ?? 0;
       for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) entry.run.usage.cost[key] += message.usage.cost?.[key] ?? 0;
     }
     void save(entry);
   } else if (data.type === "agent_settled") {
-    const serial = entry.serial;
     const turnId = entry.run.turnId;
-    // A prompt racing with completion can already have started work in Pi.
-    // Never let the earlier settled event mark that work complete.
-    void entry.rpc?.request("get_state").then(async (state) => {
-      if (!entry.busy || entry.abort.signal.aborted || entry.run.turnId !== turnId || entry.serial !== serial || state?.isStreaming) return;
+    const rpc = entry.rpc;
+    // Finish and input share one short control queue. Closing an old process
+    // must finish before a new execution can acquire this task's session.
+    void inTask(entry.run.runId, async () => {
+      if (!rpc || entry.rpc !== rpc || !entry.busy || entry.abort.signal.aborted || entry.run.turnId !== turnId) return;
+      const serial = entry.serial;
+      const state = await rpc.request("get_state");
+      if (!entry.busy || entry.abort.signal.aborted || entry.run.turnId !== turnId || entry.serial !== serial || state?.isStreaming || state?.isCompacting) return;
       const error = entry.error ?? (!entry.final ? "子 Agent 未返回最终结果" : undefined);
-      await finish(entry, error ? "失败" : "已完成", error);
-    }).catch((error) => { if (entry.busy && !entry.abort.signal.aborted) void finish(entry, "失败", String(error)); });
+      await finish(entry, entry.interrupted ? "已停止" : error ? "失败" : "已完成", error);
+    }).catch((error) => failExecution(entry, turnId, error));
   }
 }
 
+function failExecution(entry: ManagedRun, turnId: string | undefined, error: unknown): void {
+  void inTask(entry.run.runId, async () => {
+    if (entry.busy && !entry.abort.signal.aborted && entry.run.turnId === turnId) await finish(entry, "失败", error instanceof Error ? error.message : String(error));
+  }).catch((failure) => { event(entry, "错误", String(failure)); });
+}
+
 function beginTurn(entry: ManagedRun): void {
-  clearTimeout(entry.writerWait);
+  entry.releaseSlot = reserveRunSlot(entry.run.parentSessionId, entry.run.runId);
   entry.abort = new AbortController();
   entry.busy = true;
-  // An idle RPC is alive, but this turn's first prompt has not been submitted yet.
+  // The previous process has exited; this turn has not submitted its first prompt.
   entry.ready = false;
   entry.final = false;
   entry.error = undefined;
+  entry.interrupted = false;
   entry.questionTool = undefined;
   Object.assign(entry.run, {
     turnId: randomUUID(), pendingQuestion: undefined, ownerPid: process.pid,
+    resourceState: "starting",
     status: entry.request.routing && !entry.request.routingDecision && !entry.request.routing.immediate ? "选配中" : "运行中",
     attemptStartedAt: Date.now(), endedAt: undefined, exitCode: undefined, stderr: undefined,
     finalText: undefined, reports: [], events: [], stopRequested: false, currentAction: "正在启动",
@@ -304,53 +340,37 @@ async function execute(entry: ManagedRun): Promise<void> {
     }
     if (cancelled()) return;
     assertRequestExecutionPolicy(request, entry.run);
-    if (entry.run.writePermission && !entry.run.writerLease) {
-      const admission = await acquireWriterLease(request.cwd, entry.run.runId);
-      if (cancelled()) { if (admission.acquired) await releaseWriterLease(admission.lease); return; }
-      if (!admission.acquired) {
-        entry.run.status = "排队中";
-        entry.run.currentAction = "等待同一工作区的写任务结束";
-        await save(entry);
-        // Existing writer admission can be released by another Pi process too.
-        // This only retries admission; messages never travel through disk polling.
-        entry.writerWait = setTimeout(() => { void launchRunner(entry.run.runId); }, 500);
-        entry.writerWait.unref();
-        return;
-      }
-      entry.run.writerLease = admission.lease;
-    }
     entry.run.status = "运行中";
     await save(entry);
     await writeJsonAtomic(path.join(runDirectory(entry.run.runId), "request.json"), request);
     if (cancelled()) return;
     if (!entry.rpc) {
       entry.ready = false;
-      entry.rpc = new RpcConnection(request.command, rpcArgs(request.argsPrefix), request.cwd, request.env,
-        (data) => handleEvent(entry, data), (error) => {
-          entry.ready = false;
-          entry.rpc = undefined;
-          entry.run.childPid = undefined;
-          if (entry.busy && !entry.abort.signal.aborted) void finish(entry, "失败", error.message);
-          else void save(entry);
-        });
+      const rpc = new RpcConnection(request.command, rpcArgs(request.argsPrefix), request.cwd, request.env,
+        (data) => { if (entry.rpc === rpc && entry.run.turnId === turnId) handleEvent(entry, data); },
+        (error) => failExecution(entry, turnId, error));
+      entry.rpc = rpc;
+      entry.run.resourceState = "running";
       entry.run.childPid = entry.rpc.child.pid;
       await save(entry);
       await entry.rpc.request("get_state");
+      if (cancelled()) return;
       await entry.rpc.request("set_steering_mode", { mode: "all" });
     }
     if (cancelled()) return;
     entry.ready = true;
     const prompt = [request.prompt, ...entry.messages.splice(0)].join("\n\n");
+    void save(entry);
     entry.run.currentAction = "子 Agent 正在执行";
     if (request.timeoutMs && request.timeoutMs > 0) entry.timer = setTimeout(() => {
-      void stopOwned(entry, "失败", "任务执行超时；可以在原会话手动继续。");
+      entry.abort.abort();
+      entry.run.status = "停止中";
+      void inTask(entry.run.runId, () => stopOwned(entry, "失败", "任务执行超时；可以在原会话手动继续。"));
     }, request.timeoutMs);
     await entry.rpc.request("prompt", { message: prompt });
   } catch (error) {
     if (cancelled()) return;
-    if (entry.rpc) { const rpc = entry.rpc; entry.rpc = undefined; entry.ready = false; await rpc.close(); }
-    entry.run.childPid = undefined;
-    await finish(entry, "失败", error instanceof Error ? error.message : String(error));
+    failExecution(entry, turnId, error);
   }
 }
 
@@ -364,42 +384,42 @@ function startExecution(entry: ManagedRun): void {
 
 /** Retained internal name; execution is now owned by the calling Pi process. */
 export async function launchRunner(runId: string): Promise<number> {
-  const entry = owned.get(runId);
-  // Reloading never replays detached requests or an old follow-up.json.
-  if (!entry || entry.abort.signal.aborted || isTerminalStatus(entry.run.status)) return 0;
-  if (!entry.busy) { beginTurn(entry); await save(entry); }
-  if (!entry.starting && (!entry.ready || entry.run.status === "排队中")) {
-    startExecution(entry);
-  }
-  return entry.rpc?.child.pid ?? 0;
+  return inTask(runId, async () => {
+    const entry = owned.get(runId);
+    // Reloading never replays detached requests or an old follow-up.json.
+    if (!entry || entry.abort.signal.aborted || isTerminalStatus(entry.run.status)) return 0;
+    if (!entry.busy) { beginTurn(entry); await save(entry); }
+    if (!entry.starting && !entry.ready) {
+      startExecution(entry);
+    }
+    return entry.rpc?.child.pid ?? 0;
+  });
 }
 
-export async function sendToRun(runId: string, message: string, _summary?: string, replyTo?: string): Promise<{ run: PersistedRun; delivery: "queued" | "resumed" }> {
+export async function sendToRun(runId: string, message: string, _summary?: string, replyTo?: string, delivery?: MessageDelivery): Promise<{ run: PersistedRun; delivery: "queued" | "resumed" | "deferred" }> {
   if (!message.trim()) throw new Error("请提供补充要求。");
-  return withFileMutationQueue(`${runDirectory(runId)}/input`, async () => {
+  if (delivery !== undefined && !["QueueOnly", "TriggerTurn"].includes(delivery)) throw new Error("delivery 必须为 QueueOnly 或 TriggerTurn。");
+  if (replyTo && delivery !== undefined) throw new Error("reply_to 是问题答复，不能同时指定 delivery。");
+  const mode = delivery ?? "TriggerTurn";
+  const current = owned.get(runId);
+  if (current?.run.status === "停止中" || current?.run.status === "停止未确认") throw new Error("任务正在停止，停止完成后才可继续。");
+  return inTask(runId, async () => {
     let entry = owned.get(runId);
     if (entry && (entry.run.status === "停止中" || entry.run.status === "停止未确认" || (entry.busy && entry.abort.signal.aborted))) throw new Error("任务正在停止，暂不接受消息；停止完成后可在原会话继续。");
     if (replyTo) {
       const question = entry?.run.pendingQuestion;
       if (!entry?.rpc || !question || question.id !== replyTo || question.turnId !== entry.run.turnId || !entry.busy || entry.abort.signal.aborted) throw new Error("问题不存在、已经回答或已经失效；请使用当前任务的待答问题 ID。");
+      await entry.rpc.reply(replyTo, message);
       entry.run.pendingQuestion = undefined;
       entry.run.status = "运行中";
-      await entry.rpc.reply(replyTo, message);
       await save(entry);
       return { run: structuredClone(entry.run), delivery: "queued" };
     }
-    if (entry?.busy) {
-      // Invalidate any in-flight idle snapshot before Pi emits this input's events.
-      entry.serial++;
-      try {
-        if (!entry.ready || entry.run.status === "排队中") entry.messages.push(message);
-        else if (entry.run.pendingQuestion) await entry.rpc!.request("steer", { message });
-        else await entry.rpc!.request("prompt", { message, streamingBehavior: "steer" });
-      } catch (error) {
-        // A rejected preflight must not suppress the completion of earlier work.
-        if (entry.rpc && entry.ready) handleEvent(entry, { type: "agent_settled" });
-        throw error;
-      }
+    if (entry && (entry.busy || (entry.releaseSlot && !isTerminalStatus(entry.run.status)))) {
+      if (!entry.ready || entry.run.status === "排队中") entry.messages.push(message);
+      else if (entry.run.pendingQuestion || mode === "QueueOnly") await entry.rpc!.request("steer", { message });
+      else await entry.rpc!.request("prompt", { message, streamingBehavior: "steer" });
+      await save(entry);
       return { run: structuredClone(entry.run), delivery: "queued" };
     }
     if (!entry) {
@@ -408,16 +428,27 @@ export async function sendToRun(runId: string, message: string, _summary?: strin
       if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) throw new Error("旧任务仍由另一个 Pi 进程运行，请等待它结束后再继续。");
       const previous = JSON.parse(await fs.promises.readFile(path.join(runDirectory(runId), "request.json"), "utf8")) as RunnerRequest;
       const request: RunnerRequest = { version: 1, cwd: previous.cwd, command: previous.command, argsPrefix: previous.argsPrefix, prompt: message, env: previous.env, naturalOutput: previous.naturalOutput, timeoutMs: previous.timeoutMs, routing: previous.routing, routingDecision: previous.routingDecision, review: previous.review };
-      assertRequestExecutionPolicy(request, run);
-      entry = manage({ ...run, writerLease: undefined, runnerPid: undefined, childPid: undefined }, request);
+      entry = manage({ ...run, writerLease: undefined, runnerPid: undefined, childPid: undefined, resourceState: "released", queuedMessageCount: 0 }, request);
+    }
+    if (mode === "QueueOnly") {
+      entry.messages.push(message);
+      await save(entry);
+      return { run: structuredClone(entry.run), delivery: "deferred" };
     }
     assertRequestExecutionPolicy(entry.request, entry.run);
-    await persistCompletion(runDirectory(runId), entry.run);
-    entry.request.prompt = message;
-    beginTurn(entry);
-    await save(entry);
-    startExecution(entry);
-    return { run: structuredClone(entry.run), delivery: "resumed" };
+    const release = reserveRunSlot(entry.run.parentSessionId, runId);
+    try {
+      await entry.starting;
+      await persistCompletion(runDirectory(runId), entry.run);
+      // Earlier queued information comes before the new instruction.
+      message = [...entry.messages, message].join("\n\n");
+      entry.messages = [];
+      entry.request.prompt = message;
+      beginTurn(entry);
+      await save(entry);
+      startExecution(entry);
+      return { run: structuredClone(entry.run), delivery: "resumed" };
+    } catch (error) { release(); throw error; }
   });
 }
 
@@ -429,9 +460,9 @@ async function stopOwned(entry: ManagedRun, status: RunStatus = "已停止", err
   entry.ready = false;
   entry.messages = [];
   clearTimeout(entry.timer);
-  clearTimeout(entry.writerWait);
   entry.run.stopRequested = true;
-  if (wasBusy) entry.run.status = "停止中";
+  entry.run.pendingQuestion = undefined;
+  if (wasBusy) { entry.run.status = "停止中"; await save(entry); }
   if (entry.rpc) {
     const rpc = entry.rpc;
     try {
@@ -443,6 +474,7 @@ async function stopOwned(entry: ManagedRun, status: RunStatus = "已停止", err
   }
   entry.ready = false;
   entry.run.childPid = undefined;
+  entry.run.resourceState = "released";
   entry.run.pendingQuestion = undefined;
   if (wasBusy) await finish(entry, status, error);
   else await save(entry);
@@ -450,7 +482,7 @@ async function stopOwned(entry: ManagedRun, status: RunStatus = "已停止", err
 }
 
 export async function stopRun(runId: string): Promise<PersistedRun> {
-  return withFileMutationQueue(`${runDirectory(runId)}/input`, async () => {
+  return inTask(runId, async () => {
     const entry = owned.get(runId);
     if (entry) return stopOwned(entry);
     const run = await readRun(runId, true);

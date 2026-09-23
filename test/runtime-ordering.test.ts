@@ -94,7 +94,7 @@ if(q.type==="prompt"){
   }
   assert.ok(inFlight, "应先观察到旧 agent_settled 正在核对空闲状态");
   const sent=await sendToRun(id,"FOLLOWUP");
-  assert.equal(sent.delivery,"queued");
+  assert.equal(sent.delivery,"resumed", "结束与输入串行：完成边界之后在原任务启动新执行");
   let result;
   for(let i=0;i<500;i++){
     const run=await readRun(id);

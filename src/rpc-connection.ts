@@ -1,5 +1,4 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 
 /** One owned Pi process speaking Pi's existing JSONL RPC protocol. No message replay. */
@@ -9,14 +8,14 @@ export class RpcConnection {
   stderr = "";
   private failure?: Error;
   private closing = false;
+  private closePromise?: Promise<void>;
   private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
   constructor(command: string, args: string[], cwd: string, env: Record<string, string> | undefined,
     onEvent: (event: any) => void, onExit: (error: Error) => void) {
     this.child = spawn(command, args, { cwd, env: { ...process.env, ...env }, windowsHide: true, shell: false, stdio: "pipe" });
     // Install every listener before awaiting anything: a local child may finish immediately.
-    const lines = createInterface({ input: this.child.stdout });
-    lines.on("line", (line) => {
+    const parseLine = (line: string) => {
       let event: any;
       try { event = JSON.parse(line); } catch { return; }
       const request = event.type === "response" ? this.pending.get(event.id) : undefined;
@@ -26,6 +25,18 @@ export class RpcConnection {
         if (event.success) request.resolve(event.data);
         else request.reject(new Error(event.error ?? `Pi RPC ${event.command} 失败`));
       } else onEvent(event);
+    };
+    // JSONL uses LF. Preserve CR, U+2028 and U+2029 inside JSON strings.
+    let buffer = "";
+    this.child.stdout.setEncoding("utf8");
+    this.child.stdout.on("data", (chunk: string) => {
+      buffer += chunk;
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 1);
+        parseLine(line);
+      }
     });
     this.child.stderr.on("data", (data) => { this.stderr = (this.stderr + data.toString("utf8")).slice(-128 * 1024); });
     const failed = (error: Error) => {
@@ -38,7 +49,6 @@ export class RpcConnection {
     this.child.once("error", failed);
     this.child.stdin.on("error", failed);
     this.closed = new Promise((resolve) => this.child.once("close", (code, signal) => {
-      lines.close();
       failed(new Error(`子 Pi 已退出（${code ?? signal ?? "未知"}）${this.stderr ? `：${this.stderr}` : ""}`));
       resolve();
     }));
@@ -65,7 +75,11 @@ export class RpcConnection {
     return new Promise((resolve, reject) => this.child.stdin.write(`${JSON.stringify(value)}\n`, (error) => error ? reject(error) : resolve()));
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    return this.closePromise ??= this.closeOwned();
+  }
+
+  private async closeOwned(): Promise<void> {
     this.closing = true;
     this.child.stdin.end(); // Pi shuts its session down on EOF.
     let timer: NodeJS.Timeout | undefined;

@@ -71,7 +71,7 @@ async function fixture(cwd: string, write: boolean, env: Record<string, string> 
   return id;
 }
 
-test("同工作区写任务排队，完成后续跑复用原会话；停止取消排队任务", async (t) => {
+test("独立写任务同工作区并行；完成释放进程后复用原会话；停止不重启", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-flow-"));
   t.after(async () => { await shutdownRuns("flow-parent"); await fs.rm(cwd, { recursive: true, force: true }); });
   const a = await fixture(cwd, true, { DECK_RPC_DELAY_MS: "350" });
@@ -79,7 +79,8 @@ test("同工作区写任务排队，完成后续跑复用原会话；停止取�
   await launchRunner(a);
   const firstPid = await until(async () => (await readRun(a))?.childPid, "首个写任务启动");
   await launchRunner(b);
-  await until(async () => (await readRun(b))?.status === "排队中" ? true : undefined, "第二个写任务排队");
+  await until(async () => (await readRun(b))?.childPid, "第二个独立写任务启动");
+  assert.ok(alive(firstPid), "第二个任务无需等待第一个任务结束");
   assert.equal((await sendToRun(a, "追加调查")).delivery, "queued");
   const first = await finished(a);
   assert.equal(first.status, "已完成");
@@ -89,17 +90,18 @@ test("同工作区写任务排队，完成后续跑复用原会话；停止取�
   assert.equal(resumed.delivery, "resumed");
   const last = await until(async () => { const run = await readRun(a); return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined; }, "原会话续跑");
   assert.match(last.finalText ?? "", /继续已经完成的任务/);
-  assert.equal(last.childPid, firstPid);
+  assert.equal(last.childPid, undefined);
+  assert.equal(alive(firstPid), false);
   assert.equal(last.childSessionId, first.childSessionId);
   assert.equal(last.model, first.model);
   const c = await fixture(cwd, true, { DECK_RPC_DELAY_MS: "500" });
-  const d = await fixture(cwd, true);
+  const d = await fixture(cwd, true, { DECK_RPC_HANG: "1" });
   await launchRunner(c);
-  await until(async () => (await readRun(c))?.childPid, "占用写锁");
+  await until(async () => (await readRun(c))?.childPid, "第三个任务启动");
   await launchRunner(d);
-  await until(async () => (await readRun(d))?.status === "排队中" ? true : undefined, "待取消任务排队");
+  await until(async () => (await readRun(d))?.childPid, "待停止任务启动");
   await sendToRun(d, "不应执行");
-  assert.equal((await stopRun(d)).status, "已取消");
+  assert.equal((await stopRun(d)).status, "已停止");
   await finished(c);
   assert.equal((await readRun(d))?.childPid, undefined);
   assert.equal(await launchRunner(d), 0);
@@ -153,5 +155,6 @@ test("Agent 公共入口立即返回，RPC 完成后自动交付结果", async (
   assert.equal(request.env.PI_AGENT_DECK_SIMPLE, "1");
   assert.equal(run.writePermission, false);
   assert.equal(run.thinking, "high");
-  assert.ok(alive(run.childPid), "RPC 会话在本轮完成后保持存活");
+  assert.equal(alive(run.childPid), false, "执行返回后进程自动释放");
+  assert.equal(run.resourceState, "released");
 });

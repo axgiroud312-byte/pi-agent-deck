@@ -62,7 +62,7 @@ export function renderFleet(runs: PersistedRun[], width: number, height: number,
     lines.push(twoColumns(`${theme.fg(view.color, view.icon)} ${plain(runTitle(run))} · ${plain(runRoleLabel(run))}`, theme.fg(view.color, `${plain(executionLabel(run))} · ${view.label}`), width));
   }
   const rest = visible.length - maxRows;
-  lines.push(truncateToWidth(theme.fg("muted", `${rest > 0 ? `另有 ${rest} 项 · ` : ""}/agents 查看 · 同工作区写任务依次执行`), width));
+  lines.push(truncateToWidth(theme.fg("muted", `${rest > 0 ? `另有 ${rest} 项 · ` : ""}/agents 查看 · 最多 8 个活跃子任务 · 主 Agent 安排依赖顺序`), width));
   return lines;
 }
 

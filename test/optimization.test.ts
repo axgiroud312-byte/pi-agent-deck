@@ -2,13 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import agentDeck from "../src/index.ts";
 import { parseDeckConfig, readDeckConfig, writeDeckConfig, DEFAULT_CONFIG, deckConfigPath } from "../src/config.ts";
 import { parseAgentDefinition, validateAgentDefinition } from "../src/agents.ts";
-import { acquireWriterLease, releaseWriterLease } from "../src/admission.ts";
 import { initializeRun, launchRunner, readRun, runDirectory, sendToRun, shutdownRuns } from "../src/runtime.ts";
 import { showAgentPanel } from "../src/ui.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -46,7 +44,7 @@ lines.on("line", (line) => {
     turn += 1;
     send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
     setTimeout(() => {
-      const text = turn === 1 ? "FIRST_RESULT" : "SECOND_RESULT";
+      const text = request.message.includes("继续第二轮") ? "SECOND_RESULT" : "FIRST_RESULT";
       send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
       send({ type: "agent_settled" });
     }, ${options.duration ?? 50});
@@ -139,19 +137,6 @@ test("配置入口编辑内置角色为个人覆盖，新任务读取有效的�
   const text = await fs.readFile(path.join(getAgentDir(), "agents", "scout.md"), "utf8");
   const role = parseAgentDefinition(text, "scout.md", "用户");
   assert.equal(role.timeoutMs, 0); assert.equal(role.thinking, "high"); assert.equal("maxConcurrent" in role, false);
-});
-
-test("同一非 Git 目录树和 Git 工作区的不同子目录不能同时写入", async () => {
-  const root = path.join(getAgentDir(), "nested-writers");
-  await fs.mkdir(path.join(root, "src"), { recursive: true });
-  const a = await acquireWriterLease(root, "nested-a"); assert.equal(a.acquired, true);
-  try { assert.equal((await acquireWriterLease(path.join(root, "src"), "nested-b")).acquired, false); }
-  finally { if (a.acquired) await releaseWriterLease(a.lease); }
-  await fs.mkdir(path.join(root, "tests"), { recursive: true });
-  execFileSync("git", ["init", "--quiet", root], { windowsHide: true });
-  const b = await acquireWriterLease(path.join(root, "src"), "git-a"); assert.equal(b.acquired, true);
-  try { assert.equal((await acquireWriterLease(path.join(root, "tests"), "git-b")).acquired, false); }
-  finally { if (b.acquired) await releaseWriterLease(b.lease); }
 });
 
 test("不同 cwd 的只读任务超过旧全局与角色限制仍同时启动", async (t) => {

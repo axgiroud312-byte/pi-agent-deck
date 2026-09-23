@@ -1,4 +1,5 @@
 import type { AgentDefinition, DelegationRequest } from "./types.ts";
+import { roleCapabilities } from "./capabilities.ts";
 
 function section(title: string, values: string[] | undefined): string {
   if (!values || values.length === 0) return "";
@@ -77,7 +78,9 @@ export function buildChildSystemPrompt(agent: AgentDefinition): string {
     "- 只处理收到的委派任务，不主动创建其他子 Agent。",
     `- ${permission}`,
     "- 工具权限是硬边界，不能尝试绕过。",
-    "- 常规可逆选择自行处理；确实缺少必要决定且无法继续时调用 agent_question 向主 Agent 提问。",
+    roleCapabilities(agent).canAsk
+      ? "- 常规可逆选择自行处理；确实缺少必要决定且无法继续时调用 agent_question 向主 Agent 提问。"
+      : "- 常规可逆选择自行处理；没有提问工具，无法继续时在最终回答中说明缺少的信息和已完成的工作。",
     "- 不要伪造已经读取的文件、已经执行的命令或已经通过的测试。",
     "- 完成后直接用自然语言回答：结论、必要证据、实际修改和验证、未完成事项。简单任务简短回答，无需填写固定报告。",
     "- 所有自然语言使用简体中文。",

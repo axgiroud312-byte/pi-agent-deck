@@ -97,6 +97,7 @@ test("panel separates answering, stopping and ordinary continuation; public resu
       assert.match(component.render(100).join("\n"), /是否保持兼容/);
       component.handleInput("a");
       component.handleInput("c");
+      component.handleInput("m");
       component.handleInput("x");
     } finally { component.dispose(); }
     return { action: "关闭" };
@@ -105,6 +106,7 @@ test("panel separates answering, stopping and ordinary continuation; public resu
   assert.deepEqual(actions, [
     { action: "回答问题", runId, questionId: "question-1" },
     { action: "继续", runId },
+    { action: "仅发信息", runId },
     { action: "停止", runId },
   ]);
 });

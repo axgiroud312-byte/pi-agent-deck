@@ -1,6 +1,6 @@
 # Pi Agent Deck
 
-给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.10.0**，采用 MIT 许可证。
+给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.11.0**，采用 MIT 许可证。
 
 主 Agent 用 `Agent` 派任务，用 `SendMessage` 补充要求或回答问题，用 `TaskStop` 停止任务。0.10.0 将通信收回主 Pi 进程：主 Pi 直接管理子 Pi 的 RPC 会话，不再依靠独立 Runner 和磁盘消息队列转发。
 
@@ -18,7 +18,9 @@
 | 可复用角色 | 使用内置角色，或用一句话创建个人角色 |
 | 可选 Jev 选配 | 在符合强制策略且当前可用的模型与思考强度组合中选择 |
 
-插件不设置全局或单个角色的 Agent 数量上限。实际同时运行多少个任务，由主 Agent 根据任务、模型服务和本机资源决定。
+每个主 Pi 会话固定最多 **8 个活跃子任务**。创建、选配、执行、等答复和释放中的任务占位；历史任务不占位。第 9 个新建或续接请求明确报错，不自动排队。主 Agent 决定实际需要几个任务，Jev 不负责调度。
+
+子 Agent **返回结果后自动释放进程**，主 Agent 独立验收；返工或补查复用原任务 ID 和 Pi 会话，不需要模型再决定是否关闭进程。
 
 ## 安装
 
@@ -35,7 +37,7 @@
 pi install git:github.com/axgiroud312-byte/pi-agent-deck
 ```
 
-然后在已经打开的 Pi 会话中输入：
+已有任务时先等它们结束，再在已经打开的 Pi 会话中输入：
 
 ```text
 /reload
@@ -69,7 +71,7 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 
 ## 三个工具
 
-工具名称和基础字段采用 Claude 风格，但行为以 Pi Agent Deck 的说明为准。0.10.0 保留原来的 `Agent`、`SendMessage` 和 `TaskStop` 参数，只给 `SendMessage` 新增了 `reply_to`：
+工具名称和基础字段采用 Claude 风格，但行为以 Pi Agent Deck 的说明为准。0.11.0 在 0.10.0 基础上只新增一个可选输入 `delivery`；它和 `reply_to` 都是本插件扩展：
 
 ```ts
 Agent({
@@ -85,7 +87,8 @@ SendMessage({
   to: string,                   // Agent 返回的 task_id/agentId，或实例名称
   message: string,              // 完整补充要求或问题答复
   summary?: string,             // 仅用于简短预览
-  reply_to?: string             // 回答阻塞问题时必须填写对应 questionId
+  reply_to?: string,            // 回答阻塞问题时必须填写对应 questionId
+  delivery?: "QueueOnly" | "TriggerTurn" // 默认 TriggerTurn；不能与 reply_to 同传
 })
 
 TaskStop({ task_id: string })   // 任务 ID 或实例名称
@@ -102,8 +105,20 @@ TaskStop({ task_id: string })   // 任务 ID 或实例名称
 
 - 同一个 `task_id` 始终定位同一个子 Session。初始执行以及从空闲状态继续工作时生成内部 `turnId`；运行中补充、问题答复仍属于当前执行，不生成新编号。用户只需要保存返回的 `agentId`，在 TaskStop 中作为 `task_id` 使用。
 - 子 Agent 正在运行时，补充要求通过 RPC `steer` 送入。Pi 会在当前工具调用结束、下一次模型调用开始前处理它；这不是逐 token 的即时中断。
-- 子 Agent 已结束时，补充要求在同一个任务和同一个子 Session 中开启新 turn，继续使用已有上下文。
+- 子 Agent 已结束时，默认的 `TriggerTurn` 重新启动子进程、打开同一个 Pi Session，开启新 turn，继续使用已有上下文。
 - `summary` 不替代 `message`，也不会截断正文。
+
+| delivery | 正在执行/等答复 | 执行已结束 |
+|---|---|---|
+| `QueueOnly` | 在消息边界补充；不能回答问题 | 信息暂存于主 Pi 内存，不启动进程、不占槽位 |
+| `TriggerTurn`（默认） | 补充当前执行；不能回答问题 | 有空槽位时复用原会话继续，带上暂存信息 |
+
+```ts
+SendMessage({ to: "scan-login", message: "这份日志供后续参考。", delivery: "QueueOnly" })
+SendMessage({ to: "scan-login", message: "请结合日志继续调查。", delivery: "TriggerTurn" })
+```
+
+两种方式都由调用参数决定，不使用模型猜测消息意图。QueueOnly 信息只保留在当前主 Pi 进程；退出或重载后不自动恢复。若补充恰逢执行结束，尚未被 Pi 消费的 QueueOnly 信息留待下一次 TriggerTurn。回执中的“已接收或排队”不代表模型已经读到。
 
 ### 回答阻塞问题
 
@@ -120,6 +135,7 @@ SendMessage({
 - 只有匹配当前问题的 `reply_to` 才能解除等待。
 - 普通 `SendMessage` 可以补充背景，但不能冒充问题答复，也不能让等待中的任务自行恢复。
 - 旧问题的 `questionId` 不能回答新问题。
+- `reply_to` 直接回答原工具调用，不启动新 turn，不额外占槽位；与 `delivery` 同传会报错。
 
 ### TaskStop
 
@@ -146,7 +162,7 @@ TaskStop({ task_id: "scan-login" })
 
 这三个工具借用了 Claude 风格的名称和部分字段，但本项目没有实现 Claude Code 的完整 Agent、团队、权限、工作树、远程执行或持久后台协议。
 
-## 0.10.0 的任务生命周期
+## 0.11.0 的任务生命周期
 
 主 Pi 进程持有每个活动任务的控制器，并直接通过 RPC 管理子 Pi：
 
@@ -154,7 +170,17 @@ TaskStop({ task_id: "scan-login" })
 2. 子 Pi 返回事件、工具调用和结果，主 Pi 直接更新面板并把结果交给当前父会话。
 3. `SendMessage` 使用相同任务编号和子 Session；运行中使用 `steer`，已结束任务开启下一轮。
 4. 阻塞问题保持等待，直到收到匹配 `reply_to` 的答复。
-5. `TaskStop`、主 Pi 退出或 `/reload` 会结束当前控制器及其子进程。
+5. Pi 发出 `agent_settled` 后，插件结合最后执行结果判断正常返回、失败或中断，保存结果并关闭子进程；不靠自然语言或静默时间猜测完成。
+6. 进程确认退出后释放槽位；任务 ID、Pi Session 和结果保留。“已返回结果”和“进程已释放”同时成立，是否验收通过由主 Agent 判断。
+7. `TaskStop` 清空消息、取消待答问题并中断当前执行；主 Pi 退出或 `/reload` 会结束其子进程。
+
+进度消息只传递、不自动唤醒主 Agent；问题和最终结果自动通知并唤醒，主 Agent 才能继续调度有依赖的下一项任务。
+
+面板快捷键：**C 继续工作 / 运行中补充**（TriggerTurn），**M 仅发信息**（QueueOnly），**A 回答问题**（自动带问题 ID），**X 停止**。详情显示进程资源状态和暂存信息数量。
+
+所有子 Agent 共享工作目录。插件不再用整个工作区的写锁强制串行：主 Agent 应划清修改范围，把有依赖或共享接口的任务顺序派发，独立任务才并行。不同文件也可能相互影响，最终仍须统一验收。
+
+派发前主 Agent 会收到角色的实际工具清单，以及读写、命令/测试、提问能力。内置 Explore 和 reviewer 没有 bash，不能承担执行测试的任务；实现角色可以运行命令。自定义角色配置错误会显示不可用原因并在启动前拒绝。
 
 0.10.0 删除了独立 Runner，以及通过 `follow-up.json` 等磁盘队列在重启后自动重放消息的路径。升级前保存的任务历史和旧队列文件不会被删除，但旧队列不会自动执行。需要继续的内容，应在升级并 `/reload` 后用新的 `SendMessage` 明确发送。
 
@@ -244,8 +270,8 @@ npm test
 npm pack --dry-run
 ```
 
-0.10.0 的最终自动化与打包结果会在发布前补入 [0.10.0 发布说明](docs/0.10.0-release.md)。在结果产生前，不把命令清单写成已经通过的验证结论。
+本次设计与验收范围见 [0.11.0 优化计划](docs/0.11.0-optimization-plan.md)，实际验证结果见 [0.11.0 发布说明](docs/0.11.0-release.md)。
 
-源码职责和修改约定见 [DEVELOPMENT.md](DEVELOPMENT.md)。版本变化见 [0.10.0 发布说明](docs/0.10.0-release.md)以及历史发布说明。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
+源码职责和修改约定见 [DEVELOPMENT.md](DEVELOPMENT.md)。版本变化见 [0.11.0 发布说明](docs/0.11.0-release.md)以及历史发布说明。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
 
 本项目是社区扩展，与 Pi、Anthropic 或 TypeSafe 官方没有隶属关系。许可证见 [MIT LICENSE](LICENSE)。

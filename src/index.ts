@@ -40,6 +40,8 @@ import { registerRouting } from "./routing-ui.ts";
 import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, requireAvailableModel, taskToolResult, runTitle, runRoleLabel } from "./tool-contract.ts";
 import { resolveTaskTarget, withTaskCreation } from "./task-identity.ts";
 import { AGENT_DECK_VERSION } from "./version.ts";
+import { roleCapabilities, roleCapabilityCatalog } from "./capabilities.ts";
+import { activeRunCount, reserveRunSlot } from "./run-capacity.ts";
 import type {
   AgentDefinition,
   DelegationRequest,
@@ -48,9 +50,6 @@ import type {
   RunStatus,
 } from "./types.ts";
 
-const DEFAULT_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
-const DEFAULT_WRITE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-const CHILD_SUPPORTED_TOOLS = new Set([...DEFAULT_READ_ONLY_TOOLS, ...DEFAULT_WRITE_TOOLS, "agent_report", "agent_question"]);
 const MAX_EVENTS = 200;
 const DECK_STATUS_KEY = "agent-deck";
 
@@ -186,7 +185,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => ({
     message: {
       customType: "agent-roles", display: false,
-      content: [agentAuthoringContext(), deckEnabled ? `可用 Agent 角色（subagent_type）：${discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }).map((agent) => `${agent.id}${agent.id === "worker" ? " / general-purpose" : agent.id === "scout" ? " / Explore" : ""}：${agent.description}`).join("；")}。Agent 只创建新任务；SendMessage 用返回的 agentId 或实例 name 继续；TaskStop 停止任务。` : "派遣已关闭，仍可停止任务、创建和编辑角色；开启派遣使用 /agent-deck 开启。"].join("\n"),
+      content: [agentAuthoringContext(), deckEnabled ? `角色实际能力（subagent_type；不继承主 Agent 的其他扩展）：\n${roleCapabilityCatalog(discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }))}\n本会话槽位 ${activeRunCount(ctx.sessionManager.getSessionId())}/8。Agent 新建；SendMessage 联系原任务；TaskStop 中断执行。` : "派遣已关闭，仍可停止任务、创建和编辑角色；开启派遣使用 /agent-deck 开启。"].join("\n"),
     },
   }));
 
@@ -210,16 +209,16 @@ export default function agentDeck(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "SendMessage", label: "联系 Agent", description: "向任务 ID 或实例名称发送补充要求：运行中在工具边界接收，已结束则沿用原会话继续。回答待答问题必须填写其 reply_to；普通消息不能解除等待。沿用原模型与思考强度。",
+    name: "SendMessage", label: "联系 Agent", description: "向任务 ID 或实例名称发消息。delivery 默认 TriggerTurn，空闲时在原会话继续；QueueOnly 仅发信息，不启动空闲任务。运行中均在 Pi 消息边界补充。回答问题仅用 reply_to，不与 delivery 同传；普通消息不能解除等待。沿用原模型与思考强度。",
     parameters: SendMessageParameters,
     async execute(_id, raw, _signal, _update, ctx) {
       if (!deckEnabled) throw new Error("Agent 已关闭，请在 /agent-deck 开启后重试。");
       const params = parseMessageInput(raw);
       const run = await resolveTaskTarget(params.to, ctx.sessionManager.getSessionId());
       await reconcileRun(run.runId);
-      const sent = await sendToRun(run.runId, params.message, params.summary, params.replyTo);
-      const message = params.replyTo ? "已提交指定问题的答复。" : sent.delivery === "queued" ? (sent.run.pendingQuestion ? "补充已排队，任务仍等待指定问题的答复。" : "消息已接收，将在工具边界送入执行；不表示模型已经读到。") : `已在原子会话继续；当前状态：${sent.run.status}。`;
-      return taskToolResult(sent.run, `${message} 结果会自动返回。摘要：${params.summary}`, sent.delivery, true);
+      const sent = await sendToRun(run.runId, params.message, params.summary, params.replyTo, params.delivery);
+      const message = params.replyTo ? "已提交指定问题的答复。" : sent.delivery === "deferred" ? "信息已暂存于主 Pi 进程，未启动子 Agent；下次 TriggerTurn 时一起送入。" : sent.delivery === "queued" ? (sent.run.pendingQuestion ? "补充已排队，任务仍等待指定问题的答复。" : "消息已接收或排队，不表示模型已经读到；若恰逢执行结束，QueueOnly 信息留待下次继续。") : `已在原子会话继续；当前状态：${sent.run.status}。`;
+      return taskToolResult(sent.run, `${message}${sent.delivery === "deferred" ? "" : " 执行结果会自动返回。"} 摘要：${params.summary}`, sent.delivery, true);
     },
   });
 
@@ -230,12 +229,14 @@ export default function agentDeck(pi: ExtensionAPI) {
     promptSnippet: "创建后台任务并自动接收结果；SendMessage 继续，TaskStop 停止",
     promptGuidelines: [
       "独立任务可并行派遣；不要重复执行已经交给子 Agent 的工作。",
-      "你决定子任务数量、角色、分工、依赖和验收。没有人为并发数量上限；同一工作区的写任务按顺序执行。",
+      "你决定任务数量、角色、分工、依赖和验收。每个主会话最多 8 个活跃子任务（包含选配、等待答复和释放过程）；满额明确报错，不自动排队。",
+      "派发前核对角色实际工具能力，测试任务需要命令能力。划清文件和接口范围；有先后依赖或共享接口的任务顺序执行，独立任务才并行。所有任务共享工作目录。",
       "默认省略 model，由 Jev 为新子任务选配模型和思考强度；仅在用户明确指定模型时传入覆盖值。Agent 不接受 thinking 参数。SendMessage 沿用符合当前策略的原配置。",
       "审查任务使用 reviewer 或 reportProfile: 审查 的自定义角色，只能用 GPT-5.6 Sol / xhigh 或 max。非审查角色禁止 GPT-5.6 Sol；GPT-6 Sol/Luna 最低 high。Jev、显式配置和关闭选配均遵守该策略。",
       "description 是简短标题；prompt 是完整任务；subagent_type 是角色；name 是可选实例名称。同一主会话内名称唯一，任务结束后仍保留绑定。",
       "完成和提问会自动返回，不要轮询或使用 sleep 等待；有独立工作就继续，否则告知用户正在等待。",
-      "根据证据判断结果，补充调查或返工调用 SendMessage，to 使用返回的 agentId 或实例 name，不能使用角色名。回答子 Agent 问题必须填写通知中的 reply_to；普通消息不会解除等待。能根据已有授权回答时直接回复，只把真正缺少的用户决定交给用户。",
+      "返回结果不等于验收通过：进程自动释放，你按证据独立验收。SendMessage 默认 TriggerTurn，在原会话继续；只传信息且不启动空闲任务时用 delivery: QueueOnly。to 用 agentId 或实例 name，不用角色名。",
+      "回答子 Agent 问题使用通知中的 reply_to，不能同时传 delivery；普通消息不解除等待。能根据已有授权回答时直接回复，只把真正缺少的用户决定交给用户。",
     ],
     parameters: AgentParameters,
 
@@ -254,9 +255,9 @@ export default function agentDeck(pi: ExtensionAPI) {
       const config = readDeckConfig();
       const model = resolveModelOverride(params.model, config);
       requireAvailableModel(model ?? agent.model, ctx);
-      const tools = agent.tools ?? (agent.writePermission ? DEFAULT_WRITE_TOOLS : DEFAULT_READ_ONLY_TOOLS);
-      const unsupportedTools = tools.filter((tool) => !CHILD_SUPPORTED_TOOLS.has(tool));
-      if (unsupportedTools.length) throw new Error(`Agent“${agent.name}”配置了 child runtime 不支持的工具：${unsupportedTools.join("、")}`);
+      const capability = roleCapabilities(agent);
+      if (capability.errors.length) throw new Error(`Agent“${agent.name}”不可用：${capability.errors.join("；")}`);
+      const tools = capability.tools;
       const routing = prepareRouting(agent, request.objective, ctx, config, pi.getThinkingLevel?.() ?? "off", { model });
       const resolved = routing.immediate ?? routing.fallback;
       const providers = prepareChildProviders(ctx.modelRegistry, [resolved.model, ...routing.candidates.map((candidate) => candidate.model)]);
@@ -264,90 +265,93 @@ export default function agentDeck(pi: ExtensionAPI) {
       const parent = ctx.sessionManager.getSessionId();
       const created = await withTaskCreation(parent, params.name, async () => {
         const runId = `A-${randomUUID().slice(0, 8)}`;
-        const providerSnapshot = await saveChildProviders(runId, providers);
-        const childSessionId = randomUUID();
-        const parentSessionPath = ctx.sessionManager.getSessionFile();
-        const childManager = SessionManager.create(ctx.cwd, undefined, {
-          id: childSessionId,
-          parentSession: parentSessionPath,
-        });
-        childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`);
-        const childSessionPath = childManager.getSessionFile();
-        if (!childSessionPath) throw new Error("无法创建持久化子 Session");
-        const instruction = request.objective;
-        const details: RunDetails = {
-          autoDeliver: true,
-          version: 1,
-          runId,
-          agentId: agent.id,
-          agentName: agent.name,
-          agentSource: agent.source,
-          instanceName: params.name,
-          description: params.description,
-          objective: shortTask(request.objective, 80),
-          instruction,
-          planContext: request.planContext,
-          batchId: request.batchId,
-          phase: request.phase,
-          acceptanceCriteria: request.acceptanceCriteria,
-          status: routing.immediate ? "运行中" : "选配中",
-          model: resolved.model,
-          thinking: resolved.thinking,
-          routing: routing.immediate,
-          routingPending: !routing.immediate,
-          tools,
-          writePermission: agent.writePermission,
-          parentSessionId: parent,
-          parentSessionPath,
-          childSessionId,
-          childSessionPath,
-          cwd: ctx.cwd,
-          startedAt: Date.now(),
-          reports: [],
-          events: [],
-          usage: emptyUsage(),
-        };
-        const background = true;
-        pushEvent(details, "状态", "已创建独立子 Session");
-        await appendIndex({
-          version: 1, event: "started", at: details.startedAt, runId, agentId: agent.id, agentName: agent.name,
-          objective: request.objective, status: details.status, model: details.model, thinking: details.thinking,
-          parentSessionId: details.parentSessionId, parentSessionPath, childSessionId, childSessionPath,
-        });
-        const directory = runDirectory(runId);
-        await fs.promises.mkdir(directory, { recursive: true });
-        const systemPath = path.join(directory, "SYSTEM.md");
-        await fs.promises.writeFile(systemPath, buildChildSystemPrompt(agent), { encoding: "utf8", mode: 0o600 });
-        const childTools = [...new Set([...tools.filter((tool) => tool !== "agent_report"), "agent_question"])];
-        const childArgs = [
-          "--mode", "rpc",
-          "--session", childSessionPath,
-          "--name", `子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`,
-          "--model", details.model,
-          "--thinking", details.thinking,
-          "--no-extensions",
-          "--extension", childRuntimePath(),
-          "--tools", childTools.join(","),
-          "--append-system-prompt", systemPath,
-        ];
-        const invocation = getPiInvocation(childArgs);
-        const runnerRequest: RunnerRequest = {
-          version: 1,
-          cwd: ctx.cwd,
-          command: invocation.command,
-          argsPrefix: invocation.args,
-          prompt: instruction,
-          naturalOutput: true,
-          timeoutMs: agent.timeoutMs ?? config.timeoutMs,
-          routing, review: routing.state.review,
-          env: {
-            ...(providerSnapshot ? { PI_AGENT_DECK_PROVIDERS: providerSnapshot } : {}),
-            PI_AGENT_DECK_RUN_ID: runId,
-            PI_AGENT_DECK_SIMPLE: "1",
-          },
-        };
-        await initializeRun(details, runnerRequest, background);
-        return details;
+        const release = reserveRunSlot(parent, runId);
+        try {
+          const providerSnapshot = await saveChildProviders(runId, providers);
+          const childSessionId = randomUUID();
+          const parentSessionPath = ctx.sessionManager.getSessionFile();
+          const childManager = SessionManager.create(ctx.cwd, undefined, {
+            id: childSessionId,
+            parentSession: parentSessionPath,
+          });
+          childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`);
+          const childSessionPath = childManager.getSessionFile();
+          if (!childSessionPath) throw new Error("无法创建持久化子 Session");
+          const instruction = request.objective;
+          const details: RunDetails = {
+            autoDeliver: true,
+            version: 1,
+            runId,
+            agentId: agent.id,
+            agentName: agent.name,
+            agentSource: agent.source,
+            instanceName: params.name,
+            description: params.description,
+            objective: shortTask(request.objective, 80),
+            instruction,
+            planContext: request.planContext,
+            batchId: request.batchId,
+            phase: request.phase,
+            acceptanceCriteria: request.acceptanceCriteria,
+            status: routing.immediate ? "运行中" : "选配中",
+            model: resolved.model,
+            thinking: resolved.thinking,
+            routing: routing.immediate,
+            routingPending: !routing.immediate,
+            tools,
+            writePermission: agent.writePermission,
+            parentSessionId: parent,
+            parentSessionPath,
+            childSessionId,
+            childSessionPath,
+            cwd: ctx.cwd,
+            startedAt: Date.now(),
+            reports: [],
+            events: [],
+            usage: emptyUsage(),
+          };
+          const background = true;
+          pushEvent(details, "状态", "已创建独立子 Session");
+          await appendIndex({
+            version: 1, event: "started", at: details.startedAt, runId, agentId: agent.id, agentName: agent.name,
+            objective: request.objective, status: details.status, model: details.model, thinking: details.thinking,
+            parentSessionId: details.parentSessionId, parentSessionPath, childSessionId, childSessionPath,
+          });
+          const directory = runDirectory(runId);
+          await fs.promises.mkdir(directory, { recursive: true });
+          const systemPath = path.join(directory, "SYSTEM.md");
+          await fs.promises.writeFile(systemPath, buildChildSystemPrompt(agent), { encoding: "utf8", mode: 0o600 });
+          const childTools = tools;
+          const childArgs = [
+            "--mode", "rpc",
+            "--session", childSessionPath,
+            "--name", `子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`,
+            "--model", details.model,
+            "--thinking", details.thinking,
+            "--no-extensions",
+            "--extension", childRuntimePath(),
+            "--tools", childTools.join(","),
+            "--append-system-prompt", systemPath,
+          ];
+          const invocation = getPiInvocation(childArgs);
+          const runnerRequest: RunnerRequest = {
+            version: 1,
+            cwd: ctx.cwd,
+            command: invocation.command,
+            argsPrefix: invocation.args,
+            prompt: instruction,
+            naturalOutput: true,
+            timeoutMs: agent.timeoutMs ?? config.timeoutMs,
+            routing, review: routing.state.review,
+            env: {
+              ...(providerSnapshot ? { PI_AGENT_DECK_PROVIDERS: providerSnapshot } : {}),
+              PI_AGENT_DECK_RUN_ID: runId,
+              PI_AGENT_DECK_SIMPLE: "1",
+            },
+          };
+          await initializeRun(details, runnerRequest, background);
+          return details;
+        } catch (error) { release(); throw error; }
       });
       await launchRunner(created.runId);
       const current = (await readRun(created.runId)) ?? created;
@@ -395,17 +399,17 @@ export default function agentDeck(pi: ExtensionAPI) {
       ctx.ui.notify(`${run.agentName}：${stopped.status}`, stopped.status === "停止未确认" ? "warning" : "info");
       return;
     }
-    if (action.action === "继续" || action.action === "回答问题") {
+    if (action.action === "继续" || action.action === "仅发信息" || action.action === "回答问题") {
       if (!readDeckConfig().enabled) return void ctx.ui.notify("多 Agent 已关闭，请先 /agent-deck 开启。", "warning");
       const question = action.action === "回答问题" ? run.pendingQuestion : undefined;
       if (action.action === "回答问题" && question?.id !== action.questionId) return void ctx.ui.notify("该问题已经回答或失效，请刷新任务面板。", "warning");
       const answer = await ctx.ui.editor(
-        question ? `回答 ${run.agentName}：${question.question}` : `补充 ${run.agentName}`,
+        question ? `回答 ${run.agentName}：${question.question}` : `${action.action === "仅发信息" ? "仅发信息（空闲时不启动）" : "继续工作 / 运行中补充"}：${run.agentName}`,
         "",
       );
       if (!answer?.trim()) return;
-      const sent = await sendToRun(run.runId, answer, undefined, question?.id);
-      ctx.ui.notify(question ? "已提交指定问题的答复。" : sent.delivery === "queued" ? `${runRoleLabel(run)}：消息已排队${sent.run.pendingQuestion ? "，仍等待问题答复" : "，将在工具边界接收"}。` : `${runRoleLabel(run)}：已在原会话继续，${sent.run.status}。`, "info");
+      const sent = await sendToRun(run.runId, answer, undefined, question?.id, question ? undefined : action.action === "仅发信息" ? "QueueOnly" : "TriggerTurn");
+      ctx.ui.notify(question ? "已提交指定问题的答复。" : sent.delivery === "deferred" ? "信息已暂存，未启动子 Agent。" : sent.delivery === "queued" ? `${runRoleLabel(run)}：消息已排队${sent.run.pendingQuestion ? "，仍等待问题答复" : "，将在 Pi 消息边界接收"}。` : `${runRoleLabel(run)}：已在原会话继续，${sent.run.status}。`, "info");
       return;
     }
   };
@@ -502,15 +506,9 @@ export default function agentDeck(pi: ExtensionAPI) {
   pi.registerCommand("agent-doctor", {
     description: "查看 Agent Deck 通信方式、当前任务和角色工具能力",
     handler: async (_args, ctx) => {
-      const supportedChildTools = CHILD_SUPPORTED_TOOLS;
       const agents = discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
       const definitionProblems = agents.flatMap((agent) => {
-        const errors = validateAgentDefinition(agent);
-        const unsupported = (agent.tools ?? []).filter((tool) => !supportedChildTools.has(tool));
-        return [
-          ...errors.map((error) => `${agent.id}：${error}`),
-          ...(unsupported.length ? [`${agent.id}：child runtime 未提供工具 ${unsupported.join("、")}`] : []),
-        ];
+        return roleCapabilities(agent).errors.map((error) => `${agent.id}：${error}`);
       });
       const runs = await listRuns(Number.MAX_SAFE_INTEGER, ctx.sessionManager.getSessionId());
       const lines = [
@@ -518,7 +516,8 @@ export default function agentDeck(pi: ExtensionAPI) {
         `Pi 宿主：${process.execPath} · ${process.version} · 模式：${ctx.mode}`,
         `项目：${ctx.cwd} · 信任：${ctx.isProjectTrusted() ? "已信任" : "未信任（项目 Agent 已忽略）"}`,
         `当前会话任务：${runs.length} · 待答问题：${runs.filter((run) => run.pendingQuestion).length}`,
-        `数量由主 Agent 决定 · Jev 选配：${readDeckConfig().routing.enabled ? "开启" : "关闭"}`,
+        `槽位 ${activeRunCount(ctx.sessionManager.getSessionId())}/8 · 数量由主 Agent 决定 · Jev 只选模型/思考：${readDeckConfig().routing.enabled ? "开启" : "关闭"}`,
+        "结果、失败、中断与进程资源分开记录；返回结果后自动释放进程，主 Agent 独立验收。",
         "关闭或重载主 Pi 会结束它管理的子进程；会话记录保留，之后可手动继续。",
         ...definitionProblems.map((problem) => `• ${problem}`),
       ];
@@ -547,9 +546,10 @@ export default function agentDeck(pi: ExtensionAPI) {
             return `${agent.id}｜${agent.name}｜${agent.source}｜${agent.model ?? "自动选配（遵守角色策略）"}｜${agent.writePermission ? "允许写入" : "只读"}\n  ${agent.description}\n  思考：${agent.thinking ?? "自动选配"} · 工具：${agent.tools?.join(", ") ?? "默认"}\n  时限：${timeout === 0 ? "不限时" : `${timeout} ms`}\n  文件：${agent.filePath}\n  编辑：/agent-config ${agent.id}${override}`;
           }).join("\n\n") + trustNotice
         : `没有发现 Agent 定义。${trustNotice}`;
-      if (ctx.mode !== "tui") return void ctx.ui.notify(text, "info");
+      const visible = `${roleCapabilityCatalog(agents)}\n\n${text}`;
+      if (ctx.mode !== "tui") return void ctx.ui.notify(visible, "info");
       await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => ({
-        render: (width) => new Text(`${theme.fg("accent", theme.bold("可用 Agent"))}\n\n${text}\n\n${theme.fg("dim", "按 Esc 关闭")}`, 1, 1).render(width),
+        render: (width) => new Text(`${theme.fg("accent", theme.bold("可用 Agent"))}\n\n${visible}\n\n${theme.fg("dim", "按 Esc 关闭")}`, 1, 1).render(width),
         handleInput: (data) => { if (data === "\u001b" || data === "\u0003") done(); },
         invalidate: () => {},
       }));

@@ -15,7 +15,7 @@ import {
   waitForRun,
   writeJsonAtomic,
 } from "../src/runtime.ts";
-import { writerLeasePath } from "../src/admission.ts";
+import { activeRunCount } from "../src/run-capacity.ts";
 
 function details(runId: string, cwd: string, overrides: Record<string, unknown> = {}): any {
   return {
@@ -70,15 +70,26 @@ async function rpcFixture(t: any, prompt = "HOLD"): Promise<{ runId: string; cwd
 import { createInterface } from "node:readline";
 const lines = createInterface({ input: process.stdin });
 let turn = 0;
+let queued = [];
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 lines.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.type === "get_state") return send({ type: "response", id: request.id, command: request.type, success: true, data: { isStreaming: false } });
-  if (request.type === "set_steering_mode" || request.type === "clear_queue" || request.type === "abort") return send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
+  if (request.type === "clear_queue") {
+    send({ type: "response", id: request.id, success: true, data: { steering: queued, followUp: [] } }); queued = []; return;
+  }
+  if (request.type === "set_steering_mode" || request.type === "abort") return send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
+  if (request.type === "steer") {
+    queued.push(request.message);
+    send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "BOUNDARY_DONE" }] } });
+    send({ type: "agent_settled" });
+    send({ type: "response", id: request.id, success: true });
+    return;
+  }
   if (request.type === "prompt") {
     turn += 1;
     send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
-    if (String(request.message).includes("HOLD")) return;
+    if (String(request.message).includes("HOLD") || request.message === "BOUNDARY") return;
     setTimeout(() => {
       send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "TURN_" + turn + ":" + request.message }] } });
       send({ type: "agent_settled" });
@@ -133,7 +144,7 @@ test("停止任务会结束实际子进程并保留任务记录", { skip: proces
   assert.equal(fs.existsSync(path.join(runDirectory(fixture.runId), "status.json")), true);
 });
 
-test("旧任务 request 损坏时不会先占用 writer lease", async (t) => {
+test("旧任务 request 损坏时不会先占用执行槽位", async (t) => {
   const runId = `test-corrupt-request-${randomUUID()}`;
   const cwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agent-deck-corrupt-request-"));
   const directory = runDirectory(runId);
@@ -149,12 +160,11 @@ test("旧任务 request 损坏时不会先占用 writer lease", async (t) => {
   await fs.promises.writeFile(path.join(directory, "request.json"), "{broken", "utf8");
   t.after(async () => {
     await fs.promises.rm(directory, { recursive: true, force: true });
-    await fs.promises.rm(writerLeasePath(cwd), { recursive: true, force: true });
     await fs.promises.rm(cwd, { recursive: true, force: true });
   });
 
   await assert.rejects(sendToRun(runId, "继续"), /JSON|Unexpected|position|property/i);
-  assert.equal(fs.existsSync(writerLeasePath(cwd)), false);
+  assert.equal(activeRunCount(`parent-${runId}`), 0);
 });
 
 test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t) => {
@@ -162,13 +172,13 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
   await launchRunner(fixture.runId);
   const first = await until(async () => {
     const run = await readRun(fixture.runId);
-    return run?.status === "已完成" ? run : undefined;
+    return run?.status === "已完成" && run.resourceState === "released" ? run : undefined;
   }, "第一轮完成");
   assert.match(first.finalText ?? "", /^TURN_1:FIRST$/);
   const firstTurn = first.turnId;
   const firstSession = first.childSessionId;
   const childPid = first.childPid;
-  assert.equal(alive(childPid), true, "单轮完成后子 Pi 应继续等待下一轮输入");
+  assert.equal(alive(childPid), false, "单轮完成后自动释放子 Pi");
 
   const resumed = await sendToRun(fixture.runId, "SECOND");
   assert.equal(resumed.delivery, "resumed");
@@ -177,9 +187,33 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
   assert.deepEqual(resumed.run.reports, []);
   const second = await until(async () => {
     const run = await readRun(fixture.runId);
-    return run?.status === "已完成" && run.turnId !== firstTurn ? run : undefined;
+    return run?.status === "已完成" && run.resourceState === "released" && run.turnId !== firstTurn ? run : undefined;
   }, "第二轮完成");
-  assert.match(second.finalText ?? "", /^TURN_2:SECOND$/);
+  assert.match(second.finalText ?? "", /^TURN_1:SECOND$/); // A fresh process reopens the same session.
   assert.equal(second.childSessionId, firstSession);
   assert.equal(second.childPid, childPid);
+});
+
+test("QueueOnly 恰逢 settled 时未消费信息回到邮箱；下次继续只送一次", async (t) => {
+  const fixture = await rpcFixture(t, "BOUNDARY");
+  await launchRunner(fixture.runId);
+  await until(async () => (await readRun(fixture.runId))?.currentAction === "子 Agent 正在执行" ? true : undefined, "首条任务已提交");
+  const before = (await readRun(fixture.runId))!;
+  await sendToRun(fixture.runId, "BOUNDARY_INFO", undefined, undefined, "QueueOnly");
+  const first = await until(async () => {
+    const run = await readRun(fixture.runId);
+    return run?.status === "已完成" ? run : undefined;
+  }, "边界完成");
+  assert.equal(first.turnId, before.turnId);
+  assert.equal(first.finalText, "BOUNDARY_DONE");
+  assert.equal(first.queuedMessageCount, 1);
+  assert.equal(first.resourceState, "released");
+  await sendToRun(fixture.runId, "CONTINUE");
+  const second = await until(async () => {
+    const run = await readRun(fixture.runId);
+    return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined;
+  }, "再次执行");
+  assert.equal(second.finalText?.split("BOUNDARY_INFO").length, 2);
+  assert.match(second.finalText ?? "", /BOUNDARY_INFO\s+CONTINUE/);
+  assert.equal(second.queuedMessageCount, 0);
 });

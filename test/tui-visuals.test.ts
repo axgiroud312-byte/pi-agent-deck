@@ -66,6 +66,24 @@ test("长中文任务名不挤掉状态和耗时，窄宽终端都不越界", as
   });
 });
 
+test("控制台区分执行结果与资源释放，并提供两种消息入口", async () => {
+  const f = await runs(["已完成"]);
+  const run = { ...f.values[0], resourceState: "released", queuedMessageCount: 2 };
+  await fs.writeFile(path.join(runDirectory(run.runId), "status.json"), JSON.stringify(run));
+  await withPanel(f.parent, (component, terminal, actions) => {
+    terminal.rows = 40;
+    component.handleInput("\r");
+    const output = component.render(120).join("\n");
+    assert.match(output, /已返回结果/);
+    assert.match(output, /进程已释放/);
+    assert.match(output, /暂存信息 2/);
+    assert.match(output, /M 仅发信息/);
+    component.handleInput("m");
+    component.handleInput("c");
+    assert.deepEqual(actions, [{ action: "仅发信息", runId: run.runId }, { action: "继续", runId: run.runId }]);
+  });
+});
+
 test("选配状态、最终组合、回退原因与耗时在实际面板中可读", async () => {
   const f = await runs(["选配中"]);
   const pending = { ...f.values[0], routingPending: true, thinking: "medium" };

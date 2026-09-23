@@ -10,6 +10,7 @@ import { readCompletions } from "./persistence.mjs";
 import { readDeckConfig } from "./config.ts";
 import { decisionText } from "./router.mjs";
 import { executionLabel } from "./presentation.ts";
+import { activeRunCount } from "./run-capacity.ts";
 import { countSummary, fit, frame, panelHeight, plain, runTime, sortRuns, statusText, twoColumns } from "./presentation.ts";
 
 export type AgentPanelAction =
@@ -18,6 +19,7 @@ export type AgentPanelAction =
   | { action: "配置" }
   | { action: "停止"; runId: string }
   | { action: "回答问题"; runId: string; questionId: string }
+  | { action: "仅发信息"; runId: string }
   | { action: "继续"; runId: string };
 type LogEntry = { at: number; kind: string; text: string };
 
@@ -122,6 +124,7 @@ class AgentPanelComponent {
     if (data.toLowerCase() === "x" && !isTerminalStatus(selected.status)) this.done({ action: "停止", runId: selected.runId });
     if (data.toLowerCase() === "a" && selected.pendingQuestion) this.done({ action: "回答问题", runId: selected.runId, questionId: selected.pendingQuestion.id });
     if (data.toLowerCase() === "c" && selected.status !== "停止中" && selected.status !== "停止未确认") this.done({ action: "继续", runId: selected.runId });
+    if (data.toLowerCase() === "m" && selected.status !== "停止中" && selected.status !== "停止未确认") this.done({ action: "仅发信息", runId: selected.runId });
   }
 
   render(width: number): string[] {
@@ -136,14 +139,14 @@ class AgentPanelComponent {
   private actionHint(run?: PersistedRun): string {
     const actions = [];
     if (run?.pendingQuestion) actions.push("A 回答问题");
-    if (run && run.status !== "停止中" && run.status !== "停止未确认") actions.push("C 继续/补充");
+    if (run && run.status !== "停止中" && run.status !== "停止未确认") actions.push("C 继续", "M 仅发信息");
     if (run && !isTerminalStatus(run.status)) actions.push("X 停止");
     return [...actions, "N 新建", "G 配置", "Esc 返回"].join(" · ");
   }
 
   private renderList(width: number, height: number): string[] {
     height = Math.min(height, this.runs.length ? this.runs.length * 2 + 5 : 7);
-    const lines = [countSummary(this.runs, this.theme), this.theme.fg("muted", `本会话 ${this.runs.length} 项任务 · Jev 自动选配${readDeckConfig().routing.enabled ? "开启" : "关闭"}`), ""];
+    const lines = [countSummary(this.runs, this.theme), this.theme.fg("muted", `槽位 ${activeRunCount(this.parentSessionId)}/8 · 本会话 ${this.runs.length} 项任务 · Jev ${readDeckConfig().routing.enabled ? "开启" : "关闭"}`), ""];
     this.pageSize = Math.max(1, Math.floor((height - 5) / 2));
     const start = Math.max(0, Math.min(this.selected - Math.floor(this.pageSize / 2), Math.max(0, this.runs.length - this.pageSize)));
     const end = Math.min(this.runs.length, start + this.pageSize);
@@ -171,12 +174,13 @@ class AgentPanelComponent {
       const label = `${index + 1} ${page === "报告" ? "结果" : page === "任务说明" ? "任务" : "实时"}`;
       return page === this.page ? this.theme.fg("accent", this.theme.bold(`[${label}]`)) : this.theme.fg("muted", label);
     }).join("   ");
-    const lines = [twoColumns(this.theme.bold(plain(runTitle(run))), `${statusText(run, this.theme)} · ${runTime(run)}`, width), this.theme.fg("muted", plain(runRoleLabel(run))), tabs, ""];
+    const resource = run.resourceState ? { starting: "进程启动中", running: "进程存活", releasing: "进程释放中", released: "进程已释放" }[run.resourceState] : "历史资源状态";
+    const lines = [twoColumns(this.theme.bold(plain(runTitle(run))), `${statusText(run, this.theme)} · ${runTime(run)}`, width), this.theme.fg("muted", `${plain(runRoleLabel(run))} · ${resource} · 暂存信息 ${run.queuedMessageCount ?? 0}`), tabs, ""];
     let content = this.page === "任务说明" ? this.renderInstruction(run, width) : this.page === "报告" ? this.renderReports(run, width) : this.renderTranscript(run, width);
     if (run.pendingQuestion) {
       const question = run.pendingQuestion;
       const choices = question.options.map((option, index) => `${index + 1}. ${option}`);
-      content = [...this.wrapLines([`待回答问题：${stripTerminalSequences(question.question)}`, ...choices, "按 A 回答问题；按 C 发送普通补充。", ""].join("\n"), width), ...content];
+      content = [...this.wrapLines([`待回答问题：${stripTerminalSequences(question.question)}`, ...choices, "A 回答问题；C/M 仅补充，不能解除等待。", ""].join("\n"), width), ...content];
     }
     if (!content.length) content = [this.theme.fg("muted", this.page === "实时记录" ? run.currentAction ?? "等待新的活动记录…" : "暂无结果。")];
     height = Math.min(height, content.length + 7);

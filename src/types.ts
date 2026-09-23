@@ -1,12 +1,18 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
-import type { WriterLease } from "./admission.ts";
 import type { RoutingDecision } from "./router.mjs";
 
 export type AgentSource = "内置" | "用户" | "项目";
 export type ReportProfile = "通用" | "侦察" | "执行" | "审查";
 export type RunStatus = "选配中" | "排队中" | "等待批准" | "运行中" | "等待决定" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
 export type ReportType = "进度" | "发现" | "问题" | "警告" | "最终";
+export type MessageDelivery = "QueueOnly" | "TriggerTurn";
+export type ResourceState = "starting" | "running" | "releasing" | "released";
+
+/** Read-only shape for historical records; no new writer leases are created. */
+export interface WriterLease {
+  version: 1; runId: string; ownerToken: string; cwd: string; leasePath: string; createdAt: number;
+}
 
 export interface AgentDefinition {
   id: string;
@@ -103,6 +109,9 @@ export interface RunEvent {
 export interface RunDetails {
   /** Stable task identity is runId. This identifies only the current execution. */
   turnId?: string;
+  resourceState?: ResourceState;
+  /** Informational count only; messages themselves are never persisted or replayed. */
+  queuedMessageCount?: number;
   pendingQuestion?: { id: string; turnId: string; question: string; options: string[] };
   autoDeliver?: boolean;
   version: 1;

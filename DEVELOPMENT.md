@@ -2,7 +2,7 @@
 
 ## 当前目标
 
-0.10.0 保持四个动作直观：派任务、接收结果、继续任务、停止任务。模型侧只注册 `Agent`、`SendMessage` 和 `TaskStop`。完整公开参数见 [README 的三个工具](README.md#三个工具)，参数 Schema 和运行时校验统一维护在 `tool-contract.ts`。
+0.11.0 保持四个动作直观：派任务、接收结果、继续任务、停止任务。模型侧只注册 `Agent`、`SendMessage` 和 `TaskStop`。完整公开参数见 [README 的三个工具](README.md#三个工具)，参数 Schema 和运行时校验统一维护在 `tool-contract.ts`。
 
 本版采用当前主 Pi 进程直接管理子 Pi RPC 会话的结构。活动任务不交给独立 Runner，也不通过持久消息队列跨重启转发。主进程退出或 `/reload` 时，当前活动控制器和子进程一起结束。
 
@@ -11,6 +11,8 @@
 - `index.ts`：扩展入口、三个模型工具、命令、父会话事件、活动控制器和结果交付。
 - `tool-contract.ts`：三个工具的参数 Schema、严格解析、角色/模型别名和公开回执。
 - `runtime.ts`：任务控制器、子 Session/RPC 生命周期、初始执行、`steer`、继续、停止和 turn 状态。
+- `run-capacity.ts`：当前主进程内按父会话同步占位，固定 8 个槽位；没有持久租约或自动排队。
+- `capabilities.ts`：同一份工具解析结果生成启动参数和派发前的角色能力目录。
 - `rpc-connection.ts`：Pi 原生 JSONL RPC 的薄连接层，处理请求匹配、事件、问答响应和进程退出。
 - `task-identity.ts`：按当前父会话解析任务 ID 或实例名称；名称只在所属父会话中绑定。
 - `child-runtime.ts`：子 Pi 的内部问题工具、阻塞状态和最小运行约束。
@@ -31,7 +33,7 @@
 
 ## 公开工具契约
 
-0.10.0 保留原参数，只为 `SendMessage` 增加 `reply_to`：
+0.11.0 保留原参数，为 `SendMessage` 新增可选的 `delivery`（reply_to 已在 0.10.0 提供）：
 
 ```ts
 Agent({
@@ -47,7 +49,8 @@ SendMessage({
   to: string,
   message: string,
   summary?: string,
-  reply_to?: string
+  reply_to?: string,
+  delivery?: "QueueOnly" | "TriggerTurn"
 })
 
 TaskStop({ task_id: string })
@@ -80,6 +83,12 @@ TaskStop({ task_id: string })
 - 不承诺在正在生成的 token 中间立即打断；
 - turn 结束后收到的新要求，在同一 Session 中启动新的 turn。
 
+`delivery` 默认 TriggerTurn。运行中 TriggerTurn 使用 Pi 的 prompt + streamingBehavior: steer，避免完成边界把新要求遗留在原生空闲队列；QueueOnly 使用 steer，绝不能隐式启动空闲执行。等待问题时两者都仅 steer。
+
+结束检查、输入、停止在同一 task 的控制队列中顺序执行。最终事件使用 Pi agent_settled，再核对原生状态与所属 turn；不把 agent_end 当作完成。结束时 clear_queue 取回边界处未消费的信息，放入主进程邮箱，再关闭进程。下一次 TriggerTurn 才带着邮箱内容打开原 Session。消息内容不落盘重放。
+
+进度向主 Agent 发送时 triggerTurn: false；问题和最终结果使用 followUp + triggerTurn: true。不要把完成通知也改成不唤醒，导致依赖任务无人派发。
+
 活动控制器只存在于当前主 Pi 进程。`session_shutdown`、`/reload` 和显式停止必须关闭子会话及其受控进程。不要重新引入脱离主进程的 Runner，也不要通过磁盘队列尝试恢复一个已经不存在的活动控制器。
 
 ## 问题与回答
@@ -91,12 +100,19 @@ TaskStop({ task_id: string })
 - 不匹配或已经过期的 `reply_to` 必须拒绝，不能误答另一轮问题。
 - 问题答复在原工具调用中返回，不创建新的 turn；运行中补充也仍属于当前 turn。
 - 结果消息应清楚提示如何填写 `reply_to`。
+- reply_to 不能与 delivery 同传；回复走原生 extension_ui_response，不产生新 turn。
 
 ## 停止与关闭
 
 `TaskStop` 定位当前父会话中的任务，关闭相应控制器和子 Pi。重复停止已经结束的任务应保留已有终态和结果。
 
 主 Pi 关闭或重载属于明确的活动任务生命周期边界。任务历史可继续显示，但不能把旧活动任务描述成仍在后台运行。
+
+正常返回后也自动关闭子进程，无需模型决定。执行 outcome 与 resourceState 分开：starting / running / releasing / released 不覆盖已完成、失败或已停止。完成结果可先保存，槽位在进程退出后释放。等待问题仍属于执行中，保留原进程与工具调用。
+
+创建、选配、运行、等待问题、停止和释放过程均占位。创建入口在写 Session 前 reserveRunSlot；runtime 初始化和续接也检查。第 9 项报错不排队；失败路径释放槽位；QueueOnly 空闲邮箱和问题回复不另占位。
+
+已删除旧工作区写锁及持久容量租约实现；历史字段只供兼容读取。不同文件可能存在接口和语义依赖，分工与顺序由主 Agent 决定，不引入工作树或自动依赖图。
 
 ## 历史与升级
 
@@ -114,7 +130,7 @@ TaskStop({ task_id: string })
 - 非审查任务不能使用 GPT-5.6 Sol；
 - GPT-6 Sol 和 GPT-6 Luna 最低为 `high`；
 - GPT-6 Astra 对所有子 Agent 停用；
-- 插件没有全局或角色并发数量上限。
+- 每个主 Pi 会话固定最多 8 个活跃子任务；Jev 不参与占位和调度。
 
 显式模型、角色固定值、模型别名、关闭 Jev 和回退路径都必须遵守同一策略。Jev 缺少密钥、超时或返回无效选项时，只能使用预先校验的合规回退。
 
@@ -159,9 +175,11 @@ npm pack --dry-run
 - 主 Pi 关闭、重载和显式停止会清理活动子进程；
 - 旧持久队列保留但不会自动执行；
 - Jev 只选模型与思考强度，且所有入口遵守模型策略；
-- 多个任务并行时没有人为数量上限；
+- 并发创建和续接的 8/9 边界、等待占位、失败释放、QueueOnly 不唤醒；
+- 自动释放实际进程后，原任务和 Session 上下文仍能续接；
+- 角色目录与真实 Pi 模型收到的工具列表一致；
 - 父会话隔离、实例名称和任务编号解析；
-- 发布包包含当前 README、DEVELOPMENT 和 0.10.0 发布说明。
+- 发布包包含当前 README、DEVELOPMENT 和 0.11.0 发布说明。
 
 自动化测试、受控假模型和本地 fixture 不能写成真实模型质量证明。最终通过数量、平台验收和打包清单只能在对应命令实际完成后写入发布说明。
 
