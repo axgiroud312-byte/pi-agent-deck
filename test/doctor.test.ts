@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
-import childRuntime from "../src/child-runtime.ts";
-import { AGENT_DECK_VERSION, CHILD_RUNTIME_PROTOCOL_VERSION } from "../src/version.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import agentDeck from "../src/index.ts";
+import { AGENT_DECK_VERSION } from "../src/version.ts";
 
 const packageJson = JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8"));
 
@@ -12,26 +12,35 @@ test("package 版本与运行时代码版本一致", () => {
   assert.equal(packageJson.version, AGENT_DECK_VERSION);
 });
 
-test("child runtime 写入带版本和 token 的确认文件", async (t) => {
-  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agent-deck-ack-"));
-  const ackPath = path.join(directory, "runtime-ack.json");
-  const previousPath = process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH;
-  const previousToken = process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN;
-  process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH = ackPath;
-  process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN = "test-token";
-  t.after(() => {
-    if (previousPath === undefined) delete process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH;
-    else process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH = previousPath;
-    if (previousToken === undefined) delete process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN;
-    else process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN = previousToken;
-    fs.rmSync(directory, { recursive: true, force: true });
+test("doctor 展示当前 RPC 运行方式、任务概况和角色能力诊断", async () => {
+  const commands = new Map<string, any>();
+  const notifications: Array<{ message: string; level: string }> = [];
+  agentDeck({
+    on() {},
+    registerTool() {},
+    registerCommand: (name: string, command: any) => commands.set(name, command),
+    registerMessageRenderer() {},
+    getActiveTools: () => [],
+    setActiveTools() {},
+    sendMessage() {},
+  } as any);
+  const doctor = commands.get("agent-doctor");
+  assert.ok(doctor);
+  assert.match(doctor.description, /通信方式/);
+  assert.match(doctor.description, /角色工具能力/);
+  await doctor.handler("", {
+    mode: "tui",
+    cwd: getAgentDir(),
+    isProjectTrusted: () => false,
+    sessionManager: { getSessionId: () => "doctor-parent" },
+    ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
   });
-
-  let registered = false;
-  childRuntime({ registerTool: () => { registered = true; } } as any);
-  assert.equal(registered, true);
-  const ack = JSON.parse(await fs.promises.readFile(ackPath, "utf8"));
-  assert.equal(ack.token, "test-token");
-  assert.equal(ack.extensionVersion, AGENT_DECK_VERSION);
-  assert.equal(ack.protocolVersion, CHILD_RUNTIME_PROTOCOL_VERSION);
+  assert.equal(notifications.length, 1);
+  const output = notifications[0].message;
+  assert.match(output, new RegExp(`Agent Deck ${AGENT_DECK_VERSION}`));
+  assert.match(output, /主 Pi 管理 RPC 子会话/);
+  assert.match(output, /当前会话任务：0/);
+  assert.match(output, /数量由主 Agent 决定/);
+  assert.match(output, /关闭或重载主 Pi会结束|关闭或重载主 Pi 会结束/);
+  assert.doesNotMatch(output, /runtime-ack|协议版本|构建指纹|Runner/);
 });

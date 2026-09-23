@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { initializeRun, runDirectory } from "../src/runtime.ts";
+import { runDirectory } from "../src/runtime.ts";
 import { showAgentPanel } from "../src/ui.ts";
 import { panelHeight, renderFleet } from "../src/presentation.ts";
 import { editAgentConfig, editGlobalConfig, selectAgentTools } from "../src/config-editor.ts";
@@ -20,7 +20,10 @@ async function runs(statuses: string[], objective = "任务") {
   const values: any[] = [];
   for (let index = 0; index < statuses.length; index++) {
     const run = { version: 1, runId: `${parent}-${index}`, agentId: "fixture", agentName: `角色 ${index}`, objective: `${objective} ${index}`, instruction: "按描述调查，并提供证据。", status: statuses[index], parentSessionId: parent, model: "fixture/model", startedAt: Date.now() - 125000, reports: [], events: [], currentAction: "正在读取任务文件", finalText: "## 结论\n\n**已检查**\n\n- 给出建议\n- 需要验证" };
-    values.push(await initializeRun(run as any, { version: 1, cwd: getAgentDir(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true));
+    // These are display records, not live controllers owned by the test process.
+    await fs.mkdir(runDirectory(run.runId), { recursive: true });
+    await fs.writeFile(path.join(runDirectory(run.runId), "status.json"), JSON.stringify(run));
+    values.push(run);
   }
   return { parent, values };
 }

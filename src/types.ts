@@ -101,6 +101,9 @@ export interface RunEvent {
 }
 
 export interface RunDetails {
+  /** Stable task identity is runId. This identifies only the current execution. */
+  turnId?: string;
+  pendingQuestion?: { id: string; turnId: string; question: string; options: string[] };
   autoDeliver?: boolean;
   version: 1;
   runId: string;

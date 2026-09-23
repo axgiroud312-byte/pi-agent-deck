@@ -67,7 +67,7 @@ export async function withDiskLock(directory, action) {
 }
 
 export function completionId(run) {
-  return `${run.runId}:${run.attemptStartedAt ?? run.startedAt}:${run.endedAt}:${run.status}`;
+  return `${run.runId}:${run.turnId ?? run.attemptStartedAt ?? run.startedAt}:${run.pendingQuestion?.id ?? run.endedAt}:${run.status}`;
 }
 export async function persistCompletion(directory, run) {
   if (!run.autoDeliver || !["已完成", "失败", "已取消", "已停止", "失联", "等待决定"].includes(run.status)) return;
@@ -75,7 +75,7 @@ export async function persistCompletion(directory, run) {
   const file = path.join(directory, "results", `${createHash("sha256").update(deliveryId).digest("hex")}.json`);
   try { await fs.access(file); return; } catch (error) { if (error.code !== "ENOENT") throw error; }
   const snapshot = {
-    autoDeliver: true, runId: run.runId, parentSessionId: run.parentSessionId,
+    autoDeliver: true, runId: run.runId, parentSessionId: run.parentSessionId, turnId: run.turnId,
     agentId: run.agentId, agentName: run.agentName, instanceName: run.instanceName,
     description: run.description, objective: run.objective, status: run.status,
     model: run.model, thinking: run.thinking, routing: run.routing, routingPending: run.routingPending,

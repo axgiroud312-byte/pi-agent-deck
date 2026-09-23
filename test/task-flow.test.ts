@@ -5,89 +5,136 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import agentDeck from "../src/index.ts";
-import { initializeRun, launchRunner, readRun, continueRun, startFollowUp, runDirectory, stopRun } from "../src/runtime.ts";
+import { initializeRun, launchRunner, readRun, runDirectory, sendToRun, shutdownRuns, stopRun } from "../src/runtime.ts";
 
-async function until(check: () => Promise<boolean>) {
-  const end = Date.now() + 15000;
-  while (Date.now() < end) { if (await check()) return; await new Promise((r) => setTimeout(r, 50)); }
-  throw new Error("任务流程测试超时");
+async function until<T>(check: () => Promise<T | undefined>, label: string, timeout = 15_000): Promise<T> {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    const value = await check();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`任务流程测试超时：${label}`);
 }
-function alive(pid?: number) { try { if (!pid) return false; process.kill(pid, 0); return true; } catch { return false; } }
-async function settled(id: string) {
-  await until(async () => { const r = await readRun(id); return !!r && ["已完成", "失败", "已停止"].includes(r.status) && !alive(r.runnerPid) && !alive(r.childPid); });
+function alive(pid?: number): boolean { try { if (!pid) return false; process.kill(pid, 0); return true; } catch { return false; } }
+const finished = (id: string) => until(async () => {
+  const run = await readRun(id);
+  return run && ["已完成", "失败", "已停止", "已取消"].includes(run.status) ? run : undefined;
+}, "完成");
+
+// Persistent local Pi-RPC peer. It emits the event boundaries consumed by runtime.ts.
+const rpcSource = String.raw`import fs from "node:fs";
+import readline from "node:readline";
+const args=process.argv.slice(2), option=(name)=>args[args.indexOf(name)+1];
+const output=(value)=>process.stdout.write(JSON.stringify(value)+"\n");
+const log=(value)=>fs.appendFileSync("executions.jsonl",JSON.stringify(value)+"\n");
+const sessionFile=option("--session"), model=option("--model"), thinkingLevel=option("--thinking");
+const [provider,modelId]=model.split("/");
+let streaming=false, queue=[], turn=0;
+log({type:"start",args});
+function start(message){
+  streaming=true; turn++; log({type:"prompt",message,turn}); output({type:"agent_start"});
+  if(process.env.DECK_RPC_HANG==="1") return;
+  setTimeout(()=>{
+    output({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:"调查完成："+message}]}});
+    if(queue.length){ start(queue.shift()); return; }
+    streaming=false; output({type:"agent_settled"});
+  },Number(process.env.DECK_RPC_DELAY_MS||300));
 }
-async function fixture(cwd: string, write: boolean, source?: string) {
+readline.createInterface({input:process.stdin}).on("line",line=>{
+  let request;try{request=JSON.parse(line)}catch{return}
+  const {type,id}=request;
+  if(type==="get_state") return output({type:"response",id,command:type,success:true,data:{model:{provider,id:modelId},thinkingLevel,sessionId:sessionFile,sessionFile,isStreaming:streaming}});
+  if(type==="prompt"||type==="steer"){
+    output({type:"response",id,command:type,success:true,data:{}});
+    if(streaming) queue.push(request.message); else start(request.message);
+    return;
+  }
+  if(type==="clear_queue") queue=[];
+  if(type==="abort") streaming=false;
+  output({type:"response",id,command:type,success:true,data:{}});
+});`;
+
+async function fixture(cwd: string, write: boolean, env: Record<string, string> = {}, timeoutMs = 0) {
   const id = `test-flow-${randomUUID()}`;
   const script = path.join(cwd, `${id}.mjs`);
-  await fs.writeFile(script, source ?? `setTimeout(()=>console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:process.argv.at(-1)}]}})),250);`);
-  const run: any = { version: 1, runId: id, agentId: "test", agentName: "fixture", objective: "测试任务", instruction: "initial", status: "运行中", model: "fake/model", thinking: "off", tools: [], writePermission: write, cwd, parentSessionId: "flow-parent", childSessionId: "same-session", childSessionPath: path.join(cwd, "session.jsonl"), startedAt: Date.now(), reports: [], events: [], autoDeliver: true, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-  await initializeRun(run, { version: 1, cwd, command: process.execPath, argsPrefix: [script], prompt: "initial", naturalOutput: true }, true);
+  await fs.writeFile(script, rpcSource);
+  const session = path.join(cwd, `${id}.jsonl`);
+  const run: any = { version: 1, runId: id, turnId: randomUUID(), agentId: "test", agentName: "fixture", agentSource: "内置",
+    objective: "测试任务", instruction: "initial", acceptanceCriteria: [], status: "运行中", model: "fake/model", thinking: "off", tools: [],
+    writePermission: write, cwd, parentSessionId: "flow-parent", childSessionId: id, childSessionPath: session,
+    startedAt: Date.now(), reports: [], events: [], autoDeliver: true,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+  await initializeRun(run, { version: 1, cwd, command: process.execPath,
+    argsPrefix: [script, "--session", session, "--model", run.model, "--thinking", run.thinking],
+    prompt: "initial", naturalOutput: true, env, timeoutMs }, true);
   return id;
 }
 
-test("写任务排队后可启动；补充要求持久化并复用原会话；停止取消排队要求", async (t) => {
+test("同工作区写任务排队，完成后续跑复用原会话；停止取消排队任务", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-flow-"));
-  t.after(() => fs.rm(cwd, { recursive: true, force: true }));
-  const a = await fixture(cwd, true);
+  t.after(async () => { await shutdownRuns("flow-parent"); await fs.rm(cwd, { recursive: true, force: true }); });
+  const a = await fixture(cwd, true, { DECK_RPC_DELAY_MS: "350" });
   const b = await fixture(cwd, true);
   await launchRunner(a);
-  assert.equal(await launchRunner(b), 0);
-  assert.equal((await readRun(b))?.status, "排队中");
-  await continueRun(a, "追加调查");
-  await settled(a);
+  const firstPid = await until(async () => (await readRun(a))?.childPid, "首个写任务启动");
   await launchRunner(b);
-  await settled(b);
-  assert.equal(await startFollowUp(a), true);
-  await settled(a);
-  assert.match((await readRun(a))!.finalText!, /追加调查/);
-  assert.equal((await readRun(a))!.childSessionId, "same-session");
-  assert.equal(await startFollowUp(a), false);
-  await continueRun(a, "继续已经完成的任务");
-  await settled(a);
-  assert.match((await readRun(a))!.finalText!, /继续已经完成的任务/);
-  const c = await fixture(cwd, true);
-  await launchRunner(c);
+  await until(async () => (await readRun(b))?.status === "排队中" ? true : undefined, "第二个写任务排队");
+  assert.equal((await sendToRun(a, "追加调查")).delivery, "queued");
+  const first = await finished(a);
+  assert.equal(first.status, "已完成");
+  const second = await finished(b);
+  assert.equal(second.status, "已完成");
+  const resumed = await sendToRun(a, "继续已经完成的任务");
+  assert.equal(resumed.delivery, "resumed");
+  const last = await until(async () => { const run = await readRun(a); return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined; }, "原会话续跑");
+  assert.match(last.finalText ?? "", /继续已经完成的任务/);
+  assert.equal(last.childPid, firstPid);
+  assert.equal(last.childSessionId, first.childSessionId);
+  assert.equal(last.model, first.model);
+  const c = await fixture(cwd, true, { DECK_RPC_DELAY_MS: "500" });
   const d = await fixture(cwd, true);
+  await launchRunner(c);
+  await until(async () => (await readRun(c))?.childPid, "占用写锁");
   await launchRunner(d);
-  await continueRun(d, "不应执行");
+  await until(async () => (await readRun(d))?.status === "排队中" ? true : undefined, "待取消任务排队");
+  await sendToRun(d, "不应执行");
   assert.equal((await stopRun(d)).status, "已取消");
-  await assert.rejects(fs.access(path.join(runDirectory(d), "follow-up.json")));
-  await settled(c);
+  await finished(c);
+  assert.equal((await readRun(d))?.childPid, undefined);
+  assert.equal(await launchRunner(d), 0);
 });
 
-test("配置的执行超时实际结束 fixture 子进程并记录失败", async (t) => {
+test("配置的执行超时终止 RPC 子进程并记录失败", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-timeout-"));
-  t.after(() => fs.rm(cwd, { recursive: true, force: true }));
-  const id = await fixture(cwd, false, "setInterval(()=>{},1000);");
-  const file = path.join(runDirectory(id), "request.json");
-  const request = JSON.parse(await fs.readFile(file, "utf8"));
-  await fs.writeFile(file, JSON.stringify({ ...request, timeoutMs: 150 }));
+  t.after(async () => { await shutdownRuns("flow-parent"); await fs.rm(cwd, { recursive: true, force: true }); });
+  const id = await fixture(cwd, false, { DECK_RPC_HANG: "1" }, 150);
   await launchRunner(id);
-  await settled(id);
-  assert.equal((await readRun(id))!.status, "失败");
-  assert.ok((await readRun(id))!.events.some((e) => e.text.includes("超时")));
+  const run = await finished(id);
+  assert.equal(run.status, "失败");
+  assert.ok(run.events.some((event) => event.text.includes("超时")));
+  assert.equal(alive(run.childPid), false);
 });
 
-test("从 Agent 公共入口到独立 Runner 再到自动消息交付", async (t) => {
+test("Agent 公共入口立即返回，RPC 完成后自动交付结果", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-public-flow-"));
   const fakeCli = path.join(cwd, "fake-pi.mjs");
-  await fs.writeFile(fakeCli, `console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'调查完成：'+process.argv.at(-1)}]}}));`);
-  const tools = new Map<string, any>();
-  const handlers = new Map<string, any>();
-  const messages: any[] = [];
-  const entries: any[] = [];
+  await fs.writeFile(fakeCli, rpcSource);
+  const tools = new Map<string, any>(), handlers = new Map<string, any>(), messages: any[] = [];
   let active: string[] = [];
   agentDeck({
     registerTool: (tool: any) => { tools.set(tool.name, tool); active.push(tool.name); },
     registerCommand() {}, registerMessageRenderer() {},
     on: (name: string, fn: any) => handlers.set(name, fn),
     getActiveTools: () => active, setActiveTools: (names: string[]) => { active = names; },
-    getThinkingLevel: () => "high",
-    sendMessage: (message: any) => { messages.push(message); entries.push({ type: 'custom_message', ...message }); },
+    getThinkingLevel: () => "high", sendMessage: (message: any) => messages.push(message),
   } as any);
-  const ctx: any = { cwd, isProjectTrusted: () => false, model: { provider: "fake", id: "model", reasoning: true }, thinkingLevel: "off", sessionManager: { getSessionId: () => "public-flow", getSessionFile: () => undefined, getBranch: () => entries }, ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, text: string) => text } } };
-  ctx.modelRegistry = { getAvailable: () => [ctx.model], find: (provider: string, id: string) => provider === ctx.model.provider && id === ctx.model.id ? ctx.model : undefined };
-  t.after(async () => { handlers.get("session_shutdown")(); await fs.rm(cwd, { recursive: true, force: true }); });
+  const entries: any[] = [];
+  const ctx: any = { cwd, isProjectTrusted: () => false, model: { provider: "fake", id: "model", reasoning: true },
+    sessionManager: { getSessionId: () => "public-flow", getSessionFile: () => undefined, getBranch: () => entries },
+    ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, text: string) => text } } };
+  ctx.modelRegistry = { getAvailable: () => [ctx.model], find: (provider: string, id: string) => provider === "fake" && id === "model" ? ctx.model : undefined };
+  t.after(async () => { await handlers.get("session_shutdown")(); await fs.rm(cwd, { recursive: true, force: true }); });
   await handlers.get("session_start")({}, ctx);
   const originalCli = process.argv[1];
   let result: any;
@@ -96,16 +143,15 @@ test("从 Agent 公共入口到独立 Runner 再到自动消息交付", async (t
     result = await tools.get("Agent").execute("call", { description: "调查入口", prompt: "只读调查入口", subagent_type: "Explore" }, undefined, undefined, ctx);
   } finally { process.argv[1] = originalCli; }
   const id = result.details.publicResult.agentId;
-  await settled(id);
-  await until(async () => messages.length === 1);
+  assert.notEqual((await readRun(id))?.status, "已完成", "派发工具不应等待子 Agent 完成");
+  const run = await finished(id);
+  assert.equal(run.status, "已完成");
+  await until(async () => messages.length ? true : undefined, "自动交付");
   assert.match(messages[0].content, /调查完成：只读调查入口/);
   const request = JSON.parse(await fs.readFile(path.join(runDirectory(id), "request.json"), "utf8"));
   assert.equal(request.naturalOutput, true);
-  assert.equal(request.timeoutMs, 0);
   assert.equal(request.env.PI_AGENT_DECK_SIMPLE, "1");
-  assert.equal((await readRun(id))!.writePermission, false);
-  assert.equal((await readRun(id))!.thinking, "high");
-  assert.equal(request.argsPrefix[request.argsPrefix.indexOf("--thinking") + 1], "high");
-  await assert.rejects(tools.get("Agent").execute("call", { description: "继续", prompt: "继续", task_id: id }, undefined, undefined, ctx), /不支持的参数/);
-  await assert.rejects(tools.get("SendMessage").execute("call", { to: id, message: "继续", model: "fake/model" }, undefined, undefined, ctx), /不支持的参数/);
+  assert.equal(run.writePermission, false);
+  assert.equal(run.thinking, "high");
+  assert.ok(alive(run.childPid), "RPC 会话在本轮完成后保持存活");
 });

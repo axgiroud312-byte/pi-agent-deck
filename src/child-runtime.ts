@@ -1,11 +1,9 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import type { AgentReport } from "./types.ts";
-import { AGENT_DECK_VERSION, CHILD_RUNTIME_PROTOCOL_VERSION } from "./version.ts";
+
 import { registerChildProviders } from "./child-providers.ts";
 
 const StringList = Type.Optional(Type.Array(Type.String()));
@@ -94,34 +92,27 @@ function normalizeCriterion(value: string): string {
   return value.replace(/\s+/g, " ").trim().toLocaleLowerCase("zh-CN");
 }
 
+async function awaitQuestionAnswer(report: AgentReport, signal: AbortSignal | undefined, ctx: { ui: { input: (title: string, placeholder?: string, options?: { signal?: AbortSignal }) => Promise<string | undefined> } }): Promise<string> {
+  if (signal?.aborted) throw signal.reason ?? new Error("问题等待已取消");
+  const question = report.question?.trim() || report.summary;
+  const choices = report.options.length ? `可选回答：\n${report.options.map((option, index) => `${index + 1}. ${option}`).join("\n")}` : undefined;
+  const answer = await ctx.ui.input(question, choices, { signal });
+  if (signal?.aborted) throw signal.reason ?? new Error("问题等待已取消");
+  if (!answer?.trim()) throw new Error("问题尚未获得主 Agent 的答复");
+  return answer.trim();
+}
+
 export default function childRuntime(pi: ExtensionAPI) {
   registerChildProviders(pi);
-  const ackPath = process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH;
-  const ackToken = process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN;
-  if (ackPath && ackToken) {
-    try {
-      fs.mkdirSync(path.dirname(ackPath), { recursive: true });
-      const temporary = `${ackPath}.${process.pid}.${Date.now()}.tmp`;
-      fs.writeFileSync(temporary, `${JSON.stringify({
-        version: 1,
-        token: ackToken,
-        extensionVersion: AGENT_DECK_VERSION,
-        protocolVersion: CHILD_RUNTIME_PROTOCOL_VERSION,
-        pid: process.pid,
-        acknowledgedAt: Date.now(),
-      }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-      fs.renameSync(temporary, ackPath);
-    } catch { /* doctor 会报告缺少运行时确认，不能让诊断写入破坏任务 */ }
-  }
-
   pi.registerTool({
     name: "agent_question",
     label: "询问主 Agent",
     description: "确实缺少必要信息且无法继续时提问。常规可逆选择自行处理。",
     parameters: Type.Object({ question: Type.String({ minLength: 1 }), options: StringList }),
-    async execute(_id, params) {
+    async execute(_id, params, signal, _update, ctx) {
       const report = normalize({ type: "问题", title: "需要答复", summary: params.question, question: params.question, options: params.options, blocking: true });
-      return { content: [{ type: "text", text: "问题已交给主 Agent。" }], details: report, terminate: true };
+      const answer = await awaitQuestionAnswer(report, signal, ctx);
+      return { content: [{ type: "text", text: `主 Agent 的答复：${answer}` }], details: report };
     },
   });
   if (process.env.PI_AGENT_DECK_SIMPLE === "1") return;
@@ -132,13 +123,13 @@ export default function childRuntime(pi: ExtensionAPI) {
     promptSnippet: "提交阶段性发现、阻塞问题或最终结构化报告",
     promptGuidelines: [
       "使用 agent_report 报告会影响后续决策的重要发现，不要用它重复每个普通工具步骤。",
-      "遇到无法自行决定的关键问题时，使用 agent_report 提交 blocking=true 的“问题”报告并暂停。",
+      "遇到无法自行决定的关键问题时，使用 agent_report 提交 blocking=true 的“问题”报告，并在同一次工具调用中等待答复。",
       "完成委派任务时，最后一个动作必须使用 agent_report 提交“最终”报告。",
       "最终报告必须逐项填写 acceptanceCriteria，说明每项是通过、部分完成、未完成还是未验证，并提供证据或原因。",
       "最终报告必须清楚列出交付物、读取和修改的文件、设计决定、命令、测试状态、风险、未知项及下游注意事项。",
     ],
     parameters: ReportParameters,
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal, _update, ctx) {
       const report = normalize(params);
       if (report.type === "最终") {
         if (!report.objectiveStatus) throw new Error("最终报告必须填写 objectiveStatus");
@@ -147,7 +138,11 @@ export default function childRuntime(pi: ExtensionAPI) {
         const missing = expectedAcceptanceCriteria().filter((criterion) => !reported.has(normalizeCriterion(criterion)));
         if (missing.length) throw new Error(`最终报告遗漏完成标准：${missing.join("；")}`);
       }
-      const terminal = report.type === "最终" || (report.type === "问题" && report.blocking);
+      if (report.type === "问题" && report.blocking) {
+        const answer = await awaitQuestionAnswer(report, signal, ctx);
+        return { content: [{ type: "text", text: `主 Agent 的答复：${answer}` }], details: report };
+      }
+      const terminal = report.type === "最终";
       return {
         content: [{ type: "text", text: terminal ? `已提交${report.type}报告：${report.title}` : `已记录${report.type}：${report.title}` }],
         details: report,

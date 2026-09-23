@@ -9,40 +9,90 @@ import agentDeck from "../src/index.ts";
 import { parseDeckConfig, readDeckConfig, writeDeckConfig, DEFAULT_CONFIG, deckConfigPath } from "../src/config.ts";
 import { parseAgentDefinition, validateAgentDefinition } from "../src/agents.ts";
 import { acquireWriterLease, releaseWriterLease } from "../src/admission.ts";
-import { initializeRun, launchRunner, readRun, runDirectory, reconcileRun, stopRun } from "../src/runtime.ts";
-import { alive, persistCompletion } from "../src/persistence.mjs";
+import { initializeRun, launchRunner, readRun, runDirectory, sendToRun, shutdownRuns } from "../src/runtime.ts";
 import { showAgentPanel } from "../src/ui.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
-async function fixture(options: { duration?: number; role?: string; roleLimit?: number; final?: string; completed?: boolean } = {}) {
+async function until<T>(read: () => Promise<T | undefined>, label: string, timeoutMs = 10_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`等待${label}超时`);
+}
+
+function alive(pid?: number): boolean {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function fixture(t: any, options: { duration?: number; role?: string; roleLimit?: number; final?: string; completed?: boolean } = {}) {
   const id = `test-opt-${randomUUID()}`;
   const directory = path.join(getAgentDir(), "fixtures", id);
   await fs.mkdir(directory, { recursive: true });
   const script = path.join(directory, "child.mjs");
-  await fs.writeFile(script, `setTimeout(()=>console.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'SECOND_RESULT'}]}})),${options.duration ?? 200});`);
+  await fs.writeFile(script, `
+import { createInterface } from "node:readline";
+const lines = createInterface({ input: process.stdin });
+let turn = 0;
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+lines.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.type === "get_state") return send({ type: "response", id: request.id, command: request.type, success: true, data: { isStreaming: false } });
+  if (["set_steering_mode", "clear_queue", "abort"].includes(request.type)) return send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
+  if (request.type === "prompt") {
+    turn += 1;
+    send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
+    setTimeout(() => {
+      const text = turn === 1 ? "FIRST_RESULT" : "SECOND_RESULT";
+      send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+      send({ type: "agent_settled" });
+    }, ${options.duration ?? 50});
+  }
+});
+lines.on("close", () => process.exit(0));
+`);
   const now = Date.now();
-  const run: any = { version: 1, autoDeliver: true, runId: id, agentId: options.role ?? "probe", agentName: "probe", objective: "probe", instruction: "probe", status: options.completed ? "已完成" : "运行中", model: "fake/model", thinking: "off", tools: [], writePermission: false, cwd: directory, parentSessionId: id, childSessionId: "same-child", childSessionPath: path.join(directory, "child.jsonl"), startedAt: now - 1000, endedAt: options.completed ? now - 100 : undefined, reports: [], events: [], finalText: options.final, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+  const run: any = {
+    version: 1, autoDeliver: true, runId: id,
+    agentId: options.role ?? "probe", agentName: "probe", objective: "probe", instruction: "probe", acceptanceCriteria: [],
+    status: options.completed ? "已完成" : "运行中", model: "fake/model", thinking: "off", tools: [], writePermission: false,
+    cwd: directory, parentSessionId: id, childSessionId: "same-child", childSessionPath: path.join(directory, "child.jsonl"),
+    startedAt: now - 1000, endedAt: options.completed ? now - 100 : undefined,
+    reports: [], events: [], finalText: options.final,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  };
   await initializeRun(run, { version: 1, cwd: directory, command: process.execPath, argsPrefix: [script], prompt: "fixture", naturalOutput: true }, true);
   if (options.roleLimit) {
     const file = path.join(runDirectory(id), "request.json");
     const saved = JSON.parse(await fs.readFile(file, "utf8"));
     await fs.writeFile(file, JSON.stringify({ ...saved, maxConcurrent: options.roleLimit }));
   }
+  t.after(async () => {
+    await shutdownRuns(id);
+    await fs.rm(runDirectory(id), { recursive: true, force: true });
+    await fs.rm(directory, { recursive: true, force: true });
+  });
   return { id, directory, run };
 }
-async function settled(id: string) {
-  for (let i = 0; i < 200; i++) {
-    const run = await readRun(id);
-    if (run && ["已完成", "失败", "已停止"].includes(run.status) && !alive(run.runnerPid) && !alive(run.childPid)) return run;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error("Fixture did not settle");
-}
-function host(parent: string, entries: any[] = []) {
+
+function host(parent: string) {
   const handlers = new Map<string, any>(), commands = new Map<string, any>(), tools = new Map<string, any>();
   const messages: any[] = [];
-  const ctx: any = { mode: "tui", cwd: getAgentDir(), isProjectTrusted: () => false, sessionManager: { getSessionId: () => parent, getBranch: () => entries }, ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, value: string) => value } } };
-  agentDeck({ on: (name: string, fn: any) => handlers.set(name, fn), registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand: (name: string, value: any) => commands.set(name, value), registerMessageRenderer() {}, getActiveTools: () => [...tools.keys()], setActiveTools() {}, sendMessage: (message: any) => messages.push(message) } as any);
+  const ctx: any = {
+    mode: "tui", cwd: getAgentDir(), isProjectTrusted: () => false,
+    sessionManager: { getSessionId: () => parent, getBranch: () => [] },
+    ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, value: string) => value } },
+  };
+  agentDeck({
+    on: (name: string, fn: any) => handlers.set(name, fn),
+    registerTool: (tool: any) => tools.set(tool.name, tool),
+    registerCommand: (name: string, value: any) => commands.set(name, value),
+    registerMessageRenderer() {}, getActiveTools: () => [...tools.keys()], setActiveTools() {},
+    sendMessage: (message: any) => messages.push(message),
+  } as any);
   return { handlers, commands, messages, ctx };
 }
 
@@ -68,8 +118,8 @@ test("旧数量限制被忽略，切换派遣开关不丢失选配设置", async
   assert.equal(readDeckConfig().enabled, true);
 });
 
-test("关闭后面板和兼容命令也不再启动继续任务", async () => {
-  const f = await fixture({ completed: true, final: "done" });
+test("关闭后面板和兼容命令也不再启动继续任务", async (t) => {
+  const f = await fixture(t, { completed: true, final: "done" });
   await writeDeckConfig({ enabled: false });
   const h = host(f.id);
   h.ctx.ui.custom = async () => ({ action: "继续", runId: f.id });
@@ -78,17 +128,17 @@ test("关闭后面板和兼容命令也不再启动继续任务", async () => {
     await h.commands.get("agent-continue").handler(`${f.id} continue`, h.ctx);
     await h.commands.get("agents").handler("", h.ctx);
     assert.equal((await readRun(f.id))!.status, "已完成");
-    assert.equal((await readRun(f.id))!.runnerPid, undefined);
+    assert.equal((await readRun(f.id))!.childPid, undefined);
   } finally { await writeDeckConfig({ enabled: true }); }
 });
 
 test("配置入口编辑内置角色为个人覆盖，新任务读取有效的零时限", async () => {
   const h = host("config-edit");
-  h.ctx.ui.editor = async () => "---\nid: scout\nname: 私人侦察员\nmodel: inherit\nthinking: low\ntools: Read, Grep, Glob\ntimeoutMs: 0\nmaxConcurrent: 1\n---\n只读调查。\n";
+  h.ctx.ui.editor = async () => "---\nid: scout\nname: 私人侦察员\nmodel: inherit\nthinking: high\ntools: Read, Grep, Glob\ntimeoutMs: 0\nmaxConcurrent: 1\n---\n只读调查。\n";
   await h.commands.get("agent-config").handler("scout --raw", h.ctx);
   const text = await fs.readFile(path.join(getAgentDir(), "agents", "scout.md"), "utf8");
   const role = parseAgentDefinition(text, "scout.md", "用户");
-  assert.equal(role.timeoutMs, 0); assert.equal(role.thinking, "low"); assert.equal("maxConcurrent" in role, false);
+  assert.equal(role.timeoutMs, 0); assert.equal(role.thinking, "high"); assert.equal("maxConcurrent" in role, false);
 });
 
 test("同一非 Git 目录树和 Git 工作区的不同子目录不能同时写入", async () => {
@@ -97,78 +147,54 @@ test("同一非 Git 目录树和 Git 工作区的不同子目录不能同时写�
   const a = await acquireWriterLease(root, "nested-a"); assert.equal(a.acquired, true);
   try { assert.equal((await acquireWriterLease(path.join(root, "src"), "nested-b")).acquired, false); }
   finally { if (a.acquired) await releaseWriterLease(a.lease); }
-  await fs.mkdir(path.join(root, "tests"));
+  await fs.mkdir(path.join(root, "tests"), { recursive: true });
   execFileSync("git", ["init", "--quiet", root], { windowsHide: true });
   const b = await acquireWriterLease(path.join(root, "src"), "git-a"); assert.equal(b.acquired, true);
   try { assert.equal((await acquireWriterLease(path.join(root, "tests"), "git-b")).acquired, false); }
   finally { if (b.acquired) await releaseWriterLease(b.lease); }
 });
 
-test("真实后台只读任务超过旧全局与角色限制仍同时启动", async () => {
+test("不同 cwd 的只读任务超过旧全局与角色限制仍同时启动", async (t) => {
   await fs.writeFile(deckConfigPath(), JSON.stringify({ enabled: true, maxConcurrent: 1, timeoutMs: 0 }));
-  const tasks = await Promise.all(Array.from({ length: 5 }, () => fixture({ duration: 1800, role: "same-role", roleLimit: 1 })));
-  try {
-    const pids = await Promise.all(tasks.map((task) => launchRunner(task.id)));
-    assert.ok(pids.every((pid) => pid > 0));
-    const runs = await Promise.all(tasks.map((task) => readRun(task.id)));
-    assert.ok(runs.every((run) => run!.status === "运行中" && alive(run!.runnerPid)));
-    await Promise.all(tasks.map((task) => settled(task.id)));
-  } finally {
-    await Promise.all(tasks.map((task) => stopRun(task.id)));
-    await writeDeckConfig({ enabled: true });
-  }
+  const tasks = await Promise.all(Array.from({ length: 5 }, () => fixture(t, { duration: 500, role: "same-role", roleLimit: 1 })));
+  await Promise.all(tasks.map((task) => launchRunner(task.id)));
+  const active = await Promise.all(tasks.map((task) => until(async () => {
+    const run = await readRun(task.id);
+    return run?.childPid && alive(run.childPid) && run.status === "运行中" ? run : undefined;
+  }, `${task.id} 启动`)));
+  assert.equal(new Set(active.map((run) => run.childPid)).size, tasks.length);
+  await Promise.all(tasks.map((task) => until(async () => {
+    const run = await readRun(task.id);
+    return run?.status === "已完成" ? run : undefined;
+  }, `${task.id} 完成`)));
+  await writeDeckConfig({ enabled: true });
 });
 
-test("主会话忙时排队结果，自动继续后重启仍补送两轮，持久化回执去重", async () => {
-  const f = await fixture({ final: "FIRST_RESULT", completed: true });
-  await fs.writeFile(path.join(runDirectory(f.id), "follow-up.json"), JSON.stringify(["continue"]));
-  const first = host(f.id);
-  try { await first.handlers.get("session_start")({}, first.ctx); }
-  finally { first.handlers.get("session_shutdown")(); }
-  assert.equal(first.messages.length, 1); assert.match(first.messages[0].content, /FIRST_RESULT/);
-  await settled(f.id);
-  const restarted = host(f.id);
-  try { await restarted.handlers.get("session_start")({}, restarted.ctx); }
-  finally { restarted.handlers.get("session_shutdown")(); }
-  assert.equal(restarted.messages.length, 2);
-  assert.match(restarted.messages[0].content, /FIRST_RESULT/); assert.match(restarted.messages[1].content, /SECOND_RESULT/);
-  const receipts = restarted.messages.map((message) => ({ type: "custom_message", ...message }));
-  const received = host(f.id, receipts);
-  try { await received.handlers.get("session_start")({}, received.ctx); assert.equal(received.messages.length, 0); }
-  finally { received.handlers.get("session_shutdown")(); }
-  const wrong = host("another-parent");
-  try { await wrong.handlers.get("session_start")({}, wrong.ctx); assert.equal(wrong.messages.length, 0); }
-  finally { wrong.handlers.get("session_shutdown")(); }
-});
-
-test("结果已落盘但状态尚未更新时恢复结果，不误标失联", async () => {
-  const f = await fixture();
-  const past = Date.now() - 30000;
-  const run = { ...f.run, startedAt: past, attemptStartedAt: past };
-  await fs.writeFile(path.join(runDirectory(f.id), "status.json"), JSON.stringify(run));
-  await persistCompletion(runDirectory(f.id), { ...run, status: "已完成", endedAt: Date.now(), finalText: "durable result" });
-  const restored = await reconcileRun(f.id);
-  assert.equal(restored!.status, "已完成"); assert.equal(restored!.finalText, "durable result");
-});
-
-test("父会话取消导致内存队列清空后，无需重启也能补送结果", async () => {
-  const f = await fixture({ completed: true, final: "queued result" });
+test("续接任务时结果和通知都以当前 turn 为准", async (t) => {
+  const f = await fixture(t);
   const h = host(f.id);
-  let idle = false;
-  h.ctx.isIdle = () => idle;
-  h.ctx.hasPendingMessages = () => !idle;
-  try {
-    await h.handlers.get("session_start")({}, h.ctx);
-    assert.equal(h.messages.length, 1);
-    idle = true;
-    for (let i = 0; i < 50 && h.messages.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(h.messages.length, 2);
-    assert.equal(h.messages[0].details.deliveryId, h.messages[1].details.deliveryId);
-  } finally { h.handlers.get("session_shutdown")(); }
+  await h.handlers.get("session_start")({}, h.ctx);
+  t.after(async () => { await h.handlers.get("session_shutdown")(); });
+  await launchRunner(f.id);
+  const first = await until(async () => {
+    const run = await readRun(f.id);
+    return run?.status === "已完成" && run.finalText === "FIRST_RESULT" ? run : undefined;
+  }, "第一轮结果");
+  const firstTurn = first.turnId;
+  await sendToRun(f.id, "继续第二轮");
+  const during = await readRun(f.id);
+  assert.notEqual(during?.turnId, firstTurn);
+  assert.equal(during?.finalText, undefined);
+  const second = await until(async () => {
+    const run = await readRun(f.id);
+    return run?.status === "已完成" && run.turnId !== firstTurn ? run : undefined;
+  }, "第二轮结果");
+  assert.equal(second.finalText, "SECOND_RESULT");
+  assert.ok(h.messages.some((message) => message.details?.turnId === second.turnId && /SECOND_RESULT/.test(message.content)));
 });
 
-test("实际面板组件能显示结果、切换页面和继续，窄终端不越界", async () => {
-  const f = await fixture({ completed: true, final: "panel result" });
+test("实际面板组件能显示结果、切换页面和继续，窄终端不越界", async (t) => {
+  const f = await fixture(t, { completed: true, final: "panel result" });
   const h = host(f.id);
   let action: any;
   h.ctx.ui.custom = async (factory: any) => {

@@ -16,6 +16,7 @@ export const SendMessageParameters = Type.Object({
   to: Type.String({ minLength: 1, description: "当前主会话内的任务 ID 或实例名称。" }),
   message: Type.String({ minLength: 1, description: "完整补充要求或问题答复，按纯文本处理。运行中则排队，结束后在原会话继续。" }),
   summary: Type.Optional(Type.String({ minLength: 1, description: "可选消息摘要，只用于预览和记录；不会替换完整 message。" })),
+  reply_to: Type.Optional(Type.String({ minLength: 1, description: "回答待处理问题时填写其问题 ID；普通补充消息请省略。" })),
 }, { additionalProperties: false });
 
 export const TaskStopParameters = Type.Object({
@@ -23,7 +24,7 @@ export const TaskStopParameters = Type.Object({
 }, { additionalProperties: false });
 
 export interface AgentInput { description: string; prompt: string; subagent_type?: string; model?: string; name?: string; run_in_background?: true }
-export interface MessageInput { to: string; message: string; summary: string }
+export interface MessageInput { to: string; message: string; summary: string; replyTo?: string }
 
 function fields(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("参数必须是对象。");
@@ -48,10 +49,10 @@ export function parseAgentInput(value: unknown): AgentInput {
 }
 export function messagePreview(message: string): string { return message.trim().split(/\r?\n/, 1)[0].slice(0, 200); }
 export function parseMessageInput(value: unknown): MessageInput {
-  const input = fields(value, ["to", "message", "summary"]);
+  const input = fields(value, ["to", "message", "summary", "reply_to"]);
   textField(input, "message");
   const message = input.message as string;
-  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message) };
+  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message), replyTo: textField(input, "reply_to", true) };
 }
 export function parseStopInput(value: unknown): { task_id: string } { return { task_id: textField(fields(value, ["task_id"]), "task_id")! }; }
 
@@ -87,6 +88,7 @@ export function publicTaskResult(run: RunDetails, message: string, delivery?: "q
     status: STATUSES[run.status], statusText: run.status,
     resolvedModel: run.routingPending ? undefined : run.model,
     thinking: run.routingPending ? undefined : run.thinking,
+    ...(run.pendingQuestion ? { pendingQuestion: run.pendingQuestion } : {}),
     delivery, message,
   };
 }

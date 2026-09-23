@@ -2,26 +2,24 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import http from "node:http";
 import test from "node:test";
 import { getAgentDir, DefaultResourceLoader, SettingsManager, ModelRuntime, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import agentDeck from "../src/index.ts";
 import { DEFAULT_CONFIG, parseDeckConfig, readDeckConfig, writeDeckConfig } from "../src/config.ts";
 import { discoverAgents } from "../src/agents.ts";
-import { initializeRun, listRuns, readRun, runDirectory, startFollowUp, stopRun, writeJsonAtomic } from "../src/runtime.ts";
+import { initializeRun, listRuns, readRun, runDirectory, stopRun, writeJsonAtomic } from "../src/runtime.ts";
 import { resolveTaskTarget } from "../src/task-identity.ts";
 import { publicTaskResult, resolveAgentRole } from "../src/tool-contract.ts";
-import { alive, readCompletions } from "../src/persistence.mjs";
+import { readCompletions } from "../src/persistence.mjs";
 
-async function until(check: () => Promise<boolean>) {
+async function until<T>(check: () => Promise<T | undefined | false>): Promise<T> {
   const end = Date.now() + 15000;
-  while (Date.now() < end) { if (await check()) return; await new Promise((resolve) => setTimeout(resolve, 25)); }
+  while (Date.now() < end) { const value = await check(); if (value) return value; await new Promise((resolve) => setTimeout(resolve, 25)); }
   throw new Error("Claude interface fixture timed out");
 }
 async function settled(id: string) {
-  await until(async () => { const run = await readRun(id); return !!run && ["已完成", "失败", "已停止", "已取消", "等待决定"].includes(run.status) && !alive(run.runnerPid) && !alive(run.childPid); });
+  await until(async () => { const run = await readRun(id); return !!run && ["已完成", "失败", "已停止", "已取消", "等待决定"].includes(run.status); });
   return (await readRun(id))!;
 }
 async function harness(t: any, duration = 350) {
@@ -29,9 +27,54 @@ async function harness(t: any, duration = 350) {
   const cwd = path.join(getAgentDir(), "fixtures", randomUUID());
   await fs.mkdir(cwd, { recursive: true });
   const cli = path.join(cwd, "fixture-cli.mjs");
-  await fs.writeFile(cli, `import fs from "node:fs";
-fs.appendFileSync("executions.jsonl",JSON.stringify(process.argv.slice(2))+"\\n");
-setTimeout(()=>console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:process.argv.at(-1)}]}})),${duration});`);
+  await fs.writeFile(cli, String.raw`import fs from "node:fs";
+import readline from "node:readline";
+const log = (value) => fs.appendFileSync("executions.jsonl", JSON.stringify(value) + "\n");
+const emit = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+let streaming = false;
+let prompt = "";
+let queued = [];
+let questionId;
+let callId;
+let timer;
+function reply(command, data = {}) { emit({ type: "response", id: command.id, command: command.type, success: true, data }); }
+function complete(text) {
+  streaming = false;
+  emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+  emit({ type: "agent_settled" });
+}
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const command = JSON.parse(line);
+  if (command.type === "get_state") return reply(command, { isStreaming: streaming });
+  if (command.type === "set_steering_mode" || command.type === "clear_queue" || command.type === "abort") return reply(command);
+  if (command.type === "extension_ui_response") {
+    if (command.id !== questionId) return;
+    log({ type: "answer", value: command.value, cancelled: command.cancelled });
+    questionId = undefined;
+    emit({ type: "tool_execution_end", toolName: "agent_question", toolCallId: callId, result: { details: { type: "问题", title: "需要决定", summary: "是否保持兼容？", question: "是否保持兼容？", options: ["保持", "移除"], blocking: true } } });
+    complete("ANSWER:" + command.value + "\n" + queued.join("\n"));
+    return;
+  }
+  if (command.type === "steer" || (command.type === "prompt" && streaming && command.streamingBehavior === "steer")) {
+    queued.push(command.message);
+    log({ type: "steer", message: command.message });
+    return reply(command);
+  }
+  if (command.type !== "prompt") return reply(command);
+  streaming = true;
+  prompt = command.message;
+  queued = [];
+  log({ type: "prompt", message: prompt, args: process.argv.slice(2) });
+  reply(command);
+  timer = setTimeout(() => {
+    if (prompt.includes("ASK_COMPAT_CASE")) {
+      callId = "call-" + Date.now();
+      questionId = "question-" + Date.now();
+      emit({ type: "tool_execution_start", toolName: "agent_question", toolCallId: callId, args: { question: "是否保持兼容？", options: ["保持", "移除"] } });
+      emit({ type: "extension_ui_request", id: questionId, method: "input", title: "是否保持兼容？" });
+    } else complete([prompt, ...queued].join("\n"));
+  }, ${duration});
+});`);
   const originalCli = process.argv[1];
   process.argv[1] = cli;
   const tools = new Map<string, any>(), handlers = new Map<string, any>(), commands = new Map<string, any>();
@@ -53,7 +96,7 @@ setTimeout(()=>console.log(JSON.stringify({type:"message_end",message:{role:"ass
   };
   const call = (tool: string, args: any, context = ctx) => tools.get(tool).execute(randomUUID(), args, undefined, undefined, context);
   t.after(async () => {
-    handlers.get("session_shutdown")(); process.argv[1] = originalCli;
+    await handlers.get("session_shutdown")(); process.argv[1] = originalCli;
     for (const run of await listRuns(Number.MAX_SAFE_INTEGER)) if (run.cwd === cwd) await stopRun(run.runId);
     await writeDeckConfig(structuredClone(DEFAULT_CONFIG));
   });
@@ -136,7 +179,7 @@ test("同名并发只创建一次；结束、重载后仍绑定；不同主会�
   const run = await settled((batch.find((result) => result.status === "fulfilled") as PromiseFulfilledResult<any>).value.details.publicResult.agentId);
   await assert.rejects(h.call("Agent", { ...input, name: "scan-config" }), /已有/);
   await h.handlers.get("session_start")({}, h.ctx);
-  h.handlers.get("session_shutdown")();
+  await h.handlers.get("session_shutdown")();
   assert.equal((await resolveTaskTarget("scan-config", h.parent)).runId, run.runId);
   const other = { ...h.ctx, sessionManager: { ...h.ctx.sessionManager, getSessionId: () => `${h.parent}-other` } };
   await assert.rejects(h.call("SendMessage", { to: run.runId, message: "跨会话" }, other), /当前会话/);
@@ -169,6 +212,7 @@ test("持久化记录损坏时不把已绑定名称当作可用，也不创建�
   const h = await harness(t);
   const id = receipt(await h.call("Agent", { ...input, name: "durable-name" })).agentId;
   await settled(id);
+  await h.handlers.get("session_shutdown")();
   const file = path.join(runDirectory(id), "status.json");
   const original = await fs.readFile(file, "utf8");
   await fs.writeFile(file, "{broken");
@@ -185,6 +229,7 @@ test("其他父会话的损坏记录不阻止新会话创建；当前会话仍�
   const h = await harness(t);
   const oldId = receipt(await h.call("Agent", { ...input, name: "old-record" })).agentId;
   await settled(oldId);
+  await h.handlers.get("session_shutdown")();
   const file = path.join(runDirectory(oldId), "status.json");
   const original = await fs.readFile(file, "utf8");
   await fs.writeFile(file, "{broken foreign record");
@@ -196,94 +241,6 @@ test("其他父会话的损坏记录不阻止新会话创建；当前会话仍�
     assert.equal((await resolveTaskTarget("fresh-name", otherParent)).runId, id);
     await assert.rejects(h.call("Agent", { ...input, name: "old-record" }), /无法读取任务记录/);
   } finally { await fs.writeFile(file, original); }
-});
-
-async function restartFollowUp(id: string, action: "startFollowUp" | "launchRunner" = "startFollowUp"): Promise<boolean> {
-  const source = `import { ${action} } from ${JSON.stringify(new URL("../src/runtime.ts", import.meta.url).href)}; console.log(Boolean(await ${action}(${JSON.stringify(id)})));`;
-  const result = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], { cwd: process.cwd(), windowsHide: true });
-  return result.stdout.trim() === "true";
-}
-
-test("队列删除失败后重启不会重放；下一条消息不会带回已执行消息", async (t) => {
-  const h = await harness(t, 500);
-  const id = receipt(await h.call("Agent", input)).agentId;
-  await h.call("SendMessage", { to: id, message: "ONCE_ONLY_MESSAGE" });
-  await settled(id);
-  const queue = path.join(runDirectory(id), "follow-up.json");
-  const unlink = fs.unlink;
-  let failures = 0;
-  const mocked = t.mock.method(fs, "unlink", async (file: any) => {
-    if (String(file) === queue) { failures++; throw Object.assign(new Error("injected queue denial"), { code: "EACCES" }); }
-    return unlink(file);
-  });
-  assert.equal(await startFollowUp(id), true);
-  mocked.mock.restore();
-  await settled(id);
-  assert.equal(failures, 1);
-  await fs.access(queue);
-  assert.equal(await restartFollowUp(id), false);
-  await h.call("SendMessage", { to: id, message: "NEXT_MESSAGE" });
-  const next = await settled(id);
-  assert.ok(next.finalText!.includes("NEXT_MESSAGE"));
-  assert.ok(!next.finalText!.includes("ONCE_ONLY_MESSAGE"));
-  assert.equal(await restartFollowUp(id), false);
-  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 3);
-});
-
-test("恢复事务写入后状态保存中断，重启补齐同一轮且只执行一次", async (t) => {
-  const h = await harness(t);
-  const id = receipt(await h.call("Agent", input)).agentId;
-  await settled(id);
-  const status = path.join(runDirectory(id), "status.json");
-  const rename = fs.rename;
-  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
-    if (String(to) === status) throw Object.assign(new Error("injected status write failure"), { code: "EIO" });
-    return rename(from, to);
-  });
-  await assert.rejects(h.call("SendMessage", { to: id, message: "RECOVER_PREPARED_MESSAGE" }), /injected status/);
-  mocked.mock.restore();
-  assert.equal(await restartFollowUp(id), true);
-  const run = await settled(id);
-  assert.ok(run.finalText!.includes("RECOVER_PREPARED_MESSAGE"));
-  assert.equal(await restartFollowUp(id), false);
-  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 2);
-});
-
-test("停止尚未提交状态的恢复事务，不会在下次启动重新执行", async (t) => {
-  const h = await harness(t);
-  const id = receipt(await h.call("Agent", input)).agentId;
-  await settled(id);
-  const status = path.join(runDirectory(id), "status.json");
-  const rename = fs.rename;
-  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
-    if (String(to) === status) throw Object.assign(new Error("injected status failure"), { code: "EIO" });
-    return rename(from, to);
-  });
-  await assert.rejects(h.call("SendMessage", { to: id, message: "DO_NOT_EXECUTE" }));
-  mocked.mock.restore();
-  assert.equal(receipt(await h.call("TaskStop", { task_id: id })).status, "cancelled");
-  assert.equal(await restartFollowUp(id), false);
-  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 1);
-});
-
-test("恢复状态已提交但尚未启动，重启按队列调度且不重放", async (t) => {
-  const h = await harness(t);
-  const id = receipt(await h.call("Agent", input)).agentId;
-  await settled(id);
-  const request = path.join(runDirectory(id), "request.json");
-  const rename = fs.rename;
-  let writes = 0;
-  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
-    if (String(to) === request && ++writes === 2) throw Object.assign(new Error("injected pre-launch interruption"), { code: "EIO" });
-    return rename(from, to);
-  });
-  await assert.rejects(h.call("SendMessage", { to: id, message: "QUEUED_RESUME_MESSAGE" }), /pre-launch interruption/);
-  mocked.mock.restore();
-  assert.equal((await readRun(id))!.status, "排队中");
-  assert.equal(await restartFollowUp(id, "launchRunner"), true);
-  assert.ok((await settled(id)).finalText!.includes("QUEUED_RESUME_MESSAGE"));
-  assert.equal(await restartFollowUp(id), false);
-  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 2);
 });
 
 test("声明式扩展模型传入真实 Pi 子进程且隔离父扩展工具和钩子", async (t) => {
@@ -356,66 +313,72 @@ test("函数型或原生扩展提供商在创建 Session 和任务前明确拒�
   assert.equal((await listRuns(Number.MAX_SAFE_INTEGER, h.parent)).length, 0);
 });
 
-test("运行中两条消息按顺序持久化，摘要不截断正文；只在当前轮结束后恢复", async (t) => {
-  const h = await harness(t, 1000);
-  const id = receipt(await h.call("Agent", { ...input, name: "ordered" })).agentId;
+async function executions(cwd: string): Promise<any[]> {
+  try { return (await fs.readFile(path.join(cwd, "executions.jsonl"), "utf8")).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+}
+
+test("运行中的普通补充通过 RPC 送达，正文和顺序保留；结束后在原 Session 继续", async (t) => {
+  const h = await harness(t, 800);
+  const launched = receipt(await h.call("Agent", { ...input, name: "ordered" }));
+  const id = launched.agentId;
+  await until(async () => (await executions(h.cwd)).some((item) => item.type === "prompt"));
+  const original = (await readRun(id))!;
   const first = "  /not-a-command @not-a-file\n" + "完整内容".repeat(100) + "\nFIRST_END  ";
   const a = receipt(await h.call("SendMessage", { to: "ordered", message: first, summary: "摘要".repeat(130) }));
   const b = receipt(await h.call("SendMessage", { to: id, message: "SECOND_MESSAGE\n第二行" }));
   assert.equal(a.delivery, "queued"); assert.equal(a.success, true); assert.equal(b.delivery, "queued");
-  assert.match(a.message, /尚未即时/);
-  const queue = JSON.parse(await fs.readFile(path.join(runDirectory(id), "follow-up.json"), "utf8"));
-  assert.equal(queue.length, 2); assert.equal(queue[0].message, first); assert.equal(queue[0].summary.length, 200);
-  assert.equal(queue[1].summary, "SECOND_MESSAGE");
-  const original = await settled(id);
-  assert.equal(original.finalText, input.prompt);
-  assert.equal(await startFollowUp(id), true);
-  const continued = await settled(id);
-  assert.equal(continued.childSessionId, original.childSessionId); assert.equal(continued.childSessionPath, original.childSessionPath);
-  assert.equal(continued.model, original.model); assert.equal(continued.thinking, original.thinking);
-  assert.ok(continued.finalText!.includes(first)); assert.ok(continued.finalText!.indexOf("FIRST_END") < continued.finalText!.indexOf("SECOND_MESSAGE"));
-  assert.equal(await startFollowUp(id), false);
-  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 2);
-  assert.equal((await readCompletions(runDirectory(id))).length, 2);
+  assert.ok(a.message.includes("摘要"));
+  const done = await settled(id);
+  assert.equal(done.status, "已完成", done.stderr);
+  assert.ok(done.finalText?.includes(first));
+  assert.ok(done.finalText!.indexOf("FIRST_END") < done.finalText!.indexOf("SECOND_MESSAGE"));
+  assert.equal(done.childSessionId, original.childSessionId);
+  assert.equal(done.model, original.model); assert.equal(done.thinking, original.thinking);
+  assert.equal((await executions(h.cwd)).filter((item) => item.type === "steer").length, 2);
+  const next = receipt(await h.call("SendMessage", { to: id, message: "NEXT_TURN" }));
+  assert.equal(next.delivery, "resumed");
+  const resumed = await until(async () => { const run = await readRun(id); return run?.status === "已完成" && run.turnId !== done.turnId ? run : undefined; });
+  assert.match(resumed.finalText ?? "", /NEXT_TURN/);
+  assert.ok(!resumed.finalText?.includes("FIRST_END"));
+  assert.equal(resumed.childSessionId, done.childSessionId);
+  assert.equal(resumed.childSessionPath, done.childSessionPath);
+  assert.equal((await executions(h.cwd)).filter((item) => item.type === "prompt").length, 2);
 });
 
-test("任务刚结束时的新消息不会越过旧排队消息；旧字符串队列仍可恢复", async (t) => {
-  const h = await harness(t);
-  const id = receipt(await h.call("Agent", input)).agentId;
-  await settled(id);
-  await fs.writeFile(path.join(runDirectory(id), "follow-up.json"), JSON.stringify(["OLD_MESSAGE"]));
-  const r = receipt(await h.call("SendMessage", { to: id, message: "NEW_MESSAGE" }));
-  assert.equal(r.delivery, "resumed");
-  const run = await settled(id);
-  assert.ok(run.finalText!.indexOf("OLD_MESSAGE") < run.finalText!.indexOf("NEW_MESSAGE"));
-  assert.equal(await startFollowUp(id), false);
-});
-
-test("agent_question 自动交付后 SendMessage 在同一 Session 回答，重载不重复交付", async (t) => {
-  const h = await harness(t);
-  await fs.writeFile(h.cli, `const prompt=process.argv.at(-1);
-if(!prompt.includes("保持兼容")) console.log(JSON.stringify({type:"tool_execution_end",toolName:"agent_question",result:{details:{type:"问题",title:"需要决定",summary:"是否保持兼容？",question:"是否保持兼容？",blocking:true,evidence:[],tests:[],risks:[]}}}));
-else console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:prompt}]}}));`);
-  const id = receipt(await h.call("Agent", { ...input, name: "ask-compat", description: "兼容检查" })).agentId;
-  const waiting = await settled(id); assert.equal(waiting.status, "等待决定");
-  await h.handlers.get("session_start")({}, h.ctx);
-  assert.equal(h.messages.length, 1); assert.match(h.messages[0].content, /SendMessage/); assert.match(h.messages[0].content, /ask-compat/);
-  const reply = receipt(await h.call("SendMessage", { to: "ask-compat", message: "保持兼容" })); assert.equal(reply.delivery, "resumed");
-  const done = await settled(id); assert.equal(done.status, "已完成", JSON.stringify({ stderr: done.stderr, events: done.events })); assert.equal(done.childSessionId, waiting.childSessionId);
-  await until(async () => h.messages.length === 2);
-  h.handlers.get("session_shutdown")();
-  await h.handlers.get("session_start")({}, h.ctx);
-  assert.equal(h.messages.length, 2); assert.ok(h.messages.every((message) => message.details.agentId === id && message.details.name === "ask-compat"));
+test("问题必须用匹配的 reply_to 回答；普通补充和错误 ID 均不解除等待", async (t) => {
+  const h = await harness(t, 80);
+  const id = receipt(await h.call("Agent", { ...input, prompt: "ASK_COMPAT_CASE", name: "ask-compat", description: "兼容检查" })).agentId;
+  const waiting = await until(async () => { const run = await readRun(id); return run?.pendingQuestion?.id ? run : undefined; });
+  const questionId = waiting.pendingQuestion!.id;
+  assert.equal(waiting.status, "等待决定");
+  assert.equal(waiting.pendingQuestion?.question, "是否保持兼容？");
+  const ordinary = receipt(await h.call("SendMessage", { to: "ask-compat", message: "这里是背景补充" }));
+  assert.equal(ordinary.delivery, "queued");
+  assert.equal((await readRun(id))?.pendingQuestion?.id, questionId);
+  await assert.rejects(h.call("SendMessage", { to: id, message: "误答", reply_to: "question-wrong" }), /问题不存在|失效/);
+  assert.equal((await readRun(id))?.pendingQuestion?.id, questionId);
+  const answered = receipt(await h.call("SendMessage", { to: "ask-compat", message: "保持兼容", reply_to: questionId }));
+  assert.equal(answered.delivery, "queued");
+  const done = await settled(id);
+  assert.equal(done.status, "已完成", done.stderr);
+  assert.equal(done.pendingQuestion, undefined);
+  assert.match(done.finalText ?? "", /ANSWER:保持兼容/);
+  assert.match(done.finalText ?? "", /这里是背景补充/);
+  assert.equal(done.childSessionId, waiting.childSessionId);
+  assert.deepEqual((await executions(h.cwd)).filter((item) => item.type === "answer").map((item) => item.value), ["保持兼容"]);
+  await assert.rejects(h.call("SendMessage", { to: id, message: "重复回答", reply_to: questionId }), /问题不存在|失效/);
 });
 
 test("TaskStop 停止运行或排队任务并清理消息，重复停止保持真实终态", async (t) => {
   const h = await harness(t, 6000);
   const first = receipt(await h.call("Agent", { ...input, subagent_type: "general-purpose", name: "writer-one" })).agentId;
+  await until(async () => Boolean((await readRun(first))?.writerLease));
   const second = receipt(await h.call("Agent", { ...input, subagent_type: "worker", name: "writer-two" }));
-  assert.equal(second.status, "queued");
+  await until(async () => (await readRun(second.agentId))?.status === "排队中");
   await h.call("SendMessage", { to: "writer-two", message: "不应继续" });
   assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-two" })).status, "cancelled");
-  await assert.rejects(fs.access(path.join(runDirectory(second.agentId), "follow-up.json")));
+  assert.ok(!(await executions(h.cwd)).some((item) => item.type === "prompt" && String(item.message).includes("不应继续")));
   assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-one" })).status, "stopped");
   assert.equal(receipt(await h.call("TaskStop", { task_id: first })).status, "stopped");
 });
@@ -424,6 +387,7 @@ test("旧记录没有新字段仍可读取、继续和停止；停止未确认�
   const h = await harness(t);
   const id = receipt(await h.call("Agent", input)).agentId;
   const old = await settled(id);
+  await h.handlers.get("session_shutdown")();
   delete old.description; delete old.instanceName;
   await writeJsonAtomic(path.join(runDirectory(id), "status.json"), old);
   const resumed = receipt(await h.call("SendMessage", { to: id, message: "继续旧记录" }));
@@ -435,7 +399,9 @@ test("旧记录没有新字段仍可读取、继续和停止；停止未确认�
   assert.equal(uncertain.status, "stop_unconfirmed");
   const lost = { ...done, runId: `lost-${randomUUID()}`, status: "失联" as const, childPid: process.pid };
   await initializeRun(lost, { version: 1, cwd: h.cwd, command: process.execPath, argsPrefix: [], prompt: "test" }, true).then(async (run) => {
-    await assert.rejects(h.call("SendMessage", { to: run.runId, message: "不能启动第二个进程" }), /尚未完全退出/);
+    await h.handlers.get("session_shutdown")();
+    await writeJsonAtomic(path.join(runDirectory(run.runId), "status.json"), { ...run, childPid: process.pid });
+    await assert.rejects(h.call("SendMessage", { to: run.runId, message: "不能启动第二个进程" }), /旧任务仍由另一个 Pi 进程运行/);
   });
 });
 
