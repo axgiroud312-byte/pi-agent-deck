@@ -1,7 +1,7 @@
 import { clampThinkingLevel, getSupportedThinkingLevels, type Api, type Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AgentDefinition } from "./types.ts";
-import type { DeckConfig } from "./config.ts";
+import { jevCredentialPath, type DeckConfig } from "./config.ts";
 import { MODEL_PROFILES, EXECUTION_POLICY, isReviewAgent, executionPolicyViolation, type RoutingPlan, type RoutingDecision, type ExecutionChoice } from "./router.mjs";
 
 export interface RoutingContext {
@@ -60,7 +60,7 @@ export function prepareRouting(agent: AgentDefinition, task: string, ctx: Routin
   const selected = fixedThinking ?? (permitted.includes(clamped) ? clamped : permitted[0]);
   const fallback: ExecutionChoice = { model: `${fallbackModel.provider}/${fallbackModel.id}`, thinking: effectiveThinking(fallbackModel, selected) };
   const plan: RoutingPlan = {
-    version: 1, routerModel: config.routing.model, timeoutMs: config.routing.timeoutMs, fallback, candidates: [],
+    version: 1, routerModel: config.routing.model, timeoutMs: config.routing.timeoutMs, credentialFile: jevCredentialPath(), fallback, candidates: [],
     state: { task, role: agent.id, roleDescription: agent.description, writePermission: agent.writePermission, tools: agent.tools ?? [], review },
   };
   const immediate = (mode: RoutingDecision["mode"], reason: string) => ({ ...plan, immediate: { ...fallback, mode, reason, elapsedMs: 0 } });

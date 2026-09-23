@@ -1,41 +1,26 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CancellableLoader } from "@earendil-works/pi-tui";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, validateAgentDefinition } from "./agents.ts";
-import { readDeckConfig, writeDeckConfig } from "./config.ts";
+import { jevCredentialPath, readDeckConfig, writeDeckConfig } from "./config.ts";
 import { prepareRouting } from "./routing.ts";
-import { selectExecution, decisionText, type RoutingDecision, type RoutingPlan } from "./router.mjs";
+import { decisionText } from "./router.mjs";
+import { editJevConfig, previewRouting } from "./jev-ui.ts";
+import { resolveJevKey } from "./jev-service.mjs";
 
-async function preview(plan: RoutingPlan, ctx: ExtensionContext): Promise<RoutingDecision | undefined> {
-  if (ctx.mode !== "tui") return selectExecution(plan);
-  type Result = { decision: RoutingDecision } | { error: unknown } | undefined;
-  const result = await ctx.ui.custom<Result>((tui, theme, _keys, done) => {
-    const loader = new CancellableLoader(tui, (text) => theme.fg("accent", text), (text) => theme.fg("muted", text), "正在试选模型… Esc 取消");
-    let settled = false;
-    const finish = (value: Result) => { if (!settled) { settled = true; loader.stop(); done(value); } };
-    loader.onAbort = () => finish(undefined);
-    void selectExecution(plan, { signal: loader.signal }).then(
-      (decision) => { if (!loader.aborted) finish({ decision }); },
-      (error: unknown) => { if (!loader.aborted) finish({ error }); },
-    );
-    return loader;
-  });
-  if (result && "error" in result) throw result.error;
-  return result?.decision;
-}
 export function registerRouting(pi: ExtensionAPI) {
   pi.registerCommand("agent-router", {
-    description: "Jev 自动选配：/agent-router [on|off|status]，只影响新任务",
+    description: "Jev 可视化配置：/agent-router；也支持 on、off、status",
     async handler(args, ctx) {
       try {
-        const current = readDeckConfig();
-        const action = args.trim().toLowerCase() || "status";
+        const action = args.trim().toLowerCase() || (ctx.mode === "tui" ? "config" : "status");
+        if (["config", "设置"].includes(action)) return await editJevConfig(ctx, () => pi.getThinkingLevel?.() ?? "off");
         if (["on", "开启", "off", "关闭"].includes(action)) {
-          await writeDeckConfig({ routing: { ...current.routing, enabled: ["on", "开启"].includes(action) } });
+          await writeDeckConfig({ routing: { enabled: ["on", "开启"].includes(action) } });
         } else if (!["status", "状态"].includes(action)) {
-          ctx.ui.notify("用法：/agent-router on、off 或 status。", "warning"); return;
+          ctx.ui.notify("用法：/agent-router 打开配置；on、off、status 管理开关和状态。", "warning"); return;
         }
         const config = readDeckConfig();
-        ctx.ui.notify(`Jev 自动选配：${config.routing.enabled ? "开启" : "关闭"}\n选配模型：${config.routing.model} · 超时：${config.routing.timeoutMs} ms\nTypeSafe 密钥：${process.env.TYPESAFE_API_KEY?.trim() ? "已检测到（尚未验证）" : "未配置，将回退"}\n只影响新任务；主 Agent 决定数量、角色和分工。用 /agent-route-test 试选。`, "info");
+        const credential = resolveJevKey(jevCredentialPath());
+        ctx.ui.notify(`Jev 自动选配：${config.routing.enabled ? "开启" : "关闭"}\n选配模型：${config.routing.model} · 超时：${config.routing.timeoutMs} ms\nTypeSafe 密钥：${credential.apiKey ? `已检测到（${credential.source === "saved" ? "本机保存" : "环境变量"}，尚未验证）` : "未配置，将回退"}\n只影响新任务；主 Agent 决定数量、角色和分工。用 /agent-route-test 试选。`, "info");
       } catch (error) { ctx.ui.notify(`选配设置失败：${error instanceof Error ? error.message : error}`, "error"); }
     },
   });
@@ -56,7 +41,7 @@ export function registerRouting(pi: ExtensionAPI) {
         const errors = validateAgentDefinition(agent);
         if (errors.length) throw new Error(errors.join("；"));
         const plan = prepareRouting(agent, task, ctx, readDeckConfig(), pi.getThinkingLevel());
-        const decision = await preview(plan, ctx);
+        const decision = await previewRouting(plan, ctx);
         ctx.ui.notify(decision ? `试选结果 · ${agent.name}\n${decisionText(decision)}\n未创建子任务。` : "已取消试选，未创建子任务。", decision?.mode === "fallback" ? "warning" : "info");
       } catch (error) { ctx.ui.notify(`试选失败：${error instanceof Error ? error.message : error}`, "error"); }
     },

@@ -22,7 +22,7 @@ export interface AgentDraft {
 }
 
 const DRAFT_FIELDS = new Set(["id", "name", "description", "systemPrompt", "tools", "model", "thinking", "timeoutMs", "reportProfile", "limitations"]);
-const RESERVED_IDS = new Set(["general-purpose", "general", "explore", "new", "global"]);
+const RESERVED_IDS = new Set(["general-purpose", "general", "explore", "new", "global", "jev"]);
 const DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 export function agentAuthoringContext(): string {
@@ -85,7 +85,7 @@ export async function generateAgentDraft(description: string, ctx: ExtensionCont
     "提示词要具体、简洁、保留用户约束；清楚说明完成后交付什么、哪些结论需要证据。简单角色用短段落即可。",
     "Pi 不提供浏览器、MCP、其他应用连接、持久记忆或自动隔离配置。用户要求这些能力时，在 limitations 中如实说明，并让角色报告相关阻碍；生成提示词不能宣称工具不存在的能力。",
     `当前模型：${model.provider}/${model.id}。可指定的模型：${available.join("、")}。未列出的模型只在确定完整 provider/model 标识时填写；保存前会校验。`,
-    `已存在 ID：${existing.join("、")}。避免重复。保留 ID：general-purpose、general、explore、new、global 和 Windows 设备名。`,
+    `已存在 ID：${existing.join("、")}。避免重复。保留 ID：general-purpose、general、explore、new、global、jev 和 Windows 设备名。`,
     '示例结构：{"id":"code-reviewer","name":"代码审查员","description":"检查代码改动并给出带证据的风险与建议","systemPrompt":"阅读任务相关的改动，检查逻辑与边界。按影响排序问题，给出文件位置、理由及最小修改建议；明确未验证事项。","tools":["read","grep","find","ls"],"reportProfile":"审查"}',
   ].join("\n");
   let correction = "";

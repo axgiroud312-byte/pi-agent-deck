@@ -9,11 +9,11 @@ export function alive(pid) {
 export async function readJson(file) {
   return JSON.parse(await fs.readFile(file, "utf8"));
 }
-export async function atomicJson(file, value) {
+export async function atomicJson(file, value, options = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: options.mode ?? 0o666 });
     for (let attempt = 0; ; attempt++) {
       try { await fs.rename(temporary, file); break; }
       catch (error) {

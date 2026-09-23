@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { resolveJevKey } from "./jev-service.mjs";
 const profiles = JSON.parse(fs.readFileSync(new URL("./model-profiles.json", import.meta.url), "utf8"));
 export const MODEL_PROFILES = profiles.profiles;
 export const EXECUTION_POLICY = profiles.policy;
@@ -66,8 +67,10 @@ export async function selectExecution(plan, options = {}) {
   plan = { ...plan, candidates: plan.candidates.filter((candidate) => !executionPolicyViolation(candidate, review)) };
   const fallback = (reason) => ({ ...plan.fallback, mode: "fallback", reason, elapsedMs: Date.now() - startedAt, routerModel: plan.routerModel });
   if (!plan.candidates.length) return fallback("当前提供商没有可用的 Astra / Sol / Luna 候选，使用合规回退配置。");
-  const apiKey = (options.apiKey ?? process.env.TYPESAFE_API_KEY ?? "").trim();
-  if (!apiKey) return fallback("未配置 TYPESAFE_API_KEY，使用合规回退配置。");
+  let apiKey;
+  try { apiKey = (options.apiKey ?? resolveJevKey(plan.credentialFile).apiKey ?? "").trim(); }
+  catch { return fallback("无法读取 Jev 密钥，请打开 /agent-router 检查；使用合规回退配置。"); }
+  if (!apiKey) return fallback("未配置 Jev 密钥（本地或 TYPESAFE_API_KEY），使用合规回退配置。");
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(), plan.timeoutMs);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;

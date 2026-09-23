@@ -239,7 +239,7 @@ test("独立选配开关与试选真实命令工作，不改变派遣开关，�
   assert.match(notices.at(-1)!, /自动选配关闭/);
   await commands.get("agent-router").handler("on", ctx);
   await commands.get("agent-route-test").handler("explore 查找登录入口", ctx);
-  assert.match(notices.at(-1)!, /未配置 TYPESAFE_API_KEY/);
+  assert.match(notices.at(-1)!, /未配置 Jev 密钥/);
   assert.match(notices.at(-1)!, /未创建子任务/);
   assert.equal((await listRuns(Number.MAX_SAFE_INTEGER)).length, before.length);
   await assert.rejects(fs.access(path.join(getAgentDir(), "agents")));

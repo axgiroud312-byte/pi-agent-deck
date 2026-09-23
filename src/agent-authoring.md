@@ -5,7 +5,7 @@
 ## 保存角色
 
 1. 读取会话提供的个人角色目录，检查已有角色。默认创建个人角色；用户明确限定当前项目时，使用可信项目的 `.pi/agents/`。
-2. 使用简短英文文件名，例如 `code-reviewer.md`。保留名称 `worker`、`scout`、`reviewer`、`general-purpose`、`general`、`Explore`、`explore`、`new`、`global` 和 Windows 设备名不用作新角色。新角色重名时加后缀，已有文件只有用户要求修改该角色时才编辑。
+2. 使用简短英文文件名，例如 `code-reviewer.md`。保留名称 `worker`、`scout`、`reviewer`、`general-purpose`、`general`、`Explore`、`explore`、`new`、`global`、`jev` 和 Windows 设备名不用作新角色。新角色重名时加后缀，已有文件只有用户要求修改该角色时才编辑。
 3. 写入 Markdown：配置头描述调用时机、模型和工具；正文写具体职责、方法、用户约束及可检查的交付要求。避免空泛人设。提示词用用户语言。
 4. 回读文件，核对用户要求、工具名和配置格式。回复名称、职责、模型、工具权限、文件位置和使用方式。下一次派遣会重新发现角色，无需重载。
 

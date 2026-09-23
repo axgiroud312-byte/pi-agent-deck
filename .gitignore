@@ -12,3 +12,5 @@ work/
 .DS_Store
 Thumbs.db
 docs/evidence/0.9.0/*.json
+docs/evidence/0.9.3/*.json
+typesafe-auth.json

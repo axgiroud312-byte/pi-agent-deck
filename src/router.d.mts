@@ -14,6 +14,7 @@ export interface RoutingDecision extends ExecutionChoice {
   usage?: { input_tokens: number; output_tokens: number };
 }
 export interface RoutingPlan {
+  credentialFile?: string;
   version: 1;
   routerModel: string;
   timeoutMs: number;

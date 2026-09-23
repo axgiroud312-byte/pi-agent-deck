@@ -13,6 +13,7 @@ import { initializeRun, launchRunner, readRun, runDirectory, stopRun, continueRu
 import { readCompletions, alive } from "../src/persistence.mjs";
 import type { RoutingPlan } from "../src/router.mjs";
 import agentDeck from "../src/index.ts";
+import { writeSavedJevKey } from "../src/jev-service.mjs";
 
 async function until(check: () => Promise<boolean> | boolean) {
   const deadline = Date.now() + 12000;
@@ -55,12 +56,14 @@ async function fixture(task: string, routing = plan(task)) {
 }
 async function service(t: any, responseMode: "delayed" | "invalid" = "delayed") {
   const calls: any[] = [];
+  const authorizations: Array<string | undefined> = [];
   let respond: (() => void) | undefined;
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(Buffer.from(chunk));
     const body = JSON.parse(Buffer.concat(chunks).toString());
     calls.push(body);
+    authorizations.push(req.headers.authorization);
     const send = () => {
       res.setHeader("Content-Type", "application/json");
       const keys = Object.keys(body.questions.execution_profile.criteria);
@@ -81,8 +84,32 @@ async function service(t: any, responseMode: "delayed" | "invalid" = "delayed") 
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
-  return { calls, respond: () => { assert.ok(respond); respond(); } };
+  return { calls, authorizations, respond: () => { assert.ok(respond); respond(); } };
 }
+
+test("后台进程直接读取可视化保存的密钥，不依赖环境变量，不写入任务记录", async (t) => {
+  const svc = await service(t);
+  delete process.env.TYPESAFE_API_KEY;
+  const file = path.join(getAgentDir(), "isolated-saved-credential.json");
+  const key = "fake-saved-runner-credential";
+  await writeSavedJevKey(file, key, undefined);
+  const p = { ...plan("saved credential"), credentialFile: file };
+  const f = await fixture("saved credential", p);
+  t.after(() => stopRun(f.id));
+  const requestFile = path.join(runDirectory(f.id), "request.json");
+  const initial = await fs.readFile(requestFile, "utf8");
+  assert.equal(JSON.parse(initial).routing.credentialFile, file);
+  assert.ok(!initial.includes(key));
+  await launchRunner(f.id);
+  await until(() => svc.calls.length === 1);
+  assert.equal(svc.authorizations[0], `Bearer ${key}`);
+  svc.respond();
+  const run = await settled(f.id);
+  assert.equal(run.status, "已完成"); assert.equal(run.routing!.mode, "jev");
+  assert.ok(!JSON.stringify(run).includes(key));
+  assert.ok(!(await fs.readFile(requestFile, "utf8")).includes(key));
+  assert.ok(!JSON.stringify(await readCompletions(runDirectory(f.id))).includes(key));
+});
 
 test("新工具串联 Jev：选配中不虚报模型，补充排队、继续不重选、停止阻断迟到启动", async (t) => {
   const svc = await service(t);

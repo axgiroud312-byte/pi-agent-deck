@@ -1,6 +1,6 @@
 # Pi Agent Deck
 
-给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.2**，采用 MIT 许可证。
+给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.3**，采用 MIT 许可证。
 
 一句话派任务，结果自动回来；用任务编号或实例名称继续、停止。模型工具采用 Claude Code 风格的 `Agent`、`SendMessage`、`TaskStop`。
 
@@ -41,7 +41,7 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 
 > 找两个 Agent，分别只读调查前端和后端的登录流程，完成后汇总结论。
 
-**Jev 是可选功能。** 没有 TypeSafe 密钥也能派遣子 Agent：自动选配不可用时，插件沿用明确配置或主会话的模型与强度。要启用 Jev，请继续阅读下面的“Jev 负责模型与思考强度”。
+**Jev 是可选功能。** 没有 TypeSafe 密钥也能派遣子 Agent：自动选配不可用时，插件使用符合角色策略的回退模型与强度。配置 Jev 可直接输入 `/agent-router`，按中文菜单操作；完整步骤见下面的“Jev 负责模型与思考强度”。
 
 子 Agent 可以使用 Pi 内置模型、`models.json` 和扩展通过声明式 `registerProvider` 注册的模型。扩展提供商的数据单独传入子进程，父扩展的工具与钩子不会随之启用。包含自定义流式函数、OAuth 回调、动态模型回调或原生 Provider 的注册暂不支持，会在创建任务前明确报错。
 
@@ -62,7 +62,8 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 | `/agent-deck 状态` | 只查看状态 |
 | `/agents` | 查看任务、结果、继续或停止 |
 | `/agent-create 描述` | 一句话自动创建个人 Agent |
-| `/agent-config` | 编辑 Jev 自动选配、默认时限、每个 Agent，或新建 Agent |
+| `/agent-config` | 编辑 Jev、默认时限、每个 Agent，或新建 Agent |
+| `/agent-router` / `/agent-config jev` | 打开 Jev 配置页：密钥、模型、等待时间、连接检查和试选 |
 | `/agent-router on` / `off` / `status` | 独立开启、关闭或查看 Jev 选配 |
 | `/agent-route-test explore 调查登录失败` | 只试选模型与强度，不创建任务 |
 | `/agent-config global` | 直接编辑全局设置 |
@@ -98,10 +99,20 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 
 主 Agent 决定开启多少子任务、使用哪个角色、怎样分工、依赖顺序及验收标准。Jev 接收一个已经定义好的子任务，只在允许的模型与强度组合中作选择。
 
-1. 在运行 Pi 的环境中配置 `TYPESAFE_API_KEY`。Windows 可打开“编辑账户的环境变量”，新增同名用户变量并填入 TypeSafe 密钥，再重新启动终端和 Pi。密钥不写入插件设置或任务文件。
-2. 执行 `/agent-router status` 查看开关与密钥是否已检测到。检测到密钥不代表鉴权已成功。
-3. 执行 `/agent-route-test explore 调查登录偶发失败，找出根因并给出文件证据`。试选期间 Esc 可取消；试选不创建任务，也不自动打开派遣开关。
-4. 派遣开启后正常使用 `Agent`。任务编号先返回，需要 Jev 时后台状态为“选配中”；选择完成后启动子 Agent。面板显示最终模型、强度、选配耗时和回退原因。
+1. 在 [TypeSafe 控制台](https://console.typesafe.ai/) 创建 API 密钥。进入 Pi，输入 `/agent-router`（也可以 `/agent-config` → **Jev：模型、密钥与连接检查**）。这是 Pi 终端里的中文菜单，用 ↑↓ 选择、Enter 确认、Esc 返回。
+2. 选 **① API 密钥**，粘贴密钥；界面始终遮挡内容，Ctrl+U 可以清空。再选 **② Jev 模型**：默认固定 `jev-1.13.0`，也可选 `jev-latest`、`jev-preview` 或手动填写官方版本 ID。等待时间默认 15 秒，可直接填写整数秒。
+3. 选 **③ 测试连接**。插件通过官方 `GET /v1/models` 验证密钥是否能读取模型列表，这一步不提交任务，也不调用推理。通过后只显示“已通过 · 尚未试选”；固定版本可能不出现在模型列表中，因此列表检查不证明该版本的推理调用一定成功。
+4. 保持 **自动选配：开启**，选 **保存并返回**。草稿在保存时才落盘；Esc 或“返回，不保存”丢弃未保存修改。保存后新任务立即读取，无需重启 Pi。
+
+需要验证实际选配时，在本页点 **试选一次**，选择角色并输入任务说明。该操作会调用 TypeSafe 推理并产生对应服务用量，显示所选执行模型、思考强度或回退原因；Esc 可取消，不创建子任务，也不更改任何开关。模型与强度已经完全固定时会明确提示本次未请求 Jev。命令 `/agent-route-test explore 调查登录失败` 也保留，使用已保存设置。
+
+本地密钥单独存到 `~/.pi/agent/agent-deck/typesafe-auth.json`，**优先于** `TYPESAFE_API_KEY` 环境变量。它是个人目录中的明文凭据文件，按 `0600` 创建（Windows 继承用户目录权限），不属于系统凭据保险库；不要上传或分享。普通配置、任务请求、结果和日志不保存密钥文本，后台选配进程只获得私有文件路径。同一设置页保存时会检查密钥是否被其他 Pi 改过，发现冲突要求重新打开。选择“移除本地密钥”并保存后，有环境变量则继续使用环境变量。
+
+旧的环境变量配置方式继续有效。`/agent-router status` 只显示密钥来源与检测状态，不代替连接检查。在非交互模式，无参数 `/agent-router` 仍返回状态。
+
+需要派遣子 Agent 时，再确认总开关 `/agent-deck on` 已开启，正常使用 `Agent`。任务编号先返回，需要 Jev 时后台状态为“选配中”；选择完成后启动子 Agent。面板显示最终模型、强度、选配耗时和回退原因。
+
+[查看 Jev 配置页预览](docs/evidence/0.9.3/jev-config-preview.html)（实际组件渲染、模拟数据）；模型 ID 和模型列表接口依据 [TypeSafe 官方模型文档](https://docs.typesafe.ai/models)，核对日期 2026-09-23。
 
 默认选择器为 `jev-1.13.0`，15 秒超时。候选只来自当前提供商中 Pi 认为可用的下列四个模型，不自动切换账户或提供商。实际服务权限和限流仍可能影响执行。
 
@@ -310,6 +321,6 @@ npm pack --dry-run
 
 测试使用独立临时 Agent 数据目录、模拟模型输出及真实 fixture 子进程；宿主加载测试禁止网络请求。自动化测试不等于真实模型质量或人工终端验收。
 
-源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.2 模型策略说明](docs/0.9.2-release.md)、[0.9.1 修复说明](docs/0.9.1-release.md)、[0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
+源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.3 Jev 可视化配置说明](docs/0.9.3-release.md)、[0.9.2 模型策略说明](docs/0.9.2-release.md)、[0.9.1 修复说明](docs/0.9.1-release.md)、[0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
 
 本项目是社区扩展，与 Pi、Anthropic 或 TypeSafe 官方没有隶属关系；“Claude 风格”指工具命名和部分交互约定，具体支持范围以本文为准。许可证见 [MIT LICENSE](LICENSE)。

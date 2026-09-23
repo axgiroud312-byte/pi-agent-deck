@@ -50,7 +50,7 @@ export async function editGlobalConfig(ctx: ExtensionContext, changed: (ctx: Ext
       const value = await choose(ctx, "允许主 Agent 派遣新任务", [{ value: true, label: "开启" }, { value: false, label: "关闭" }]);
       if (value !== undefined) draft.enabled = value;
     } else if (action === "routing") {
-      const value = await choose(ctx, "让 Jev 选择新任务的模型与思考强度", [{ value: true, label: "开启" }, { value: false, label: "关闭，使用角色或主会话配置" }]);
+      const value = await choose(ctx, "让 Jev 选择新任务的模型与思考强度", [{ value: true, label: "开启" }, { value: false, label: "关闭，使用合规回退配置" }]);
       if (value !== undefined) draft.routing.enabled = value;
     } else if (action === "timeout") {
       const value = await chooseDuration(ctx, draft.timeoutMs, false);
@@ -67,6 +67,7 @@ export async function editGlobalConfig(ctx: ExtensionContext, changed: (ctx: Ext
     if (action === "save") {
       try {
         const patch = Object.fromEntries(Object.entries(draft).filter(([key, value]) => JSON.stringify(original[key as keyof DeckConfig]) !== JSON.stringify(value)));
+        if (patch.routing) patch.routing = Object.fromEntries(Object.entries(draft.routing).filter(([key, value]) => original.routing[key as keyof DeckConfig["routing"]] !== value));
         if (Object.keys(patch).length) { await writeDeckConfig(patch); changed(ctx); }
         ctx.ui.notify("设置已保存。选配与默认时限只用于新任务。", "info");
         return;

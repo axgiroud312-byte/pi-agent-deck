@@ -2,6 +2,16 @@
 
 主 Agent 决定子任务数量、角色、分工、依赖和验收；Jev 只为一个已经定义的新子任务选择执行模型与思考强度。程序负责可用性、固定配置、取消、超时与落盘。
 
+## 可视化配置与凭据
+
+0.9.3 起，`/agent-router` 或 `/agent-config jev` 打开中文终端配置页。填写密钥、选择 Jev 版本、调整秒数后保存；完整操作与存储说明见 [README](../README.md#jev-负责模型与思考强度)。默认固定 `jev-1.13.0`，支持 `jev-latest`、`jev-preview` 和版本 ID。
+
+`jev-service.mjs` 统一处理个人 `typesafe-auth.json` 的读取、验证和保存，Runner 与界面共享密钥优先级：本次草稿试选值 > 本机保存 > `TYPESAFE_API_KEY`。请求快照只保存 `credentialFile` 路径，Runner 在真正选配时读取，不复制密钥到快照。没有有效密钥时使用已有合规回退；旧请求未带文件路径时仍可读环境变量。
+
+“测试连接”调用 `GET https://api.typesafe.ai/v1/models`，仅证明鉴权与模型目录访问可用；不推理、不提交任务。固定版本可能不在目录中，不能据此判为不可用。“试选一次”才调用现有 Choice 接口，使用当前草稿但不保存、不创建任务；关闭自动选配时也可手动试选，不改变已保存开关。
+
+配置页只有保存时才更新文件。公开配置按改变的子字段合并，保留外部的其他修改；密钥按打开页面时的值做冲突检查。密钥与公开设置分两个文件写入，后者失败时明确提示密钥已经保存，允许重试。界面、错误提示和普通日志不回显密钥或未经处理的服务错误正文。
+
 ## 强制模型策略
 
 从 0.9.2 开始，`src/model-profiles.json` 的 `policy` 与 `profiles` 是运行时规则和选项的统一来源。规则覆盖自动选配、显式配置、别名、关闭选配、失败回退，以及旧任务的下一次启动或继续。
@@ -53,11 +63,12 @@ GPT-6 Sol/Luna 的推理工具调用要求 Responses。`openai-completions` 的 
 
 下一步把真实中文任务分为审查与非审查两组。审查比较“Jev 选择”“固定 GPT-5.6 Sol xhigh”“固定 GPT-5.6 Sol max”；非审查比较“Jev 选择”“固定 GPT-6 Sol high”“固定 Astra medium”。对同一输入、仓库状态、工具权限和验收标准运行，记录首次验收是否通过、返工次数、任务总耗时与模型用量。先观察，再调整候选描述和默认策略。请求 token 或模型目录中的估价不能直接当作订阅账号账单。
 
-当前自动化测试使用本地 HTTP 服务、模拟 Choice 结果及真实受控子进程。这证明流程和接口处理可用，不证明真实 Jev 的选模质量、线上延迟或中文任务表现。真实服务测试必须单独配置 TYPESAFE_API_KEY。
+当前自动化测试使用本地 HTTP 服务、模拟 Choice 结果及真实受控子进程。这证明流程和接口处理可用，不证明真实 Jev 的选模质量、线上延迟或中文任务表现。真实服务测试需先在可视化配置页或环境变量中配置个人 TypeSafe 密钥。
 
 ## 官方依据
 
 - [TypeSafe HTTP API](https://docs.typesafe.ai/api)：typed questions/answers 与 Choice 响应。
+- [TypeSafe 模型文档](https://docs.typesafe.ai/models)：固定版本、别名、模型列表接口；2026-09-23 核对。
 - [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)：模型与支持的思考档位。
 - [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)：模型与支持的思考档位。
 - [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)：支持 none/low/medium/high/xhigh/max，推理工具调用要求 Responses。
