@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition, AgentSource, ReportProfile } from "./types.ts";
+import { isReviewAgent, executionPolicyViolation, EXECUTION_POLICY } from "./router.mjs";
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const REPORT_PROFILES = new Set<ReportProfile>(["通用", "侦察", "执行", "审查"]);
@@ -60,6 +61,7 @@ export function parseAgentDefinition(text: string, filePath: string, source: Age
   const model = typeof f.model === "string" && f.model.trim() && f.model.trim() !== "inherit" ? f.model.trim() : undefined;
   if (f.model !== undefined && typeof f.model !== "string") errors.push("model 必须是 inherit 或 provider/model");
   if (model && !/^[^/]+\/.+$/.test(model)) errors.push("model 必须使用 Pi 的 provider/model 格式；Claude 的 sonnet/opus 别名不能直接使用");
+  if (f.reportProfile !== undefined && !REPORT_PROFILES.has(f.reportProfile as ReportProfile)) errors.push("reportProfile 必须是 通用、侦察、执行 或 审查");
   const definition: AgentDefinition = {
     id, name, description: typeof f.description === "string" ? f.description.trim() : "自定义 Agent",
     systemPrompt: body.trim(), source, filePath, model, thinking, tools, disallowedTools, writePermission,
@@ -121,6 +123,11 @@ export function discoverAgents(cwd: string, options: { projectTrusted?: boolean 
 
 export function validateAgentDefinition(agent: AgentDefinition): string[] {
   const errors: string[] = [...(agent.configurationErrors ?? [])];
+  const review = isReviewAgent(agent);
+  if (agent.model || review) {
+    const violation = executionPolicyViolation({ model: agent.model ?? `inherit/${EXECUTION_POLICY.reviewModel}`, thinking: agent.thinking ?? "max" }, review);
+    if (violation) errors.push(violation);
+  }
   const dangerous = new Set(["bash", "powershell", "edit", "write"]);
   if (!agent.writePermission) {
     const forbidden = (agent.tools ?? []).filter((tool) => dangerous.has(tool));

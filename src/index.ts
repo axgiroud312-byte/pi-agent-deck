@@ -265,7 +265,8 @@ export default function agentDeck(pi: ExtensionAPI) {
     promptGuidelines: [
       "独立任务可并行派遣；不要重复执行已经交给子 Agent 的工作。",
       "你决定子任务数量、角色、分工、依赖和验收。没有人为并发数量上限；同一工作区的写任务按顺序执行。",
-      "默认省略 model，由 Jev 为新子任务选配模型和思考强度；仅在用户明确指定模型时传入覆盖值。Agent 不接受 thinking 参数。SendMessage 沿用原配置。",
+      "默认省略 model，由 Jev 为新子任务选配模型和思考强度；仅在用户明确指定模型时传入覆盖值。Agent 不接受 thinking 参数。SendMessage 沿用符合当前策略的原配置。",
+      "审查任务使用 reviewer 或 reportProfile: 审查 的自定义角色，只能用 GPT-5.6 Sol / xhigh 或 max。非审查角色禁止 GPT-5.6 Sol；GPT-6 Sol/Luna 最低 high。Jev、显式配置和关闭选配均遵守该策略。",
       "description 是简短标题；prompt 是完整任务；subagent_type 是角色；name 是可选实例名称。同一主会话内名称唯一，任务结束后仍保留绑定。",
       "完成和提问会自动返回，不要轮询或使用 sleep 等待；有独立工作就继续，否则告知用户正在等待。",
       "根据证据判断结果，补充调查或返工调用 SendMessage，to 使用返回的 agentId 或实例 name，不能使用角色名。子 Agent 提问能根据已有授权回答时直接回复，只把真正缺少的用户决定交给用户。",
@@ -374,7 +375,7 @@ export default function agentDeck(pi: ExtensionAPI) {
           prompt: instruction,
           naturalOutput: true,
           timeoutMs: agent.timeoutMs ?? config.timeoutMs,
-          routing,
+          routing, review: routing.state.review,
           inboxPath: inboxPath(),
           env: {
             ...(providerSnapshot ? { PI_AGENT_DECK_PROVIDERS: providerSnapshot } : {}),
@@ -623,7 +624,7 @@ export default function agentDeck(pi: ExtensionAPI) {
             const chain = candidates.filter((candidate) => candidate.id === agent.id).map((candidate) => candidate.source);
             const override = chain.length > 1 ? `\n  覆盖链：${chain.join(" → ")}（当前使用 ${agent.source}）` : "";
             const timeout = agent.timeoutMs ?? readDeckConfig().timeoutMs;
-            return `${agent.id}｜${agent.name}｜${agent.source}｜${agent.model ?? "自动选配（关闭时继承）"}｜${agent.writePermission ? "允许写入" : "只读"}\n  ${agent.description}\n  思考：${agent.thinking ?? "自动选配"} · 工具：${agent.tools?.join(", ") ?? "默认"}\n  时限：${timeout === 0 ? "不限时" : `${timeout} ms`}\n  文件：${agent.filePath}\n  编辑：/agent-config ${agent.id}${override}`;
+            return `${agent.id}｜${agent.name}｜${agent.source}｜${agent.model ?? "自动选配（遵守角色策略）"}｜${agent.writePermission ? "允许写入" : "只读"}\n  ${agent.description}\n  思考：${agent.thinking ?? "自动选配"} · 工具：${agent.tools?.join(", ") ?? "默认"}\n  时限：${timeout === 0 ? "不限时" : `${timeout} ms`}\n  文件：${agent.filePath}\n  编辑：/agent-config ${agent.id}${override}`;
           }).join("\n\n") + trustNotice
         : `没有发现 Agent 定义。${trustNotice}`;
       if (ctx.mode !== "tui") return void ctx.ui.notify(text, "info");

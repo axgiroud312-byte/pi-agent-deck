@@ -118,7 +118,7 @@ async function chooseModel(ctx: ExtensionContext): Promise<string | undefined> {
   const models = ctx.modelRegistry.getAvailable();
   const providers = [...new Set(models.map((model) => model.provider))].sort();
   const provider = await choose(ctx, "选择模型来源", [
-    { value: "inherit", label: "自动选配（关闭时继承当前会话）" },
+    { value: "inherit", label: "自动选配（始终遵守角色策略）" },
     ...providers.map((value) => ({ value, label: value })),
   ]);
   if (!provider || provider === "inherit") return provider;
@@ -144,8 +144,8 @@ export async function editAgentConfig(ctx: ExtensionContext, agent: AgentDefinit
       text = edited; continue;
     }
     if (!action) action = await choose(ctx, `${plain(definition.name)}${text !== original ? " · 未保存" : ""}`, [
-      { value: "model", label: `模型         ${definition.model ?? "自动选配（关闭时继承）"}` },
-      { value: "thinking", label: `思考强度     ${definition.thinking ?? "自动选配（关闭时继承）"}` },
+      { value: "model", label: `模型         ${definition.model ?? "自动选配（遵守角色策略）"}` },
+      { value: "thinking", label: `思考强度     ${definition.thinking ?? "自动选配（遵守角色策略）"}` },
       { value: "tools", label: `工具         ${definition.tools?.length ?? 0} 项 · ${definition.writePermission ? "含写入/命令" : "只读"}` },
       { value: "timeout", label: `执行时限     ${duration(definition.timeoutMs)}` },
       { value: "prompt", label: "编辑角色提示词" }, { value: "description", label: "编辑调用描述" }, { value: "name", label: "修改显示名称" },
@@ -157,8 +157,8 @@ export async function editAgentConfig(ctx: ExtensionContext, agent: AgentDefinit
       const model = await chooseModel(ctx);
       if (model) { fields.model = model; text = serialize(fields, body); }
     } else if (action === "thinking") {
-      const level = await choose(ctx, "思考强度（实际能力由模型决定）", [
-        { value: "inherit", label: "自动选配（关闭时继承）" }, { value: "off", label: "关闭 · off（Sol 的 none）" }, { value: "minimal", label: "最低 · minimal（由模型映射）" }, { value: "low", label: "低 · low" }, { value: "medium", label: "中 · medium" }, { value: "high", label: "高 · high" }, { value: "xhigh", label: "更高 · xhigh" }, { value: "max", label: "最高 · max" },
+      const level = await choose(ctx, "思考强度（保存时检查角色和模型策略）", [
+        { value: "inherit", label: "自动选配（遵守角色策略）" }, { value: "off", label: "关闭 · off（需符合模型策略）" }, { value: "minimal", label: "最低 · minimal（由模型映射）" }, { value: "low", label: "低 · low" }, { value: "medium", label: "中 · medium" }, { value: "high", label: "高 · high" }, { value: "xhigh", label: "更高 · xhigh" }, { value: "max", label: "最高 · max" },
       ]);
       if (level) { fields.thinking = level; text = serialize(fields, body); }
     } else if (action === "tools") {

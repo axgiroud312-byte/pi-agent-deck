@@ -11,7 +11,7 @@ import agentDeck from "../src/index.ts";
 import { chooseRenderedMenu } from "./menu-harness.ts";
 
 const base: AgentDraft = {
-  id: "login-reviewer", name: "登录审查员", description: "审查登录流程，只读并返回证据",
+  reportProfile: "审查", id: "login-reviewer", name: "登录审查员", description: "审查登录流程，只读并返回证据",
   systemPrompt: "定位登录流程，检查输入和会话边界。按影响排序问题，给出文件位置和验证情况。", tools: ["read", "grep", "find", "ls"],
 };
 const response = (value: unknown) => ({ stopReason: "stop", content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }] });
@@ -50,6 +50,7 @@ test("自然描述命令从真实加载组件生成、保存、发现角色，�
   const saved = discoverAgents(h.ctx.cwd).find((agent) => agent.id === h.messages[0].details.agentId)!;
   assert.ok(saved);
   assert.equal(saved.writePermission, false);
+  assert.equal(saved.reportProfile, "审查");
   assert.equal(saved.model, undefined);
   assert.equal("maxConcurrent" in saved, false);
   assert.equal(saved.timeoutMs, undefined);
@@ -69,7 +70,7 @@ test("配置菜单的新建只要求一段描述，自动选择名称并保存",
 });
 
 test("写入角色和显式模型可保存，实际能力限制保留在提示词", async () => {
-  const h = harness(async () => response({ ...base, id: "frontend-builder", tools: ["read", "edit", "write", "bash"], model: "fixture/model", thinking: "high", timeoutMs: 0, limitations: ["不能直接操作浏览器界面"] }));
+  const h = harness(async () => response({ ...base, id: "frontend-builder", reportProfile: "执行", tools: ["read", "edit", "write", "bash"], model: "fixture/model", thinking: "high", timeoutMs: 0, limitations: ["不能直接操作浏览器界面"] }));
   const draft = await generateAgentDraft("实现前端并执行测试，使用 fixture/model", h.ctx, new AbortController().signal);
   const saved = await saveGeneratedAgent(draft, h.ctx);
   assert.equal(saved.writePermission, true);
@@ -101,7 +102,7 @@ test("模型配置格式错误自动修正一次，连续错误不保存角色",
 
 test("非法路径、系统设备名、未知工具字段和不存在的模型被拒绝", () => {
   const h = harness();
-  for (const change of [{ id: "../escape" }, { id: "con" }, { id: "general" }, { tools: ["mcp"] }, { hooks: {} }, { thinking: "magic" }, { model: "missing/model" }, { maxConcurrent: 0 }]) {
+  for (const change of [{ id: "../escape" }, { id: "con" }, { id: "general" }, { tools: ["mcp"] }, { hooks: {} }, { thinking: "magic" }, { reportProfile: "review" }, { reportProfile: undefined }, { thinking: "high" }, { model: "missing/model" }, { maxConcurrent: 0 }]) {
     assert.throws(() => parseAgentDraft(JSON.stringify({ ...base, ...change }), h.ctx));
   }
   assert.equal(parseAgentDraft("```json\n" + JSON.stringify(base) + "\n```", h.ctx).id, base.id);

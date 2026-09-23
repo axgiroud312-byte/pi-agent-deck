@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const AGENT_DECK_VERSION = "0.9.1";
+export const AGENT_DECK_VERSION = "0.9.2";
 export const RUN_SCHEMA_VERSION = 1;
 export const RUNNER_PROTOCOL_VERSION = 1;
 export const CHILD_RUNTIME_PROTOCOL_VERSION = 1;

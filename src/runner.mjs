@@ -3,7 +3,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { atomicJson, withDiskLock, persistCompletion, releaseCapacity, releaseWriter } from "./persistence.mjs";
-import { selectExecution, decisionText, applyExecutionArgs } from "./router.mjs";
+import { selectExecution, decisionText, applyExecutionArgs, isReviewRequest, assertRequestExecutionPolicy } from "./router.mjs";
 
 const args = process.argv.slice(2);
 const marker = args.indexOf("--run-dir");
@@ -175,6 +175,9 @@ for (const signal of ["SIGTERM", "SIGINT"]) {
 }
 
 try {
+  request.review = isReviewRequest(request, status);
+  assertRequestExecutionPolicy(request, status);
+  if (request.routing) request.routing.state.review = request.review;
   const decision = request.routing && !request.routingDecision
     ? await selectExecution(request.routing, { signal: routingAbort.signal }) : undefined;
   let childClosed;
@@ -189,6 +192,7 @@ try {
       appendEvent("状态", decisionText(decision));
       await atomicWrite({ ...status, model: decision.model, thinking: decision.thinking, routing: decision, routingPending: false, status: "运行中", currentAction: "模型已确定，正在启动子 Agent" });
     }
+    assertRequestExecutionPolicy(request, status);
     const childArgs = [...request.argsPrefix, "--", request.prompt];
     child = spawn(request.command, childArgs, { cwd: request.cwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...(request.env ?? {}) } });
     childClosed = new Promise((resolve) => {

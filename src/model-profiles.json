@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "note": "Heuristic starting profiles, not benchmark results. Pi off maps to API none where supported. Filter by authenticated provider, Pi model capabilities and tool transport. Verify quality and latency on local tasks.",
+  "version": 2,
+  "note": "Hard role and minimum-effort policy. Profile descriptions are heuristics, not benchmark results. Filter by authenticated provider, actual supported levels and tool transport.",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-6-astra",
     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
@@ -9,64 +9,22 @@
   ],
   "profiles": [
     {
-      "id": "sol_none",
-      "modelId": "gpt-5.6-sol",
-      "thinking": "off",
-      "criteria": "Fixed-format extraction or transformation of supplied facts, with virtually no reasoning. Trial profile; avoid uncertain or multi-step work."
-    },
-    {
-      "id": "sol_low",
-      "modelId": "gpt-5.6-sol",
-      "thinking": "low",
-      "criteria": "Short, explicit, well-bounded task: locate known symbols, explain a small function, or apply a straightforward change."
-    },
-    {
-      "id": "sol_medium",
-      "modelId": "gpt-5.6-sol",
-      "thinking": "medium",
-      "criteria": "Routine development, local diagnosis, tests and ordinary review with clear scope and acceptance. Default starting point for everyday engineering."
-    },
-    {
-      "id": "sol_high",
-      "modelId": "gpt-5.6-sol",
-      "thinking": "high",
-      "criteria": "Substantial but bounded module debugging, refactoring, or review needing several linked reasoning steps."
-    },
-    {
       "id": "sol_xhigh",
       "modelId": "gpt-5.6-sol",
       "thinking": "xhigh",
-      "criteria": "Unusually difficult bounded reasoning where extra deliberation is useful; compare against Astra on actual outcomes."
+      "criteria": "Review only: inspect changes and evidence, find correctness or boundary issues, and deliver actionable findings with file locations. Default starting profile for review."
     },
     {
       "id": "sol_max",
       "modelId": "gpt-5.6-sol",
       "thinking": "max",
-      "criteria": "Exceptional bounded tasks where maximum Sol deliberation is plausibly justified and latency is secondary; require evaluation evidence for frequent use."
-    },
-    {
-      "id": "sol6_none",
-      "modelId": "gpt-6-sol",
-      "thinking": "off",
-      "criteria": "GPT-6 Sol for deterministic extraction or transformation of supplied facts with virtually no reasoning. Avoid uncertain multi-step work."
-    },
-    {
-      "id": "sol6_low",
-      "modelId": "gpt-6-sol",
-      "thinking": "low",
-      "criteria": "GPT-6 Sol for short, explicit coding tasks with clear constraints: a small change, targeted investigation, or explanation of a known function."
-    },
-    {
-      "id": "sol6_medium",
-      "modelId": "gpt-6-sol",
-      "thinking": "medium",
-      "criteria": "GPT-6 Sol as a starting choice for ordinary implementation, tests, debugging and review needing several coordinated steps within a clear scope."
+      "criteria": "Review only: exceptionally complex interacting systems, concurrency or security boundaries needing maximum deliberation; latency is secondary."
     },
     {
       "id": "sol6_high",
       "modelId": "gpt-6-sol",
       "thinking": "high",
-      "criteria": "GPT-6 Sol for demanding but bounded module debugging, refactoring, or reviews with linked constraints and evidence to reconcile."
+      "criteria": "GPT-6 Sol for demanding but bounded module debugging or refactoring with linked constraints and evidence to reconcile."
     },
     {
       "id": "sol6_xhigh",
@@ -79,24 +37,6 @@
       "modelId": "gpt-6-sol",
       "thinking": "max",
       "criteria": "Maximum GPT-6 Sol deliberation for exceptional bounded problems. Compare actual outcomes with Astra; higher effort is not a guaranteed capability upgrade."
-    },
-    {
-      "id": "luna6_none",
-      "modelId": "gpt-6-luna",
-      "thinking": "off",
-      "criteria": "GPT-6 Luna for repetitive extraction, formatting or classification of explicit supplied facts, where a short deterministic result is sufficient."
-    },
-    {
-      "id": "luna6_low",
-      "modelId": "gpt-6-luna",
-      "thinking": "low",
-      "criteria": "GPT-6 Luna for focused, easy-to-check tasks: locate symbols, make a small explicit edit, or extract specific evidence from a narrow source."
-    },
-    {
-      "id": "luna6_medium",
-      "modelId": "gpt-6-luna",
-      "thinking": "medium",
-      "criteria": "GPT-6 Luna for repeatable tasks from a clear brief, small coordinated updates, or bounded investigation with straightforward acceptance checks."
     },
     {
       "id": "luna6_high",
@@ -132,7 +72,7 @@
       "id": "astra_high",
       "modelId": "gpt-6-astra",
       "thinking": "high",
-      "criteria": "Deep diagnosis or review of interacting systems, concurrency, state transitions, security boundaries, or high-impact architectural choices."
+      "criteria": "Deep diagnosis of interacting systems, concurrency, state transitions, security boundaries, or high-impact architectural choices."
     },
     {
       "id": "astra_xhigh",
@@ -146,5 +86,13 @@
       "thinking": "max",
       "criteria": "Hardest quality-first tasks needing maximal deliberation; use sparingly until real evaluations demonstrate benefit."
     }
-  ]
+  ],
+  "policy": {
+    "reviewModel": "gpt-5.6-sol",
+    "minimumThinking": {
+      "gpt-5.6-sol": "xhigh",
+      "gpt-6-sol": "high",
+      "gpt-6-luna": "high"
+    }
+  }
 }

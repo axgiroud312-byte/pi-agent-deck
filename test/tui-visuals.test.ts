@@ -75,14 +75,14 @@ test("选配状态、最终组合、回退原因与耗时在实际面板中可�
     assert.match(component.render(110).join("\n"), /模型：待选配/);
     component.handleInput("c");
   });
-  const chosen = { ...pending, routingPending: false, status: "已完成", model: "openai-codex/gpt-5.6-sol", thinking: "high",
-    routing: { model: "openai-codex/gpt-5.6-sol", thinking: "high", mode: "fallback", elapsedMs: 15000, reason: "Jev 选配超时，沿用原配置。" } };
+  const chosen = { ...pending, routingPending: false, status: "已完成", model: "openai-codex/gpt-6-sol", thinking: "high",
+    routing: { model: "openai-codex/gpt-6-sol", thinking: "high", mode: "fallback", elapsedMs: 15000, reason: "Jev 选配超时，使用合规回退配置。" } };
   await fs.writeFile(path.join(runDirectory(chosen.runId), "status.json"), JSON.stringify(chosen));
   await withPanel(f.parent, (component, terminal) => {
     terminal.rows = 40;
     component.handleInput("\r"); component.handleInput("1");
     const view = component.render(110).join("\n");
-    assert.match(view, /gpt-5.6-sol/); assert.match(view, /思考强度：high/);
+    assert.match(view, /gpt-6-sol/); assert.match(view, /思考强度：high/);
     assert.match(view, /已回退/); assert.match(view, /15000 ms/); assert.match(view, /超时/);
     for (const width of [1, 10, 40, 80]) assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
   });

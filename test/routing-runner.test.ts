@@ -4,9 +4,12 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { initializeRun, launchRunner, readRun, runDirectory, stopRun, continueRun, startFollowUp } from "../src/runtime.ts";
+import { initializeRun, launchRunner, readRun, runDirectory, stopRun, continueRun, startFollowUp, writeJsonAtomic } from "../src/runtime.ts";
 import { readCompletions, alive } from "../src/persistence.mjs";
 import type { RoutingPlan } from "../src/router.mjs";
 import agentDeck from "../src/index.ts";
@@ -23,15 +26,15 @@ async function settled(id: string) {
 function plan(task: string): RoutingPlan {
   return {
     version: 1, routerModel: "jev-1.13.0", timeoutMs: 10000,
-    fallback: { model: "openai-codex/gpt-5.6-sol", thinking: "medium" },
+    fallback: { model: "openai-codex/gpt-6-sol", thinking: "high" },
     candidates: [
-      { id: "sol_medium", model: "openai-codex/gpt-5.6-sol", thinking: "medium", criteria: "routine" },
+      { id: "sol6_high", model: "openai-codex/gpt-6-sol", thinking: "high", criteria: "routine" },
       { id: "astra_high", model: "openai-codex/gpt-6-astra", thinking: "high", criteria: "complex" },
     ],
     state: { task, role: "scout", roleDescription: "调查", writePermission: false, tools: ["read"] },
   };
 }
-async function fixture(task: string) {
+async function fixture(task: string, routing = plan(task)) {
   const id = "routing-" + randomUUID();
   const directory = path.join(getAgentDir(), "fixtures", id);
   await fs.mkdir(directory, { recursive: true });
@@ -41,9 +44,8 @@ async function fixture(task: string) {
     'fs.appendFileSync("started.jsonl",JSON.stringify(process.argv.slice(2))+"\\n");',
     'console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:process.argv.join(" ")}]}}));',
   ].join("\n"));
-  const routing = plan(task);
   const run: any = {
-    version: 1, autoDeliver: true, runId: id, agentId: "scout", agentName: "fixture", objective: task, instruction: task,
+    version: 1, autoDeliver: true, runId: id, agentId: routing.state.role, agentName: "fixture", objective: task, instruction: task,
     status: "选配中", model: routing.fallback.model, thinking: routing.fallback.thinking, routingPending: true,
     tools: ["read"], writePermission: false, cwd: directory, parentSessionId: id, childSessionId: id, childSessionPath: path.join(directory, "child.jsonl"),
     startedAt: Date.now(), reports: [], events: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -88,7 +90,7 @@ test("新工具串联 Jev：选配中不虚报模型，补充排队、继续不�
   await fs.mkdir(directory, { recursive: true });
   const cli = path.join(directory, "fake-pi.mjs");
   await fs.writeFile(cli, 'import fs from "node:fs";fs.appendFileSync("started.jsonl",JSON.stringify(process.argv.slice(2))+"\\n");console.log(JSON.stringify({type:"message_end",message:{role:"assistant",stopReason:"stop",content:[{type:"text",text:process.argv.at(-1)}]}}));');
-  const sol: any = { provider: "openai-codex", id: "gpt-5.6-sol", reasoning: true, thinkingLevelMap: { minimal: "low", xhigh: "xhigh", max: "max" } };
+  const sol: any = { provider: "openai-codex", id: "gpt-6-sol", reasoning: true, thinkingLevelMap: { minimal: "low", xhigh: "xhigh", max: "max" } };
   const astra: any = { ...sol, id: "gpt-6-astra", thinkingLevelMap: { off: null, minimal: null, xhigh: "xhigh", max: "max" } };
   const tools = new Map<string, any>();
   agentDeck({ registerTool: (tool: any) => tools.set(tool.name, tool), registerCommand() {}, registerMessageRenderer() {}, on() {}, getThinkingLevel: () => "medium" } as any);
@@ -183,11 +185,94 @@ test("无效选择使用原配置启动，回退原因进入最终结果", async
   const run = await settled(f.id);
   assert.equal(svc.calls.length, 1);
   assert.equal(run.status, "已完成");
-  assert.equal(run.model, "openai-codex/gpt-5.6-sol");
-  assert.equal(run.thinking, "medium");
+  assert.equal(run.model, "openai-codex/gpt-6-sol");
+  assert.equal(run.thinking, "high");
   assert.equal(run.routing!.mode, "fallback");
   assert.match(run.routing!.reason, /无效/);
-  assert.match(run.finalText!, /gpt-5.6-sol --thinking medium/);
+  assert.match(run.finalText!, /gpt-6-sol --thinking high/);
   const results = await readCompletions(runDirectory(f.id));
   assert.match(results[0].routing!.reason, /无效/);
+});
+
+test("自定义审查角色的身份在选配后保留，继续沿用 GPT-5.6 Sol xhigh", async (t) => {
+  const p = plan("custom review");
+  p.fallback = { model: "openai-codex/gpt-5.6-sol", thinking: "xhigh" };
+  p.candidates = [];
+  p.state.role = "custom-review";
+  p.state.review = true;
+  const f = await fixture("custom review", p);
+  t.after(() => stopRun(f.id));
+  await launchRunner(f.id);
+  const first = await settled(f.id);
+  assert.equal(first.status, "已完成");
+  assert.equal(first.model, p.fallback.model);
+  assert.equal(first.thinking, "xhigh");
+  const saved = JSON.parse(await fs.readFile(path.join(runDirectory(f.id), "request.json"), "utf8"));
+  assert.equal(saved.review, true);
+  assert.equal(saved.routing, undefined);
+  await continueRun(f.id, "再检查边界情况");
+  const resumed = await settled(f.id);
+  assert.equal(resumed.status, "已完成");
+  assert.equal(resumed.model, first.model);
+  assert.equal(resumed.childSessionId, first.childSessionId);
+  assert.equal(resumed.thinking, "xhigh");
+  assert.equal((await fs.readFile(path.join(f.directory, "started.jsonl"), "utf8")).trim().split("\n").length, 2);
+});
+
+test("旧排队请求违规时持久化失败，不启动进程、不重复重试，补充内容保留", async () => {
+  for (const [role, model, thinking] of [["reviewer", "gpt-6-astra", "max"], ["reviewer", "gpt-5.6-sol", "high"], ["scout", "gpt-5.6-sol", "max"], ["scout", "gpt-6-luna", "medium"]] as const) {
+    const p = plan("legacy queued");
+    p.state.role = role;
+    p.fallback = { model: `openai-codex/${model}`, thinking };
+    const f = await fixture("legacy queued", p);
+    await continueRun(f.id, "保留这条补充");
+    assert.equal(await launchRunner(f.id), 0);
+    const failed = (await readRun(f.id))!;
+    assert.equal(failed.status, "失败");
+    assert.match(failed.stderr!, /模型策略不允许/);
+    assert.equal(failed.policyBlocked, true);
+    assert.equal(await launchRunner(f.id), 0);
+    assert.equal(await startFollowUp(f.id), false);
+    assert.equal((await readCompletions(runDirectory(f.id))).length, 1);
+    await assert.rejects(fs.access(path.join(f.directory, "started.jsonl")));
+    assert.match(await fs.readFile(path.join(runDirectory(f.id), "follow-up.json"), "utf8"), /保留这条补充/);
+  }
+});
+
+test("旧已结束任务继续前检查保存决策及实际启动参数，拒绝时请求、状态和队列均不变", async () => {
+  for (const mismatch of [false, true]) {
+    const f = await fixture("legacy ended");
+    const directory = runDirectory(f.id);
+    const run = (await readRun(f.id))!;
+    await writeJsonAtomic(path.join(directory, "status.json"), { ...run, status: "已完成", endedAt: Date.now(), finalText: "old result" });
+    const request = JSON.parse(await fs.readFile(path.join(directory, "request.json"), "utf8"));
+    delete request.routing;
+    request.routingDecision = { model: "openai-codex/gpt-6-sol", thinking: mismatch ? "high" : "medium", mode: "fixed", elapsedMs: 0, reason: "old" };
+    request.argsPrefix[request.argsPrefix.indexOf("--thinking") + 1] = "medium";
+    await writeJsonAtomic(path.join(directory, "request.json"), request);
+    const before = await Promise.all(["request.json", "status.json"].map((name) => fs.readFile(path.join(directory, name), "utf8")));
+    await assert.rejects(continueRun(f.id, "new instruction"), /最低思考强度为 high/);
+    const after = await Promise.all(["request.json", "status.json"].map((name) => fs.readFile(path.join(directory, name), "utf8")));
+    assert.deepEqual(after, before);
+    await assert.rejects(fs.access(path.join(directory, "follow-up.json")));
+    await assert.rejects(fs.access(path.join(f.directory, "started.jsonl")));
+    // Previously queued messages remain available, but automatic retries stop after one notice.
+    await writeJsonAtomic(path.join(directory, "follow-up.json"), [{ id: "queued", message: "old message", summary: "old message", at: Date.now() }]);
+    await assert.rejects(startFollowUp(f.id), /最低思考强度为 high/);
+    assert.equal(await startFollowUp(f.id), false);
+    assert.equal((await readRun(f.id))!.status, "已完成");
+  }
+});
+
+
+test("直接启动独立 Runner 也会拦截违规旧请求，实际子进程不会启动", async () => {
+  const p = plan("direct legacy runner");
+  p.fallback = { model: "openai-codex/gpt-6-sol", thinking: "low" };
+  const f = await fixture("direct legacy runner", p);
+  await promisify(execFile)(process.execPath, [fileURLToPath(new URL("../src/runner.mjs", import.meta.url)), "--run-dir", runDirectory(f.id)], { windowsHide: true, timeout: 15000 });
+  const failed = (await readRun(f.id))!;
+  assert.equal(failed.status, "失败");
+  assert.ok(failed.events.some((event) => event.text.includes("最低思考强度为 high")));
+  assert.equal((await readCompletions(runDirectory(f.id))).length, 1);
+  await assert.rejects(fs.access(path.join(f.directory, "started.jsonl")));
 });

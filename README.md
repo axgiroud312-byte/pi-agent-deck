@@ -1,6 +1,6 @@
 # Pi Agent Deck
 
-给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.1**，采用 MIT 许可证。
+给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.2**，采用 MIT 许可证。
 
 一句话派任务，结果自动回来；用任务编号或实例名称继续、停止。模型工具采用 Claude Code 风格的 `Agent`、`SendMessage`、`TaskStop`。
 
@@ -86,7 +86,7 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 你也可以在聊天里直接说“帮我创建一个……的 Agent”。主 Agent 会读取本插件的角色编写说明，使用现有文件工具完成；命令入口则由插件执行自动生成和校验。
 
 - 默认保存为个人角色，所有项目可用；聊天中可明确要求只用于当前可信项目。
-- 角色的模型、思考强度默认交给 Jev 在派遣时选择；自动选配关闭时继承主会话。描述里明确指定的配置固定保留；时限跟随全局。
+- 角色的模型、思考强度默认交给 Jev 在派遣时按角色策略选择；关闭选配也遵守相同策略。显式配置违反策略时拒绝保存或派遣；时限跟随全局。审查角色须带 `reportProfile: 审查`，命令生成的角色会保存这个标记。
 - 调查、建议、审查默认只读；实现和修改任务按需求分配工具。完成后会显示实际工具和权限。
 - 命令入口遇到生成格式错误会自动修正一次；仍无效时显示原因，不保存半成品。重名时自动加后缀，保留已有角色。
 - 创建后可直接说“用这个 Agent 帮我……”或“用角色 ID 帮我……”。`/agent-config 角色ID` 保留手动编辑，聊天中也可描述修改要求。
@@ -105,22 +105,26 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 
 默认选择器为 `jev-1.13.0`，15 秒超时。候选只来自当前提供商中 Pi 认为可用的下列四个模型，不自动切换账户或提供商。实际服务权限和限流仍可能影响执行。
 
-| 模型 | Pi 中使用的思考档位 |
-|---|---|
-| GPT-5.6 Sol | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
-| GPT-6 Astra | `low`、`medium`、`high`、`xhigh`、`max` |
-| GPT-6 Sol | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
-| GPT-6 Luna | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
+以下是插件的**强制使用策略**，优先于 Jev、模型别名、角色固定值和继承值；这张表不表示模型官方支持的全部档位。
 
-初始适用范围见 [选配组合与评估说明](docs/jev-routing.md)。这是待实测的路由策略；程序还会按当前 Pi 的能力筛掉不支持的组合。
+| 模型 | 可用角色 | 本插件允许的思考强度 |
+|---|---|---|
+| GPT-5.6 Sol | 仅审查；审查角色也只能用它 | `xhigh`、`max` |
+| GPT-6 Sol | 非审查 | `high`、`xhigh`、`max` |
+| GPT-6 Luna | 非审查 | `high`、`xhigh`、`max` |
+| GPT-6 Astra | 非审查 | `low`、`medium`、`high`、`xhigh`、`max` |
 
-GPT-6 Sol/Luna 在 Chat Completions 接口下只支持 `none` 档的工具调用，因此该接口只保留 `off` 候选；推理与工具一起使用时应选择 Responses 接口。显式固定了不兼容的档位会在派遣前报错。
+共定义 13 个组合：审查池 2 个，非审查池 11 个。内置 `reviewer` 始终属于审查；自定义审查角色必须填写 `reportProfile: 审查`，主 Agent 按任务职责选择角色。程序依据这个标记识别审查，不猜测任务文本或角色名称。适用范围和具体规则见 [选配组合与评估说明](docs/jev-routing.md)。
+
+继承强度低于下限时会提升到当前模型实际支持的合规档位。非审查任务若从主会话继承到 GPT-5.6 Sol，会在同一提供商中按 GPT-6 Sol → Astra → Luna 选择可用的回退模型；审查则选择同一提供商的 GPT-5.6 Sol。找不到合规配置时在创建任务前报错，不自动切换账户。这个顺序只决定回退，不是 Jev 的排名。
+
+GPT-6 Sol/Luna 的推理工具调用需要 Responses 接口。其 Chat Completions 工具调用的 `off` 档低于本插件最低 `high`，因此不会进入候选；显式固定这种接口时提示修正。候选还会按当前 Pi 的实际模型能力筛选。
 
 - `Agent.model` 优先于角色模型配置。思考强度可在角色中固定；新接口没有 `thinking` 参数。Jev 只选择尚未固定的部分；两项都固定或只剩一个组合时直接执行。
-- 缺少密钥、接口错误、超时、无效选择、无合适候选时沿用明确配置或创建时的主会话配置，并记录原因。固定了模型不支持的强度时，派遣前提示修正。
-- 每个新任务最多一次 Jev 选择。选择结果写入该任务；继续相同任务沿用配置。中途改设置不会更换已有任务的模型。选配尚未完成就取消的任务，显式继续时才重新尝试首次选择。
+- 缺少密钥、接口错误、超时、无效选择、无合适候选时使用预先校验的合规回退配置，并记录原因。显式固定的模型或强度违反策略、或模型不支持该档位时，派遣前提示修正。
+- 每个新任务最多一次 Jev 选择。选择结果写入该任务；继续相同任务沿用符合当前策略的已选配置。升级后，旧任务在再次启动或继续前会重新校验策略；不合规时要求新建任务，不自动换模重跑。已经启动的进程需结束或停止后再按新策略派遣。选配尚未完成就取消的任务，显式继续时才重新尝试首次选择。
 - 取消操作和子进程启动使用同一个任务锁；选配被取消后，迟到的结果不能再启动子进程。
-- 提交给 TypeSafe 的数据为该子任务说明、角色 ID/描述、工具名、写权限和组合标准。不额外读取整个对话、项目文件或角色提示词；任务说明中主动包含的内容仍会随请求提交。
+- 提交给 TypeSafe 的数据为该子任务说明、角色 ID/描述、审查标记、工具名、写权限和组合标准。不额外读取整个对话、项目文件或角色提示词；任务说明中主动包含的内容仍会随请求提交。
 - 分布、选择器版本、选配时长和接口返回的 token 用量保存在任务记录。置信度不等于任务成功率；没有未经评估的置信度门槛。
 
 接口遵循 [TypeSafe 官方 API](https://docs.typesafe.ai/api) 的 Choice 类型；能力边界依据 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)、[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)、[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)和 [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)文档。
@@ -149,7 +153,7 @@ GPT-6 Sol/Luna 在 Chat Completions 接口下只支持 `none` 档的工具调用
 
 `timeoutMs: 0` 表示不限执行时长；正整数表示毫秒，例如 `1800000` 是 30 分钟。未设置时默认不限时。
 
-`modelAliases` 默认空对象。若需要 `sonnet`、`opus`、`haiku` 或自定义别名，请在高级配置中明确映射到真实 `provider/model`。例如 `"modelAliases": { "review": "openai-codex/gpt-6-astra" }`，之后可用 `Agent.model: "review"`。此配置只提供名称映射，不配置账户；模型仍须在当前 Pi 中可用。角色文件继续使用完整模型标识。
+`modelAliases` 默认空对象。若需要 `sonnet`、`opus`、`haiku` 或自定义别名，请在高级配置中明确映射到真实 `provider/model`。例如 `"modelAliases": { "review": "openai-codex/gpt-5.6-sol" }`，之后可在审查角色中使用 `Agent.model: "review"`。别名不会绕过角色和思考强度规则。此配置只提供名称映射，不配置账户；模型仍须在当前 Pi 中可用。角色文件继续使用完整模型标识。
 
 开关关闭后，不新建、不追加、不启动排队任务；已经启动的任务继续运行，仍可停止和接收结果。重新开启后恢复调度。
 
@@ -191,8 +195,9 @@ timeoutMs: 0
 |---|---|
 | `name` | 显示名称；默认文件名 |
 | `description` | 让主 Agent 知道何时使用这个角色 |
-| `model` | `inherit` 或省略时自动选配，关闭时继承；完整 `provider/model` 固定模型 |
-| `thinking` | `inherit` 或省略时自动选配，关闭时继承；固定值支持 `off/minimal/low/medium/high/xhigh/max`，按模型校验 |
+| `model` | `inherit` 或省略时按角色策略自动选配；关闭时也执行策略。完整 `provider/model` 固定模型 |
+| `thinking` | `inherit` 或省略时按角色策略自动选配；固定值支持 `off/minimal/low/medium/high/xhigh/max`，实际允许值按上表及模型能力校验 |
+| `reportProfile` | `通用`（默认）、`侦察`、`执行` 或 `审查`；自定义审查角色必须标记为 `审查` |
 | `tools` | 允许的工具，可写逗号列表或 YAML 数组 |
 | `disallowedTools` | 从允许列表中排除这些工具 |
 | `timeoutMs` | 本角色每次执行的时限；`0` 不限时，省略继承全局默认 |
@@ -200,9 +205,9 @@ timeoutMs: 0
 
 支持 Pi 工具 `read, grep, find, ls, bash, edit, write`。工具名不区分大小写，Claude 风格的 `Glob` 映射到 Pi 的 `find`。省略工具时默认只读；显式 `writePermission: true` 且省略工具时使用全部上述工具。内部提问工具由插件提供。
 
-**配置修改用于下一次新建任务，无需重新加载角色文件。** 已有任务的模型、工具、提示词和时限保持原配置，继续时沿用。
+**配置修改用于下一次新建任务，无需重新加载角色文件。** 已有任务的工具、提示词和时限保持原配置；模型与强度在继续前需通过当前策略校验。
 
-这里没有实现 Claude 的 `permissionMode`、`maxTurns`、`memory`、`skills`、`mcpServers`、`hooks` 或 `isolation`。配置这些字段会明确报错。也不会将 `opus/sonnet/haiku` 自动映射到某个 Pi 模型。旧版 `id`、`reportProfile` 字段仍兼容。
+这里没有实现 Claude 的 `permissionMode`、`maxTurns`、`memory`、`skills`、`mcpServers`、`hooks` 或 `isolation`。配置这些字段会明确报错。也不会将 `opus/sonnet/haiku` 自动映射到某个 Pi 模型。旧版 `id` 字段仍兼容；`reportProfile` 同时用于审查角色识别。
 
 参考：[Claude Code 官方子 Agent 配置](https://code.claude.com/docs/en/sub-agents#write-subagent-files)。
 
@@ -305,6 +310,6 @@ npm pack --dry-run
 
 测试使用独立临时 Agent 数据目录、模拟模型输出及真实 fixture 子进程；宿主加载测试禁止网络请求。自动化测试不等于真实模型质量或人工终端验收。
 
-源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.1 修复说明](docs/0.9.1-release.md)、[0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
+源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.2 模型策略说明](docs/0.9.2-release.md)、[0.9.1 修复说明](docs/0.9.1-release.md)、[0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
 
 本项目是社区扩展，与 Pi、Anthropic 或 TypeSafe 官方没有隶属关系；“Claude 风格”指工具命名和部分交互约定，具体支持范围以本文为准。许可证见 [MIT LICENSE](LICENSE)。

@@ -385,7 +385,7 @@ else console.log(JSON.stringify({type:"message_end",message:{role:"assistant",st
   await h.handlers.get("session_start")({}, h.ctx);
   assert.equal(h.messages.length, 1); assert.match(h.messages[0].content, /SendMessage/); assert.match(h.messages[0].content, /ask-compat/);
   const reply = receipt(await h.call("SendMessage", { to: "ask-compat", message: "保持兼容" })); assert.equal(reply.delivery, "resumed");
-  const done = await settled(id); assert.equal(done.status, "已完成"); assert.equal(done.childSessionId, waiting.childSessionId);
+  const done = await settled(id); assert.equal(done.status, "已完成", JSON.stringify({ stderr: done.stderr, events: done.events })); assert.equal(done.childSessionId, waiting.childSessionId);
   await until(async () => h.messages.length === 2);
   h.handlers.get("session_shutdown")();
   await h.handlers.get("session_start")({}, h.ctx);
@@ -434,4 +434,35 @@ test("关闭后 Agent 和 SendMessage 都停用，TaskStop 可用；重新开启
   await h.commands.get("agent-deck").handler("开启", h.ctx);
   assert.deepEqual(h.active().sort(), ["Agent", "SendMessage", "TaskStop"]);
   assert.equal(readDeckConfig().modelAliases.haiku, "fixture/explicit"); assert.equal(readDeckConfig().routing.timeoutMs, 2500);
+});
+
+test("审查策略在公开 Agent 工具生效，违规别名与角色在 Session 创建前拒绝", async (t) => {
+  const h = await harness(t, 10);
+  const models = ["gpt-5.6-sol", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"].map((id) => ({ provider: "fixture", id, api: "openai-responses", reasoning: true, thinkingLevelMap: { minimal: "low", xhigh: "xhigh", max: "max" } }));
+  h.ctx.model = models[1];
+  h.ctx.modelRegistry = { find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id), getAvailable: () => models };
+  await writeDeckConfig({ ...DEFAULT_CONFIG, routing: { ...DEFAULT_CONFIG.routing, enabled: false }, modelAliases: { audit: "fixture/gpt-5.6-sol", fast: "fixture/gpt-6-luna" } });
+  const roles = path.join(h.cwd, ".pi", "agents");
+  await fs.mkdir(roles, { recursive: true });
+  await fs.writeFile(path.join(roles, "audit-custom.md"), '---\nname: 自定义审查\nreportProfile: 审查\ntools: [read]\n---\n审查代码。');
+  await fs.writeFile(path.join(roles, "audit-low.md"), '---\nname: 强度不合规\nreportProfile: 审查\nthinking: high\ntools: [read]\n---\n审查代码。');
+  let sessionCreations = 0;
+  h.ctx.sessionManager.getSessionFile = () => { sessionCreations++; return undefined; };
+  for (const args of [
+    { ...input, model: "audit" },
+    { ...input, subagent_type: "reviewer", model: "fast" },
+    { ...input, subagent_type: "audit-low" },
+    { ...input, subagent_type: "audit-custom", model: "fixture/gpt-6-astra" },
+  ]) await assert.rejects(h.call("Agent", { ...args, name: "policy-check" }), /审查|最低/);
+  assert.equal(sessionCreations, 0);
+  assert.equal((await listRuns(Number.MAX_SAFE_INTEGER, h.parent)).length, 0);
+  for (const subagent_type of ["reviewer", "audit-custom"]) {
+    const result = receipt(await h.call("Agent", { ...input, subagent_type, name: subagent_type === "reviewer" ? "policy-check" : "custom-check" }));
+    const run = await settled(result.agentId);
+    assert.equal(run.status, "已完成");
+    assert.equal(run.model, "fixture/gpt-5.6-sol");
+    assert.equal(run.thinking, "xhigh");
+    assert.equal(JSON.parse(await fs.readFile(path.join(runDirectory(run.runId), "request.json"), "utf8")).review, true);
+  }
+  assert.equal(sessionCreations, 2);
 });

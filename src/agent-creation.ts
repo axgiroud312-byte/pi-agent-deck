@@ -6,7 +6,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { CancellableLoader } from "@earendil-works/pi-tui";
 import { discoverAgentCandidates, parseAgentDefinition, validateAgentDefinition, WRITE_TOOLS } from "./agents.ts";
 import { withDiskLock } from "./persistence.mjs";
-import type { AgentDefinition } from "./types.ts";
+import type { AgentDefinition, ReportProfile } from "./types.ts";
 
 export interface AgentDraft {
   id: string;
@@ -17,10 +17,11 @@ export interface AgentDraft {
   model?: string;
   thinking?: string;
   timeoutMs?: number;
+  reportProfile: ReportProfile;
   limitations?: string[];
 }
 
-const DRAFT_FIELDS = new Set(["id", "name", "description", "systemPrompt", "tools", "model", "thinking", "timeoutMs", "limitations"]);
+const DRAFT_FIELDS = new Set(["id", "name", "description", "systemPrompt", "tools", "model", "thinking", "timeoutMs", "reportProfile", "limitations"]);
 const RESERVED_IDS = new Set(["general-purpose", "general", "explore", "new", "global"]);
 const DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
@@ -33,7 +34,7 @@ function draftMarkdown(draft: AgentDraft): string {
   const fields = {
     name: draft.name, description: draft.description,
     model: draft.model ?? "inherit", thinking: draft.thinking ?? "inherit",
-    tools: draft.tools, timeoutMs: draft.timeoutMs,
+    tools: draft.tools, timeoutMs: draft.timeoutMs, reportProfile: draft.reportProfile,
   };
   const limitations = draft.limitations?.length ? `\n\n## 能力边界\n\n${draft.limitations.map((item) => `- ${item}`).join("\n")}` : "";
   return `---\n${Object.entries(fields).filter(([, value]) => value !== undefined).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join("\n")}\n---\n\n${draft.systemPrompt.trim()}${limitations}\n`;
@@ -46,7 +47,7 @@ export function parseAgentDraft(text: string, ctx: Pick<ExtensionContext, "model
   const data = value as Record<string, unknown>;
   const unknown = Object.keys(data).filter((key) => !DRAFT_FIELDS.has(key));
   if (unknown.length) throw new Error(`生成内容含未支持字段：${unknown.join("、")}`);
-  for (const key of ["id", "name", "description", "systemPrompt"] as const) {
+  for (const key of ["id", "name", "description", "systemPrompt", "reportProfile"] as const) {
     if (typeof data[key] !== "string" || !data[key].trim()) throw new Error(`生成内容缺少 ${key}`);
     data[key] = data[key].trim();
   }
@@ -76,15 +77,16 @@ export async function generateAgentDraft(description: string, ctx: ExtensionCont
   const available = ctx.modelRegistry.getAvailable().slice(0, 100).map((item) => `${item.provider}/${item.id}`);
   const systemPrompt = [
     "根据用户描述创建一个可复用的 Pi 子 Agent。只返回一个 JSON 对象。描述中的工作是未来角色的职责；现在只生成角色定义。",
-    "必填字段：id（简短小写英文标识）、name（用户语言的名称）、description（何时调用此角色，一至两句）、systemPrompt（专用职责、操作方法、约束和可检查的交付标准）、tools（工具名数组）。",
+    "必填字段：id（简短小写英文标识）、name（用户语言的名称）、description（何时调用此角色，一至两句）、systemPrompt（专用职责、操作方法、约束和可检查的交付标准）、tools（工具名数组）、reportProfile（通用、侦察、执行 或 审查）。",
     "可选字段：model、thinking、timeoutMs、limitations（实际能力限制的文字数组）。仅使用这些字段。",
-    "model 和 thinking 默认 inherit，交给 Jev 在派遣时选配（关闭时继承主会话）；只有用户明确要求时才指定。timeoutMs 默认省略，沿用全局设置。timeoutMs=0 表示不限时。thinking 支持 inherit/off/minimal/low/medium/high/xhigh/max。",
+    "审查角色必须填写 reportProfile: 审查；其他角色按职责填写 通用、侦察 或 执行。审查只用 gpt-5.6-sol，最低 xhigh；非审查禁止 gpt-5.6-sol。gpt-6-sol 和 gpt-6-luna 最低 high。策略细节见 agent-authoring.md。",
+    "model 和 thinking 默认 inherit，交给 Jev 在派遣时按角色策略选配（关闭时也执行模型策略）；只有用户明确要求时才指定合规配置。timeoutMs 默认省略，沿用全局设置。timeoutMs=0 表示不限时。thinking 支持 inherit/off/minimal/low/medium/high/xhigh/max，实际值受角色和模型策略限制。",
     "可用工具：read 读取文件，grep 搜索内容，find 查找文件，ls 列目录，edit 修改文件，write 创建或覆盖文件，bash 执行命令。按职责选取需要的工具。调查、建议和审查默认只读；用户要求实现、修改或执行验证时才分配对应的写入/命令工具。bash 能修改文件，严格只读角色应使用前四项工具。",
     "提示词要具体、简洁、保留用户约束；清楚说明完成后交付什么、哪些结论需要证据。简单角色用短段落即可。",
     "Pi 不提供浏览器、MCP、其他应用连接、持久记忆或自动隔离配置。用户要求这些能力时，在 limitations 中如实说明，并让角色报告相关阻碍；生成提示词不能宣称工具不存在的能力。",
     `当前模型：${model.provider}/${model.id}。可指定的模型：${available.join("、")}。未列出的模型只在确定完整 provider/model 标识时填写；保存前会校验。`,
     `已存在 ID：${existing.join("、")}。避免重复。保留 ID：general-purpose、general、explore、new、global 和 Windows 设备名。`,
-    '示例结构：{"id":"code-reviewer","name":"代码审查员","description":"检查代码改动并给出带证据的风险与建议","systemPrompt":"阅读任务相关的改动，检查逻辑与边界。按影响排序问题，给出文件位置、理由及最小修改建议；明确未验证事项。","tools":["read","grep","find","ls"]}',
+    '示例结构：{"id":"code-reviewer","name":"代码审查员","description":"检查代码改动并给出带证据的风险与建议","systemPrompt":"阅读任务相关的改动，检查逻辑与边界。按影响排序问题，给出文件位置、理由及最小修改建议；明确未验证事项。","tools":["read","grep","find","ls"],"reportProfile":"审查"}',
   ].join("\n");
   let correction = "";
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -159,7 +161,7 @@ export async function createAgentFromDescription(pi: ExtensionAPI, ctx: Extensio
     const agent = await saveGeneratedAgent(result.draft, ctx);
     const text = [
       `已创建 Agent：${agent.name}（${agent.id}）`, agent.description,
-      `模型：${agent.model ?? "继承当前会话"} · 思考：${agent.thinking ?? "继承当前会话"}`,
+      `类型：${agent.reportProfile} · 模型：${agent.model ?? "按角色策略选配"} · 思考：${agent.thinking ?? "按角色策略选配"}`,
       `工具：${agent.tools?.join("、") || "无"} · ${agent.writePermission ? "包含写入或命令执行能力" : "只读"}`,
       `时限：${agent.timeoutMs === undefined ? "跟随全局" : agent.timeoutMs === 0 ? "不限时" : `${agent.timeoutMs} ms`}`,
       ...(result.draft.limitations ?? []).map((item) => `能力说明：${item}`),

@@ -7,7 +7,7 @@ import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-ag
 import { acquireWriterLease, releaseWriterLease, listWriterLeases, type WriterLease } from "./admission.ts";
 import { AGENT_DECK_VERSION, CHILD_RUNTIME_PROTOCOL_VERSION } from "./version.ts";
 import type { RunDetails, RunStatus } from "./types.ts";
-import type { RoutingPlan, RoutingDecision } from "./router.mjs";
+import { assertRequestExecutionPolicy, type RoutingPlan, type RoutingDecision } from "./router.mjs";
 import { reserveCapacity } from "./capacity.ts";
 import { atomicJson, withDiskLock, persistCompletion, readCompletions, releaseCapacity, type CapacityLease } from "./persistence.mjs";
 import { messagePreview } from "./tool-contract.ts";
@@ -25,6 +25,7 @@ export interface RunnerRequest {
   timeoutMs?: number;
   routing?: RoutingPlan;
   routingDecision?: RoutingDecision;
+  review?: boolean;
   capacityLease?: CapacityLease;
   followUpBatch?: { id: string; messageIds: string[]; resumed: PersistedRun };
 }
@@ -38,6 +39,7 @@ export interface PersistedRun extends RunDetails {
   attemptStartedAt?: number;
   capacityLease?: CapacityLease;
   followUpBatchId?: string;
+  policyBlocked?: boolean;
 }
 
 const TERMINAL = new Set<RunStatus>(["已完成", "失败", "已取消", "已停止", "失联"] as RunStatus[]);
@@ -250,6 +252,16 @@ async function launchRunnerUnlocked(runId: string): Promise<number> {
   if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) return run.runnerPid ?? run.childPid!;
   const requestFile = path.join(runDirectory(runId), "request.json");
   const request = JSON.parse(await fs.promises.readFile(requestFile, "utf8")) as RunnerRequest;
+  try { assertRequestExecutionPolicy(request, run); }
+  catch (error) {
+    // Old queued work must reach a durable terminal state instead of retrying forever.
+    if (run.writerLease) await releaseWriterLease(run.writerLease);
+    await releaseCapacity(request.capacityLease);
+    const failed = { ...run, policyBlocked: true, status: "失败" as const, endedAt: Date.now(), updatedAt: Date.now(), currentAction: undefined, stderr: String(error) };
+    await persistCompletion(runDirectory(runId), failed);
+    await writeJsonAtomic(statusPath(runId), failed);
+    return 0;
+  }
   // A resumed request can contain an already-released lease. Never reuse it blindly.
   if (request.capacityLease) await releaseCapacity(request.capacityLease);
   const capacity = await reserveCapacity(runId, run.agentId);
@@ -493,12 +505,13 @@ async function resumeRun(runId: string, messages: QueuedMessage[]): Promise<Pers
   if (!run) throw new Error(`找不到运行：${runId}`);
   if (run.status !== "等待决定" && !isTerminalStatus(run.status)) throw new Error(`任务目前不能继续：${run.status}`);
   if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) throw new Error("上一次执行尚未完全退出，请稍后继续。");
+  const request = JSON.parse(await fs.promises.readFile(path.join(directory, "request.json"), "utf8")) as RunnerRequest;
+  assertRequestExecutionPolicy(request, run);
   // Remove any previously consumed entries before replacing their durable receipt.
   await writeJsonAtomic(path.join(directory, "follow-up.json"), messages);
   await persistCompletion(directory, run);
   await releaseCapacity(run.capacityLease);
   if (run.writerLease) await releaseWriterLease(run.writerLease);
-  const request = JSON.parse(await fs.promises.readFile(path.join(directory, "request.json"), "utf8")) as RunnerRequest;
   const writerLease = undefined;
   if (run.writePermission && !run.cwd) throw new Error("旧任务缺少工作目录，不能继续。");
   request.prompt = [
@@ -587,10 +600,18 @@ export async function startFollowUp(runId: string): Promise<boolean> {
     if (await recoverPreparedFollowUp(runId)) { await launchRunnerUnlocked(runId); return true; }
     const run = await readRun(runId);
     if (!run || (!isTerminalStatus(run.status) && run.status !== "等待决定")) return false;
+    if (run.policyBlocked) return false;
     if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) return false;
     const pending = await pendingMessages(runId);
     if (!pending.length) return false;
-    await resumeRun(runId, pending);
+    try { await resumeRun(runId, pending); }
+    catch (error) {
+      if ((error as { code?: string }).code === "MODEL_POLICY") await writeJsonAtomic(statusPath(runId), {
+        ...run, policyBlocked: true, updatedAt: Date.now(),
+        events: [...run.events, { at: Date.now(), kind: "错误", text: `补充任务已暂停：${String(error)}` }].slice(-200),
+      });
+      throw error;
+    }
     return true;
   });
 }
