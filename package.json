@@ -1,6 +1,6 @@
 {
   "name": "pi-agent-deck",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Pi 中文多 Agent 扩展：Claude 风格工具、后台任务面板、上下文续接与 Jev 模型/思考强度选配",
   "type": "module",
   "license": "MIT",
@@ -19,6 +19,7 @@
     "docs/jev-routing.md",
     "docs/0.8.0-release.md",
     "docs/0.9.0-release.md",
+    "docs/0.9.1-release.md",
     "docs/evidence/0.9.0/tui-preview.html",
     "docs/publishing.md"
   ],

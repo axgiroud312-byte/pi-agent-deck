@@ -36,6 +36,7 @@ import { registerConfiguration } from "./configuration-ui.ts";
 import { agentAuthoringContext, createAgentFromDescription } from "./agent-creation.ts";
 import { renderFleet } from "./presentation.ts";
 import { prepareRouting } from "./routing.ts";
+import { prepareChildProviders, saveChildProviders } from "./child-providers.ts";
 import { registerRouting } from "./routing-ui.ts";
 import { persistCompletion, readCompletions } from "./persistence.mjs";
 import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, requireAvailableModel, taskToolResult, runTitle, runRoleLabel } from "./tool-contract.ts";
@@ -291,10 +292,12 @@ export default function agentDeck(pi: ExtensionAPI) {
       if (unsupportedTools.length) throw new Error(`Agent“${agent.name}”配置了 child runtime 不支持的工具：${unsupportedTools.join("、")}`);
       const routing = prepareRouting(agent, request.objective, ctx, config, pi.getThinkingLevel?.() ?? "off", { model });
       const resolved = routing.immediate ?? routing.fallback;
+      const providers = prepareChildProviders(ctx.modelRegistry, [resolved.model, ...routing.candidates.map((candidate) => candidate.model)]);
 
       const parent = ctx.sessionManager.getSessionId();
       const created = await withTaskCreation(parent, params.name, async () => {
         const runId = `A-${randomUUID().slice(0, 8)}`;
+        const providerSnapshot = await saveChildProviders(runId, providers);
         const childSessionId = randomUUID();
         const parentSessionPath = ctx.sessionManager.getSessionFile();
         const childManager = SessionManager.create(ctx.cwd, undefined, {
@@ -374,6 +377,7 @@ export default function agentDeck(pi: ExtensionAPI) {
           routing,
           inboxPath: inboxPath(),
           env: {
+            ...(providerSnapshot ? { PI_AGENT_DECK_PROVIDERS: providerSnapshot } : {}),
             PI_AGENT_DECK_RUN_ID: runId,
             PI_AGENT_DECK_SIMPLE: "1",
             PI_AGENT_DECK_RUNTIME_ACK_PATH: path.join(directory, "runtime-ack.json"),

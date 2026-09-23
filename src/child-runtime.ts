@@ -6,6 +6,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import type { AgentReport } from "./types.ts";
 import { AGENT_DECK_VERSION, CHILD_RUNTIME_PROTOCOL_VERSION } from "./version.ts";
+import { registerChildProviders } from "./child-providers.ts";
 
 const StringList = Type.Optional(Type.Array(Type.String()));
 const CriterionResults = Type.Optional(Type.Array(Type.Object({
@@ -94,6 +95,7 @@ function normalizeCriterion(value: string): string {
 }
 
 export default function childRuntime(pi: ExtensionAPI) {
+  registerChildProviders(pi);
   const ackPath = process.env.PI_AGENT_DECK_RUNTIME_ACK_PATH;
   const ackToken = process.env.PI_AGENT_DECK_RUNTIME_ACK_TOKEN;
   if (ackPath && ackToken) {

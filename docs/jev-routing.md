@@ -4,7 +4,7 @@
 
 ## 初始组合
 
-这是依据官方能力边界设计的起始策略，不是实测性能结论；这些描述也保存在 src/model-profiles.json，作为发给 Jev 的选项标准。
+这是依据官方能力边界设计的起始策略，不是实测性能结论；这些描述也保存在 src/model-profiles.json，作为发给 Jev 的选项标准。共定义 23 个组合，执行时按同一提供商、账户可用性和 Pi 支持档位筛选。下表原有 Sol 指 GPT-5.6 Sol。
 
 | 组合 | 初始试用范围 |
 |---|---|
@@ -19,8 +19,22 @@
 | Astra / high | 并发、状态变化、多个系统相互作用、重要架构与安全边界 |
 | Astra / xhigh | 证据充分、假设较多、相互制约的高难度问题 |
 | Astra / max | 质量优先的最难任务；常用前需真实评估 |
+| GPT-6 Sol / none（Pi off） | 明确事实的固定格式转换，不需要多步推理 |
+| GPT-6 Sol / low | 短小明确的代码任务、定点调查和小修改 |
+| GPT-6 Sol / medium | 日常实现、测试、排错和常规审查的起始组合 |
+| GPT-6 Sol / high | 范围明确、约束相互关联的复杂模块任务 |
+| GPT-6 Sol / xhigh | 既定设计内的高难度实现、深入排错 |
+| GPT-6 Sol / max | 极难但边界清楚的问题；与 Astra 的实际结果比较 |
+| GPT-6 Luna / none（Pi off） | 重复摘录、格式整理和明确事实分类 |
+| GPT-6 Luna / low | 查找符号、简单修改、窄范围证据提取 |
+| GPT-6 Luna / medium | 清晰需求下的小型实现、可重复调查和配套修改 |
+| GPT-6 Luna / high | 局部多步推理，结果容易检验、架构歧义较少 |
+| GPT-6 Luna / xhigh | 边界清楚的困难小任务，试验增加推理是否有效 |
+| GPT-6 Luna / max | 极少数可严格验收的聚焦任务；不视为 Sol/Astra 的等价替代 |
 
 模型能力和思考强度是两条维度，不能把 Sol high 与 Astra low 当作固定的前后等级。实际可选项还取决于 Pi 模型注册表、当前提供商及用户固定的配置。Astra 不提供 none 档；Pi 的 minimal 可能映射为 low，任务记录显示归一后的档位。
+
+GPT-6 Sol/Luna 的推理工具调用需要 Responses。若 Pi 中配置的是 `openai-completions`，程序仅保留支持工具调用的 `off` 组合；固定为其他档位会提示修正接口或配置。候选表中的更高档位不代表当前账户一定可用，也不代表实际任务收益更高。
 
 ## 运行决策
 
@@ -47,6 +61,7 @@
 - [TypeSafe HTTP API](https://docs.typesafe.ai/api)：typed questions/answers 与 Choice 响应。
 - [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)：模型与支持的思考档位。
 - [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)：模型与支持的思考档位。
+- [GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)：支持 none/low/medium/high/xhigh/max，推理工具调用要求 Responses。
+- [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)：支持 none/low/medium/high/xhigh/max，推理工具调用要求 Responses。
 
-文档核对日期：2026-09-22。
-
+GPT-6 Sol/Luna 文档核对日期：2026-09-23。Astra 与 GPT-5.6 Sol 的初始策略核对日期：2026-09-22。

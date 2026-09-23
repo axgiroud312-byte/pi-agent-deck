@@ -8,8 +8,17 @@ export interface RoutingContext {
   model?: Model<Api>;
   modelRegistry: { find(provider: string, id: string): Model<Api> | undefined; getAvailable(): Model<Api>[] };
 }
+function supportedThinking(model: Model<Api>): ThinkingLevel[] {
+  const supported = getSupportedThinkingLevels(model) as ThinkingLevel[];
+  // GPT-6 Sol/Luna reasoning with tools requires Responses, not Chat Completions.
+  return model.api === "openai-completions" && ["gpt-6-sol", "gpt-6-luna"].includes(model.id)
+    ? supported.filter((level) => level === "off") : supported;
+}
 function effectiveThinking(model: Model<Api>, requested: ThinkingLevel): ThinkingLevel {
+  const supported = supportedThinking(model);
+  if (!supported.length) throw new Error(`模型 ${model.id} 在当前接口没有支持工具调用的思考档位；请配置 Responses 接口。`);
   const clamped = clampThinkingLevel(model, requested) as ThinkingLevel;
+  if (!supported.includes(clamped)) return supported.includes("off") ? "off" : supported[0];
   const mapped = model.thinkingLevelMap?.[clamped];
   if (mapped === "none") return "off";
   return typeof mapped === "string" && ["off", "low", "medium", "high", "xhigh", "max"].includes(mapped) ? mapped as ThinkingLevel : clamped;
@@ -27,11 +36,11 @@ export function prepareRouting(agent: AgentDefinition, task: string, ctx: Routin
   }
   if (!fallbackModel) throw new Error("主会话当前没有可继承的模型。");
   const available = ctx.modelRegistry?.getAvailable?.() ?? [];
-  if (fixedThinking !== undefined && !getSupportedThinkingLevels(fallbackModel).includes(fixedThinking)) {
+  if (fixedThinking !== undefined && !supportedThinking(fallbackModel).includes(fixedThinking)) {
     const compatible = !fixedModel && config.routing.enabled ? available.find((item) => item.provider === fallbackModel!.provider
       && MODEL_PROFILES.some((profile) => profile.modelId === item.id)
-      && getSupportedThinkingLevels(item).includes(fixedThinking)) : undefined;
-    if (!compatible) throw new Error(`模型 ${fallbackModel.id} 不支持固定思考强度 ${fixedThinking}；请调整明确配置。`);
+      && supportedThinking(item).includes(fixedThinking)) : undefined;
+    if (!compatible) throw new Error(`模型 ${fallbackModel.id} 在当前工具接口不支持固定思考强度 ${fixedThinking}；请调整明确配置，GPT-6 Sol/Luna 的推理工具调用需使用 Responses 接口。`);
     fallbackModel = compatible;
   }
   const requestedThinking = fixedThinking ?? inheritedThinking;
@@ -48,11 +57,11 @@ export function prepareRouting(agent: AgentDefinition, task: string, ctx: Routin
   for (const profile of MODEL_PROFILES) {
     const model = available.find((item) => item.provider === fallbackModel!.provider && item.id === profile.modelId);
     if (!model || (fixedModel && `${model.provider}/${model.id}` !== fixedModel)
-      || (fixedThinking !== undefined && (!getSupportedThinkingLevels(model).includes(fixedThinking) || profile.thinking !== effectiveThinking(model, fixedThinking)))
-      || !getSupportedThinkingLevels(model).includes(profile.thinking)) continue;
+      || (fixedThinking !== undefined && (!supportedThinking(model).includes(fixedThinking) || profile.thinking !== effectiveThinking(model, fixedThinking)))
+      || !supportedThinking(model).includes(profile.thinking)) continue;
     plan.candidates.push({ id: profile.id, model: `${model.provider}/${model.id}`, thinking: profile.thinking, criteria: profile.criteria });
   }
-  if (!plan.candidates.length) return immediate("fallback", `当前提供商没有满足固定设置的可用 Astra / Sol 组合，沿用原配置。${adjustment}`);
+  if (!plan.candidates.length) return immediate("fallback", `当前提供商没有满足固定设置的可用 Astra / Sol / Luna 组合，沿用原配置。${adjustment}`);
   if (plan.candidates.length === 1) return { ...plan, immediate: { ...plan.candidates[0], mode: "fixed", profileId: plan.candidates[0].id, reason: "当前固定设置和模型可用性只允许这一个组合。", elapsedMs: 0 } };
   return plan;
 }

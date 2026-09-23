@@ -27,7 +27,7 @@ export async function selectExecution(plan, options = {}) {
   options.signal?.throwIfAborted();
   if (plan.immediate) return { ...plan.immediate };
   const fallback = (reason) => ({ ...plan.fallback, mode: "fallback", reason, elapsedMs: Date.now() - startedAt, routerModel: plan.routerModel });
-  if (!plan.candidates.length) return fallback("当前提供商没有可用的 Astra / Sol 候选，沿用原配置。");
+  if (!plan.candidates.length) return fallback("当前提供商没有可用的 Astra / Sol / Luna 候选，沿用原配置。");
   const apiKey = (options.apiKey ?? process.env.TYPESAFE_API_KEY ?? "").trim();
   if (!apiKey) return fallback("未配置 TYPESAFE_API_KEY，沿用原配置。");
   const timeout = new AbortController();

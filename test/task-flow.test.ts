@@ -86,6 +86,7 @@ test("从 Agent 公共入口到独立 Runner 再到自动消息交付", async (t
     sendMessage: (message: any) => { messages.push(message); entries.push({ type: 'custom_message', ...message }); },
   } as any);
   const ctx: any = { cwd, isProjectTrusted: () => false, model: { provider: "fake", id: "model", reasoning: true }, thinkingLevel: "off", sessionManager: { getSessionId: () => "public-flow", getSessionFile: () => undefined, getBranch: () => entries }, ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, text: string) => text } } };
+  ctx.modelRegistry = { getAvailable: () => [ctx.model], find: (provider: string, id: string) => provider === ctx.model.provider && id === ctx.model.id ? ctx.model : undefined };
   t.after(async () => { handlers.get("session_shutdown")(); await fs.rm(cwd, { recursive: true, force: true }); });
   await handlers.get("session_start")({}, ctx);
   const originalCli = process.argv[1];

@@ -1,9 +1,11 @@
 {
   "version": 1,
-  "note": "Heuristic starting profiles, not benchmark results. Pi off maps to Sol none. Verify quality and latency on local tasks.",
+  "note": "Heuristic starting profiles, not benchmark results. Pi off maps to API none where supported. Filter by authenticated provider, Pi model capabilities and tool transport. Verify quality and latency on local tasks.",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-6-astra",
-    "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+    "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+    "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "https://developers.openai.com/api/docs/models/gpt-6-luna"
   ],
   "profiles": [
     {
@@ -43,6 +45,78 @@
       "criteria": "Exceptional bounded tasks where maximum Sol deliberation is plausibly justified and latency is secondary; require evaluation evidence for frequent use."
     },
     {
+      "id": "sol6_none",
+      "modelId": "gpt-6-sol",
+      "thinking": "off",
+      "criteria": "GPT-6 Sol for deterministic extraction or transformation of supplied facts with virtually no reasoning. Avoid uncertain multi-step work."
+    },
+    {
+      "id": "sol6_low",
+      "modelId": "gpt-6-sol",
+      "thinking": "low",
+      "criteria": "GPT-6 Sol for short, explicit coding tasks with clear constraints: a small change, targeted investigation, or explanation of a known function."
+    },
+    {
+      "id": "sol6_medium",
+      "modelId": "gpt-6-sol",
+      "thinking": "medium",
+      "criteria": "GPT-6 Sol as a starting choice for ordinary implementation, tests, debugging and review needing several coordinated steps within a clear scope."
+    },
+    {
+      "id": "sol6_high",
+      "modelId": "gpt-6-sol",
+      "thinking": "high",
+      "criteria": "GPT-6 Sol for demanding but bounded module debugging, refactoring, or reviews with linked constraints and evidence to reconcile."
+    },
+    {
+      "id": "sol6_xhigh",
+      "modelId": "gpt-6-sol",
+      "thinking": "xhigh",
+      "criteria": "GPT-6 Sol for unusually difficult coding or agentic tasks requiring extended reasoning within an established design; latency is secondary."
+    },
+    {
+      "id": "sol6_max",
+      "modelId": "gpt-6-sol",
+      "thinking": "max",
+      "criteria": "Maximum GPT-6 Sol deliberation for exceptional bounded problems. Compare actual outcomes with Astra; higher effort is not a guaranteed capability upgrade."
+    },
+    {
+      "id": "luna6_none",
+      "modelId": "gpt-6-luna",
+      "thinking": "off",
+      "criteria": "GPT-6 Luna for repetitive extraction, formatting or classification of explicit supplied facts, where a short deterministic result is sufficient."
+    },
+    {
+      "id": "luna6_low",
+      "modelId": "gpt-6-luna",
+      "thinking": "low",
+      "criteria": "GPT-6 Luna for focused, easy-to-check tasks: locate symbols, make a small explicit edit, or extract specific evidence from a narrow source."
+    },
+    {
+      "id": "luna6_medium",
+      "modelId": "gpt-6-luna",
+      "thinking": "medium",
+      "criteria": "GPT-6 Luna for repeatable tasks from a clear brief, small coordinated updates, or bounded investigation with straightforward acceptance checks."
+    },
+    {
+      "id": "luna6_high",
+      "modelId": "gpt-6-luna",
+      "thinking": "high",
+      "criteria": "GPT-6 Luna for focused problems needing extra checking or several local reasoning steps, with little architectural ambiguity and verifiable outcomes."
+    },
+    {
+      "id": "luna6_xhigh",
+      "modelId": "gpt-6-luna",
+      "thinking": "xhigh",
+      "criteria": "GPT-6 Luna trial profile for difficult but narrow, well-constrained problems. Use when extra reasoning on the focused model is worth testing."
+    },
+    {
+      "id": "luna6_max",
+      "modelId": "gpt-6-luna",
+      "thinking": "max",
+      "criteria": "Maximum GPT-6 Luna deliberation for exceptional focused tasks with strong acceptance checks. Do not assume this substitutes for Sol or Astra on broad ambiguous work."
+    },
+    {
       "id": "astra_low",
       "modelId": "gpt-6-astra",
       "thinking": "low",
@@ -74,4 +148,3 @@
     }
   ]
 }
-

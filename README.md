@@ -1,6 +1,6 @@
 # Pi Agent Deck
 
-给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.0**，采用 MIT 许可证。
+给 [Pi Coding Agent](https://pi.dev/) 使用的中文多 Agent 扩展。当前版本 **0.9.1**，采用 MIT 许可证。
 
 一句话派任务，结果自动回来；用任务编号或实例名称继续、停止。模型工具采用 Claude Code 风格的 `Agent`、`SendMessage`、`TaskStop`。
 
@@ -14,7 +14,7 @@
 | 中文任务面板 | 用 `/agents` 查看任务、日志、结果，继续或停止任务 |
 | 保留上下文 | 子任务结束后仍可接着追问，沿用原来的子会话 |
 | 可复用角色 | 内置实现工程师、侦察员、代码审查员；可用一句话创建自己的角色 |
-| 可选 Jev 自动选配 | 在当前可用的 Astra / Sol 组合中选择模型与思考强度 |
+| 可选 Jev 自动选配 | 在当前可用的 GPT-6 Astra、GPT-6 Sol、GPT-6 Luna、GPT-5.6 Sol 组合中选择 |
 | 工作区写入协调 | 只读任务可并行，同一工作区的子 Agent 写任务串行 |
 
 插件不设置全局或每个角色的任务数量上限。实际并行能力取决于模型服务、机器资源以及任务是否要修改同一工作区。
@@ -42,6 +42,10 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 > 找两个 Agent，分别只读调查前端和后端的登录流程，完成后汇总结论。
 
 **Jev 是可选功能。** 没有 TypeSafe 密钥也能派遣子 Agent：自动选配不可用时，插件沿用明确配置或主会话的模型与强度。要启用 Jev，请继续阅读下面的“Jev 负责模型与思考强度”。
+
+子 Agent 可以使用 Pi 内置模型、`models.json` 和扩展通过声明式 `registerProvider` 注册的模型。扩展提供商的数据单独传入子进程，父扩展的工具与钩子不会随之启用。包含自定义流式函数、OAuth 回调、动态模型回调或原生 Provider 的注册暂不支持，会在创建任务前明确报错。
+
+扩展提供商快照保存在个人 Pi 目录的 `agent-deck/providers/`，供独立进程和后续恢复使用。快照可能包含原配置中的密钥和请求头，应与 Pi 的 `auth.json` 一样作为私人文件保管，不能上传或分享；任务请求、状态和日志只保存快照路径。文件以 `0600` 创建（Windows 继承用户目录权限）。修改提供商配置后应新建任务，旧任务继续使用创建时的快照；不再需要恢复旧任务时，可一并删除其提供商快照。
 
 已有本地源码安装时，先用 `pi list` 检查安装来源，并保留一个 Agent Deck 加载入口，避免重复注册工具。使用 GitHub 安装后可执行 `pi update --extensions`，再在 Pi 中 `/reload`。修改角色配置不需要重装插件。
 
@@ -99,14 +103,18 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 3. 执行 `/agent-route-test explore 调查登录偶发失败，找出根因并给出文件证据`。试选期间 Esc 可取消；试选不创建任务，也不自动打开派遣开关。
 4. 派遣开启后正常使用 `Agent`。任务编号先返回，需要 Jev 时后台状态为“选配中”；选择完成后启动子 Agent。面板显示最终模型、强度、选配耗时和回退原因。
 
-默认选择器为 `jev-1.13.0`，15 秒超时。候选只来自当前提供商中 Pi 认为可用的 Astra / Sol，不自动切换账户或提供商。实际服务权限和限流仍可能影响执行。
+默认选择器为 `jev-1.13.0`，15 秒超时。候选只来自当前提供商中 Pi 认为可用的下列四个模型，不自动切换账户或提供商。实际服务权限和限流仍可能影响执行。
 
 | 模型 | Pi 中使用的思考档位 |
 |---|---|
 | GPT-5.6 Sol | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
 | GPT-6 Astra | `low`、`medium`、`high`、`xhigh`、`max` |
+| GPT-6 Sol | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
+| GPT-6 Luna | `off`（对应 OpenAI `none`）、`low`、`medium`、`high`、`xhigh`、`max` |
 
 初始适用范围见 [选配组合与评估说明](docs/jev-routing.md)。这是待实测的路由策略；程序还会按当前 Pi 的能力筛掉不支持的组合。
+
+GPT-6 Sol/Luna 在 Chat Completions 接口下只支持 `none` 档的工具调用，因此该接口只保留 `off` 候选；推理与工具一起使用时应选择 Responses 接口。显式固定了不兼容的档位会在派遣前报错。
 
 - `Agent.model` 优先于角色模型配置。思考强度可在角色中固定；新接口没有 `thinking` 参数。Jev 只选择尚未固定的部分；两项都固定或只剩一个组合时直接执行。
 - 缺少密钥、接口错误、超时、无效选择、无合适候选时沿用明确配置或创建时的主会话配置，并记录原因。固定了模型不支持的强度时，派遣前提示修正。
@@ -115,7 +123,7 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 - 提交给 TypeSafe 的数据为该子任务说明、角色 ID/描述、工具名、写权限和组合标准。不额外读取整个对话、项目文件或角色提示词；任务说明中主动包含的内容仍会随请求提交。
 - 分布、选择器版本、选配时长和接口返回的 token 用量保存在任务记录。置信度不等于任务成功率；没有未经评估的置信度门槛。
 
-接口遵循 [TypeSafe 官方 API](https://docs.typesafe.ai/api) 的 Choice 类型；能力边界依据 [Astra 文档](https://developers.openai.com/api/docs/models/gpt-6-astra)和 [Sol 文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol)。
+接口遵循 [TypeSafe 官方 API](https://docs.typesafe.ai/api) 的 Choice 类型；能力边界依据 [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)、[GPT-6 Sol](https://developers.openai.com/api/docs/models/gpt-6-sol)、[GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)和 [GPT-5.6 Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)文档。
 
 ## 可以运行多少个 Agent
 
@@ -224,6 +232,7 @@ TaskStop({ task_id: string })   // 任务 ID 或实例名称
 - 实例名称为 1–64 位英文字母、数字、短横线或下划线，首位须为字母或数字。不区分大小写；保留 `main`、`team-lead` 和 `A-` 前缀。名称在任务结束和重载后仍绑定原任务，其他主会话可独立复用。
 - 新任务不等待执行结束。回执含真实状态：`selecting`（选配中）、`queued`（排队中）、`async_launched`（已运行），或已经发生的终态。选配中不把备用模型当成最终模型公布。
 - `SendMessage` 对选配、排队或运行中的任务返回 `delivery: "queued"`，消息持久化、按顺序在当前轮结束后处理。已结束或等答复的任务返回 `delivery: "resumed"` 并显示当前真实状态；恢复后仍可能等待工作区。
+- 每条补充消息有持久 ID，并与恢复轮次绑定。队列清理失败不会再次执行已消费的消息；恢复请求已保存而状态未提交时，重启会补齐同一轮。当前会话内的损坏记录仍会阻止不可靠的名称绑定，其他会话的损坏记录不影响新建任务。
 - 消息作为纯文本处理，不展开斜杠命令、文件引用或广播。摘要默认取第一行，最多 200 字符；完整正文不因此截断。
 - 已结束、失败、停止或等待答复的任务可在原 Session 继续；角色、实际模型和思考强度沿用。旧记录未包含实例名称或标题时，仍可用运行编号操作。
 - `TaskStop` 清除排队消息；重复停止已经结束的任务保留原终态。不能确认停止时返回 `stop_unconfirmed`，不会宣称停止成功。
@@ -296,6 +305,6 @@ npm pack --dry-run
 
 测试使用独立临时 Agent 数据目录、模拟模型输出及真实 fixture 子进程；宿主加载测试禁止网络请求。自动化测试不等于真实模型质量或人工终端验收。
 
-源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
+源码职责、修改约定和验收范围见 [开发约定](DEVELOPMENT.md)。版本变化见 [0.9.1 修复说明](docs/0.9.1-release.md)、[0.9.0 发布说明](docs/0.9.0-release.md)和 [0.8.0 发布说明](docs/0.8.0-release.md)。遇到问题可提交 [GitHub Issue](https://github.com/axgiroud312-byte/pi-agent-deck/issues)，附上 Pi/Node.js 版本、复现步骤和去除私人信息后的错误提示。
 
 本项目是社区扩展，与 Pi、Anthropic 或 TypeSafe 官方没有隶属关系；“Claude 风格”指工具命名和部分交互约定，具体支持范围以本文为准。许可证见 [MIT LICENSE](LICENSE)。

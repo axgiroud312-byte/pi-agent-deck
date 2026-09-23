@@ -26,6 +26,7 @@ export interface RunnerRequest {
   routing?: RoutingPlan;
   routingDecision?: RoutingDecision;
   capacityLease?: CapacityLease;
+  followUpBatch?: { id: string; messageIds: string[]; resumed: PersistedRun };
 }
 
 export interface PersistedRun extends RunDetails {
@@ -36,6 +37,7 @@ export interface PersistedRun extends RunDetails {
   stopRequested?: boolean;
   attemptStartedAt?: number;
   capacityLease?: CapacityLease;
+  followUpBatchId?: string;
 }
 
 const TERMINAL = new Set<RunStatus>(["已完成", "失败", "已取消", "已停止", "失联"] as RunStatus[]);
@@ -193,7 +195,8 @@ export async function listRuns(limit = 50, parentSessionId?: string, strict = fa
       try { await fs.promises.access(path.join(index, ".indexed")); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        const all = await listRuns(Number.MAX_SAFE_INTEGER, undefined, strict);
+        // Migration scans foreign parents too. Only this parent's indexed records are strict.
+        const all = await listRuns(Number.MAX_SAFE_INTEGER);
         for (const run of all.filter((run) => run.parentSessionId === parentSessionId)) await registerParent(run);
         await fs.promises.mkdir(index, { recursive: true });
         await fs.promises.writeFile(path.join(index, ".indexed"), "1");
@@ -240,6 +243,7 @@ export async function launchRunner(runId: string): Promise<number> {
 }
 
 async function launchRunnerUnlocked(runId: string): Promise<number> {
+  await recoverPreparedFollowUp(runId);
   const run = await readRun(runId);
   if (!run) throw new Error("找不到任务");
   if (isTerminalStatus(run.status) || run.stopRequested || run.status === "停止中" || run.status === "停止未确认" || run.status === "等待决定") return 0;
@@ -361,6 +365,7 @@ export async function stopRun(runId: string): Promise<PersistedRun> {
 }
 
 async function stopRunUnlocked(runId: string): Promise<PersistedRun> {
+  await recoverPreparedFollowUp(runId);
   const run = await readRun(runId);
   if (!run) throw new Error(`找不到运行：${runId}`);
   await fs.promises.rm(path.join(runDirectory(runId), "follow-up.json"), { force: true });
@@ -428,43 +433,68 @@ export async function continueRun(runId: string, answer: string): Promise<Persis
   return (await sendToRun(runId, answer)).run;
 }
 
-interface QueuedMessage { message: string; summary: string; at: number }
+interface QueuedMessage { id: string; message: string; summary: string; at: number }
 async function pendingMessages(runId: string): Promise<QueuedMessage[]> {
+  const file = path.join(runDirectory(runId), "follow-up.json");
   try {
-    const items: Array<string | QueuedMessage> = JSON.parse(await fs.promises.readFile(path.join(runDirectory(runId), "follow-up.json"), "utf8"));
+    const items: Array<string | QueuedMessage> = JSON.parse(await fs.promises.readFile(file, "utf8"));
     if (!Array.isArray(items)) throw new Error("任务消息队列格式无效。");
-    return items.map((item) => {
-      if (typeof item === "string") return { message: item, summary: messagePreview(item), at: 0 };
+    let migrated = false;
+    const messages = items.map((item) => {
+      if (typeof item === "string") { migrated = true; return { id: randomUUID(), message: item, summary: messagePreview(item), at: 0 }; }
       if (!item || typeof item.message !== "string" || typeof item.summary !== "string") throw new Error("任务消息队列格式无效。");
+      if (typeof item.id !== "string" || !item.id) { migrated = true; return { ...item, id: randomUUID() }; }
       return item;
     });
+    // Legacy entries must acquire durable IDs before an attempt can reference them.
+    if (migrated) await writeJsonAtomic(file, messages);
+    const run = await readRun(runId);
+    const request = JSON.parse(await fs.promises.readFile(path.join(runDirectory(runId), "request.json"), "utf8")) as RunnerRequest;
+    const consumed = new Set(request.followUpBatch?.id === run?.followUpBatchId ? request.followUpBatch?.messageIds : []);
+    return messages.filter((message) => !consumed.has(message.id));
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+}
+
+/** Called under the task control lock. request.json is the durable resume transaction. */
+async function recoverPreparedFollowUp(runId: string): Promise<boolean> {
+  const run = await readRun(runId);
+  if (!run) return false;
+  const request = JSON.parse(await fs.promises.readFile(path.join(runDirectory(runId), "request.json"), "utf8")) as RunnerRequest;
+  const batch = request.followUpBatch;
+  if (!batch) return false;
+  if (run.followUpBatchId === batch.id) return false;
+  if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) throw new Error("上一次执行尚未完全退出，请稍后继续。");
+  await writeJsonAtomic(statusPath(runId), batch.resumed);
+  return true;
 }
 
 export async function sendToRun(runId: string, answer: string, summary = messagePreview(answer)): Promise<{ run: PersistedRun; delivery: "queued" | "resumed" }> {
   if (!answer.trim()) throw new Error("请提供补充要求。");
   return withRunControl(runId, async () => {
+    if (await recoverPreparedFollowUp(runId)) await launchRunnerUnlocked(runId);
     const run = await readRun(runId);
     if (!run) throw new Error("找不到任务");
     const file = path.join(runDirectory(runId), "follow-up.json");
     const pending = await pendingMessages(runId);
+    const messages = [...pending, { id: randomUUID(), message: answer, summary: messagePreview(summary), at: Date.now() }];
     if (run.status === "运行中" || run.status === "排队中" || run.status === "选配中") {
-      await writeJsonAtomic(file, [...pending, { message: answer, summary: messagePreview(summary), at: Date.now() }]);
+      await writeJsonAtomic(file, messages);
       return { run: { ...run, currentAction: "补充要求已排队，当前执行结束后继续" }, delivery: "queued" };
     }
     // A just-finished task may still have older queued messages. Keep their original order.
-    const resumed = await resumeRun(runId, [...pending.map((item) => item.message), answer].join("\n\n"), [...pending.map((item) => item.summary), messagePreview(summary)].join("；"));
-    if (pending.length) await fs.promises.unlink(file);
+    const resumed = await resumeRun(runId, messages);
     return { run: resumed, delivery: "resumed" };
   });
 }
 
-async function resumeRun(runId: string, answer: string, summary = messagePreview(answer)): Promise<PersistedRun> {
+async function resumeRun(runId: string, messages: QueuedMessage[]): Promise<PersistedRun> {
   const directory = runDirectory(runId);
   const run = await readRun(runId);
   if (!run) throw new Error(`找不到运行：${runId}`);
   if (run.status !== "等待决定" && !isTerminalStatus(run.status)) throw new Error(`任务目前不能继续：${run.status}`);
   if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) throw new Error("上一次执行尚未完全退出，请稍后继续。");
+  // Remove any previously consumed entries before replacing their durable receipt.
+  await writeJsonAtomic(path.join(directory, "follow-up.json"), messages);
   await persistCompletion(directory, run);
   await releaseCapacity(run.capacityLease);
   if (run.writerLease) await releaseWriterLease(run.writerLease);
@@ -474,7 +504,7 @@ async function resumeRun(runId: string, answer: string, summary = messagePreview
   request.prompt = [
     "# 主会话的补充要求",
     "",
-    answer,
+    messages.map((message) => message.message).join("\n\n"),
     "",
     "在原会话上下文中处理这次补充要求，遵守原有约束。完成后直接返回结论、证据和未完成事项。",
   ].join("\n");
@@ -495,7 +525,9 @@ async function resumeRun(runId: string, answer: string, summary = messagePreview
     capacityLease: undefined,
     autoDeliver: true,
     attemptStartedAt,
-    status: "运行中",
+    // If the parent exits before launch, the normal queue scheduler can restart this attempt.
+    status: "排队中",
+    followUpBatchId: randomUUID(),
     currentAction: "正在处理主会话补充要求",
     endedAt: undefined,
     exitCode: undefined,
@@ -506,18 +538,17 @@ async function resumeRun(runId: string, answer: string, summary = messagePreview
     reports: [],
     finalText: undefined,
     updatedAt: Date.now(),
-    events: [...run.events, { at: Date.now(), kind: "状态" as const, text: `主会话补充：${messagePreview(summary)}` }].slice(-200),
+    events: [...run.events, { at: Date.now(), kind: "状态" as const, text: `主会话补充：${messagePreview(messages.map((message) => message.summary).join("；"))}` }].slice(-200),
   };
-  try {
-    await fs.promises.rm(runtimeAckPath, { force: true });
-    await fs.promises.rm(path.join(directory, "stop-requested"), { force: true });
-    await writeJsonAtomic(path.join(directory, "request.json"), request);
-    await writeJsonAtomic(statusPath(runId), resumed);
-    await launchRunnerUnlocked(runId);
-    return (await readRun(runId)) ?? resumed;
-  } catch (error) {
-    throw error;
-  }
+  request.followUpBatch = { id: resumed.followUpBatchId!, messageIds: messages.map((message) => message.id), resumed };
+  await fs.promises.rm(runtimeAckPath, { force: true });
+  await fs.promises.rm(path.join(directory, "stop-requested"), { force: true });
+  await writeJsonAtomic(path.join(directory, "request.json"), request);
+  await writeJsonAtomic(statusPath(runId), resumed);
+  await launchRunnerUnlocked(runId);
+  // Queue cleanup is optional: the committed batch prevents replay even if unlink fails.
+  try { await fs.promises.unlink(path.join(directory, "follow-up.json")); } catch { /* durable receipt remains */ }
+  return (await readRun(runId)) ?? resumed;
 }
 
 export async function reconcileRun(runId: string): Promise<PersistedRun | undefined> {
@@ -548,19 +579,18 @@ export async function reconcileRun(runId: string): Promise<PersistedRun | undefi
   return lost;
 }
 
-/** Follow-ups are durable and consumed only after a successful restart. */
+/** Recover a prepared attempt, or consume a new batch exactly once. */
 export async function startFollowUp(runId: string): Promise<boolean> {
   try { await fs.promises.access(path.join(runDirectory(runId), "follow-up.json")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
   return withRunControl(runId, async () => {
+    if (await recoverPreparedFollowUp(runId)) { await launchRunnerUnlocked(runId); return true; }
     const run = await readRun(runId);
     if (!run || (!isTerminalStatus(run.status) && run.status !== "等待决定")) return false;
     if (isProcessAlive(run.runnerPid) || isProcessAlive(run.childPid)) return false;
-    const file = path.join(runDirectory(runId), "follow-up.json");
     const pending = await pendingMessages(runId);
     if (!pending.length) return false;
-    await resumeRun(runId, pending.map((item) => item.message).join("\n\n"), pending.map((item) => item.summary).join("；"));
-    await fs.promises.unlink(file);
+    await resumeRun(runId, pending);
     return true;
   });
 }

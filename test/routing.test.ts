@@ -25,7 +25,7 @@ const fake = (body: any, status = 200) => (async () => Response.json(body, { sta
 test("候选只包含同一提供商的可用模型及官方支持组合，角色不固定模型", () => {
   const p = plan();
   assert.equal(p.candidates.length, 11);
-  assert.deepEqual(new Set(p.candidates.map((item) => item.id)), new Set(MODEL_PROFILES.map((item) => item.id)));
+  assert.deepEqual(new Set(p.candidates.map((item) => item.id)), new Set(MODEL_PROFILES.filter((item) => [sol.id, astra.id].includes(item.modelId)).map((item) => item.id)));
   assert.equal(p.candidates.some((item) => item.id === "astra_none"), false);
   assert.deepEqual(p.fallback, { model: "openai-codex/gpt-5.6-sol", thinking: "high" });
   const other = { ...astra, provider: "openai" };
@@ -34,6 +34,44 @@ test("候选只包含同一提供商的可用模型及官方支持组合，角�
   assert.equal(restricted.candidates.length, 6);
   const legacy = { ...sol, id: "legacy", thinkingLevelMap: {} };
   assert.equal(prepareRouting(role, "调查", context([legacy], legacy), DEFAULT_CONFIG, "max").immediate?.thinking, "high");
+});
+
+test("GPT-6 Sol 和 Luna 的组合可被 Jev 选择，并过滤不可用模型和不支持档位", async () => {
+  const sol6 = { ...sol, id: "gpt-6-sol", api: "openai-codex-responses" };
+  const luna6 = { ...sol, id: "gpt-6-luna", api: "openai-codex-responses" };
+  const models = [sol, astra, sol6, luna6];
+  const p = prepareRouting(role, "实现明确的小功能并检查结果", context(models), DEFAULT_CONFIG, "medium");
+  assert.equal(p.candidates.length, 23);
+  assert.equal(new Set(p.candidates.map((item) => item.id)).size, 23);
+  for (const model of [sol6, luna6]) {
+    assert.deepEqual(p.candidates.filter((item) => item.model.endsWith("/" + model.id)).map((item) => item.thinking), ["off", "low", "medium", "high", "xhigh", "max"]);
+    const fixed = prepareRouting(role, "明确指定新模型", context(models), DEFAULT_CONFIG, "medium", { model: `openai-codex/${model.id}` });
+    assert.ok(fixed.candidates.every((item) => item.model === `openai-codex/${model.id}`));
+    assert.equal(fixed.candidates.length, 6);
+  }
+  for (const id of ["sol6_high", "luna6_low"]) {
+    const decision = await selectExecution(p, { apiKey: "fake", fetch: fake(answer(p, id)) });
+    assert.equal(decision.mode, "jev");
+    assert.equal(decision.model, p.candidates.find((item) => item.id === id)!.model);
+  }
+  const limitedLuna = { ...luna6, thinkingLevelMap: { off: null, minimal: "low", xhigh: null, max: null } };
+  const restricted = prepareRouting(role, "调查", context([sol, { ...sol6, provider: "other-account" }, limitedLuna]), DEFAULT_CONFIG, "medium");
+  assert.ok(!restricted.candidates.some((item) => item.model.endsWith("gpt-6-sol")));
+  assert.deepEqual(restricted.candidates.filter((item) => item.model.endsWith("gpt-6-luna")).map((item) => item.thinking), ["low", "medium", "high"]);
+});
+
+test("GPT-6 Sol/Luna 在 Chat Completions 下只采用支持工具调用的 off 档", () => {
+  for (const id of ["gpt-6-sol", "gpt-6-luna"]) {
+    const model = { ...sol, id, api: "openai-completions" };
+    const ctx = context([model], model);
+    const p = prepareRouting(role, "小任务", ctx, DEFAULT_CONFIG, "high");
+    assert.equal(p.candidates.length, 1);
+    assert.equal(p.immediate!.thinking, "off");
+    assert.equal(p.fallback.thinking, "off");
+    assert.throws(() => prepareRouting({ ...role, model: `${model.provider}/${id}`, thinking: "high" }, "调查", ctx, DEFAULT_CONFIG, "high"), /Responses/);
+    const unsupported = { ...model, thinkingLevelMap: { off: null } };
+    assert.throws(() => prepareRouting(role, "调查", context([unsupported], unsupported), DEFAULT_CONFIG, "high"), /Responses/);
+  }
 });
 
 test("明确模型或强度限制候选；双方固定跳过 Jev；最小强度显示实际映射", async () => {

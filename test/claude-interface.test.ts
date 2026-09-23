@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import http from "node:http";
 import test from "node:test";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, DefaultResourceLoader, SettingsManager, ModelRuntime, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import agentDeck from "../src/index.ts";
 import { DEFAULT_CONFIG, parseDeckConfig, readDeckConfig, writeDeckConfig } from "../src/config.ts";
 import { discoverAgents } from "../src/agents.ts";
@@ -160,6 +163,181 @@ test("持久化记录损坏时不把已绑定名称当作可用，也不创建�
     await assert.rejects(h.call("SendMessage", { to: "durable-name", message: "不应发错对象" }), /无法读取任务记录/);
     assert.equal(created, false);
   } finally { await fs.writeFile(file, original); }
+});
+
+test("其他父会话的损坏记录不阻止新会话创建；当前会话仍严格检查名称", async (t) => {
+  const h = await harness(t);
+  const oldId = receipt(await h.call("Agent", { ...input, name: "old-record" })).agentId;
+  await settled(oldId);
+  const file = path.join(runDirectory(oldId), "status.json");
+  const original = await fs.readFile(file, "utf8");
+  await fs.writeFile(file, "{broken foreign record");
+  try {
+    const otherParent = randomUUID();
+    const other = { ...h.ctx, sessionManager: { ...h.ctx.sessionManager, getSessionId: () => otherParent } };
+    const id = receipt(await h.call("Agent", { ...input, name: "fresh-name" }, other)).agentId;
+    await settled(id);
+    assert.equal((await resolveTaskTarget("fresh-name", otherParent)).runId, id);
+    await assert.rejects(h.call("Agent", { ...input, name: "old-record" }), /无法读取任务记录/);
+  } finally { await fs.writeFile(file, original); }
+});
+
+async function restartFollowUp(id: string, action: "startFollowUp" | "launchRunner" = "startFollowUp"): Promise<boolean> {
+  const source = `import { ${action} } from ${JSON.stringify(new URL("../src/runtime.ts", import.meta.url).href)}; console.log(Boolean(await ${action}(${JSON.stringify(id)})));`;
+  const result = await promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], { cwd: process.cwd(), windowsHide: true });
+  return result.stdout.trim() === "true";
+}
+
+test("队列删除失败后重启不会重放；下一条消息不会带回已执行消息", async (t) => {
+  const h = await harness(t, 500);
+  const id = receipt(await h.call("Agent", input)).agentId;
+  await h.call("SendMessage", { to: id, message: "ONCE_ONLY_MESSAGE" });
+  await settled(id);
+  const queue = path.join(runDirectory(id), "follow-up.json");
+  const unlink = fs.unlink;
+  let failures = 0;
+  const mocked = t.mock.method(fs, "unlink", async (file: any) => {
+    if (String(file) === queue) { failures++; throw Object.assign(new Error("injected queue denial"), { code: "EACCES" }); }
+    return unlink(file);
+  });
+  assert.equal(await startFollowUp(id), true);
+  mocked.mock.restore();
+  await settled(id);
+  assert.equal(failures, 1);
+  await fs.access(queue);
+  assert.equal(await restartFollowUp(id), false);
+  await h.call("SendMessage", { to: id, message: "NEXT_MESSAGE" });
+  const next = await settled(id);
+  assert.ok(next.finalText!.includes("NEXT_MESSAGE"));
+  assert.ok(!next.finalText!.includes("ONCE_ONLY_MESSAGE"));
+  assert.equal(await restartFollowUp(id), false);
+  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 3);
+});
+
+test("恢复事务写入后状态保存中断，重启补齐同一轮且只执行一次", async (t) => {
+  const h = await harness(t);
+  const id = receipt(await h.call("Agent", input)).agentId;
+  await settled(id);
+  const status = path.join(runDirectory(id), "status.json");
+  const rename = fs.rename;
+  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
+    if (String(to) === status) throw Object.assign(new Error("injected status write failure"), { code: "EIO" });
+    return rename(from, to);
+  });
+  await assert.rejects(h.call("SendMessage", { to: id, message: "RECOVER_PREPARED_MESSAGE" }), /injected status/);
+  mocked.mock.restore();
+  assert.equal(await restartFollowUp(id), true);
+  const run = await settled(id);
+  assert.ok(run.finalText!.includes("RECOVER_PREPARED_MESSAGE"));
+  assert.equal(await restartFollowUp(id), false);
+  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 2);
+});
+
+test("停止尚未提交状态的恢复事务，不会在下次启动重新执行", async (t) => {
+  const h = await harness(t);
+  const id = receipt(await h.call("Agent", input)).agentId;
+  await settled(id);
+  const status = path.join(runDirectory(id), "status.json");
+  const rename = fs.rename;
+  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
+    if (String(to) === status) throw Object.assign(new Error("injected status failure"), { code: "EIO" });
+    return rename(from, to);
+  });
+  await assert.rejects(h.call("SendMessage", { to: id, message: "DO_NOT_EXECUTE" }));
+  mocked.mock.restore();
+  assert.equal(receipt(await h.call("TaskStop", { task_id: id })).status, "cancelled");
+  assert.equal(await restartFollowUp(id), false);
+  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 1);
+});
+
+test("恢复状态已提交但尚未启动，重启按队列调度且不重放", async (t) => {
+  const h = await harness(t);
+  const id = receipt(await h.call("Agent", input)).agentId;
+  await settled(id);
+  const request = path.join(runDirectory(id), "request.json");
+  const rename = fs.rename;
+  let writes = 0;
+  const mocked = t.mock.method(fs, "rename", async (from: any, to: any) => {
+    if (String(to) === request && ++writes === 2) throw Object.assign(new Error("injected pre-launch interruption"), { code: "EIO" });
+    return rename(from, to);
+  });
+  await assert.rejects(h.call("SendMessage", { to: id, message: "QUEUED_RESUME_MESSAGE" }), /pre-launch interruption/);
+  mocked.mock.restore();
+  assert.equal((await readRun(id))!.status, "排队中");
+  assert.equal(await restartFollowUp(id, "launchRunner"), true);
+  assert.ok((await settled(id)).finalText!.includes("QUEUED_RESUME_MESSAGE"));
+  assert.equal(await restartFollowUp(id), false);
+  assert.equal((await fs.readFile(path.join(h.cwd, "executions.jsonl"), "utf8")).trim().split("\n").length, 2);
+});
+
+test("声明式扩展模型传入真实 Pi 子进程且隔离父扩展工具和钩子", async (t) => {
+  const h = await harness(t);
+  const received: Array<{ headers: http.IncomingHttpHeaders; body: any }> = [];
+  const server = http.createServer(async (req, res) => {
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    received.push({ headers: req.headers, body: JSON.parse(text) });
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(`data: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", model: "review-model", choices: [{ index: 0, delta: { role: "assistant", content: "LOCAL_PROVIDER_SUCCESS" }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ id: "fixture", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 } })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const port = (server.address() as any).port;
+  const key = "private-fixture-provider-key";
+  const config = { name: "Review provider", baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: key, api: "openai-completions", headers: { "X-Fixture": "private-fixture-header" }, models: [{ id: "review-model", name: "Review model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 512 }] };
+  const extension = path.join(h.cwd, "provider-extension.ts");
+  await fs.writeFile(extension, `export default function(pi) { pi.registerProvider("review-provider", ${JSON.stringify(config)}); pi.on("before_agent_start", () => { throw new Error("Parent hooks must stay isolated"); }); pi.registerTool({ name: "parent_only_tool", label: "Parent only", description: "Forbidden in child", parameters: {type:"object",properties:{}}, execute: async () => ({content:[]}) }); }`);
+  const loader = new DefaultResourceLoader({ cwd: h.cwd, agentDir: getAgentDir(), settingsManager: SettingsManager.inMemory({}), noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true, additionalExtensionPaths: [extension] });
+  await loader.reload();
+  assert.deepEqual(loader.getExtensions().errors, []);
+  const runtime = await ModelRuntime.create({ refreshOnCreate: false });
+  const registry = new ModelRegistry(runtime);
+  for (const item of loader.getExtensions().runtime.pendingProviderRegistrations) registry.registerProvider(item.name, item.config);
+  await registry.refresh({ allowNetwork: false });
+  h.ctx.modelRegistry = registry;
+  h.ctx.model = registry.find("review-provider", "review-model");
+  assert.ok(registry.getAvailable().some((model) => model.id === "review-model"));
+  const installed = path.join(process.env.APPDATA ?? "", "npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+  const localCli = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js");
+  const hosts = [localCli];
+  try { await fs.access(installed); hosts.push(installed); } catch { /* Installed host is optional in CI. */ }
+  for (const cli of hosts) {
+    process.argv[1] = cli;
+    const id = receipt(await h.call("Agent", { ...input, model: "review-provider/review-model" })).agentId;
+    const run = await settled(id);
+    assert.equal(run.status, "已完成", run.stderr);
+    assert.equal(run.finalText, "LOCAL_PROVIDER_SUCCESS");
+    await h.call("SendMessage", { to: id, message: "再检查一次" });
+    assert.equal((await settled(id)).status, "已完成");
+    for (const name of await fs.readdir(runDirectory(id))) {
+      if (!/\.(json|jsonl|log|md)$/.test(name)) continue;
+      const body = await fs.readFile(path.join(runDirectory(id), name), "utf8");
+      assert.ok(!body.includes(key), `credential leaked into ${name}`);
+      assert.ok(!body.includes("private-fixture-header"), `header leaked into ${name}`);
+    }
+  }
+  assert.equal(received.length, hosts.length * 2);
+  for (const request of received) {
+    assert.equal(request.headers.authorization, `Bearer ${key}`);
+    assert.equal(request.headers["x-fixture"], "private-fixture-header");
+    assert.equal(request.body.model, "review-model");
+    const tools = request.body.tools.map((tool: any) => tool.function.name);
+    assert.ok(tools.includes("read")); assert.ok(tools.includes("agent_question"));
+    for (const name of ["Agent", "SendMessage", "TaskStop", "parent_only_tool", "edit", "write", "bash"]) assert.ok(!tools.includes(name));
+  }
+});
+
+test("函数型或原生扩展提供商在创建 Session 和任务前明确拒绝", async (t) => {
+  const h = await harness(t);
+  let sessions = 0;
+  h.ctx.sessionManager.getSessionFile = () => { sessions++; };
+  h.ctx.modelRegistry.getRegisteredProviderConfig = () => ({ streamSimple() {} });
+  await assert.rejects(h.call("Agent", input), /自定义函数或原生 Provider/);
+  h.ctx.modelRegistry.getRegisteredProviderConfig = () => undefined;
+  h.ctx.modelRegistry.getRegisteredNativeProvider = () => ({ id: "fixture" });
+  await assert.rejects(h.call("Agent", input), /尚未创建任务/);
+  assert.equal(sessions, 0);
+  assert.equal((await listRuns(Number.MAX_SAFE_INTEGER, h.parent)).length, 0);
 });
 
 test("运行中两条消息按顺序持久化，摘要不截断正文；只在当前轮结束后恢复", async (t) => {
