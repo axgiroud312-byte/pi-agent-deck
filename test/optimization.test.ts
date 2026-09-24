@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -166,7 +167,7 @@ test("续接任务时结果和通知都以当前 turn 为准", async (t) => {
     return run?.status === "已完成" && run.finalText === "FIRST_RESULT" ? run : undefined;
   }, "第一轮结果");
   const firstTurn = first.turnId;
-  await sendToRun(f.id, "继续第二轮");
+  await resumeFixtureRun(f.id, "继续第二轮");
   const during = await readRun(f.id);
   assert.notEqual(during?.turnId, firstTurn);
   assert.equal(during?.finalText, undefined);
@@ -175,10 +176,10 @@ test("续接任务时结果和通知都以当前 turn 为准", async (t) => {
     return run?.status === "已完成" && run.turnId !== firstTurn ? run : undefined;
   }, "第二轮结果");
   assert.equal(second.finalText, "SECOND_RESULT");
-  assert.ok(h.messages.some((message) => message.details?.turnId === second.turnId && /SECOND_RESULT/.test(message.content)));
+  await until(async () => h.messages.some((message) => message.details?.turnId === second.turnId && /SECOND_RESULT/.test(message.content)), "第二轮通知入队");
 });
 
-test("实际面板组件能显示结果、切换页面和继续，窄终端不越界", async (t) => {
+test("实际面板只读展示结果和切换页面，旧续接按键无效，窄终端不越界", async (t) => {
   const f = await fixture(t, { completed: true, final: "panel result" });
   const h = host(f.id);
   let action: any;
@@ -192,7 +193,7 @@ test("实际面板组件能显示结果、切换页面和继续，窄终端不�
         for (const width of [1, 10, 40, 80]) assert.ok(component.render(width).every((line: string) => visibleWidth(line) <= width));
       }
       component.handleInput("c");
-      assert.deepEqual(action, { action: "继续", runId: f.id });
+      assert.equal(action, undefined);
     } finally { component.dispose(); }
     return { action: "关闭" };
   };

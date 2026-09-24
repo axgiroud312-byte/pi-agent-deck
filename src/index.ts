@@ -15,6 +15,7 @@ import { discoverAgentCandidates, discoverAgents, validateAgentDefinition } from
 import { buildChildSystemPrompt } from "./instruction.ts";
 import {
   sendToRun,
+  resumeRun,
   reconcileRun,
   subscribeRunEvents,
   shutdownRuns,
@@ -156,12 +157,9 @@ export default function agentDeck(pi: ExtensionAPI) {
           void refreshFleet(activeContext).catch((error) => activeContext?.ui.setStatus("agent-deck-error", String(error)));
         });
       }
-      if (kind === "question" || kind === "result") {
+      if (kind === "result") {
         const message = resultMessage(run, run.parentSessionId);
         if (message) pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
-      } else if (kind === "progress") {
-        const report = run.reports.at(-1);
-        if (report) pi.sendMessage({ customType: "agent-task-progress", content: `${run.runId} · ${report.title}\n${report.summary}`, display: true, details: { taskId: run.runId, turnId: run.turnId } }, { triggerTurn: false });
       }
     });
     await reconcileRuns(ctx.sessionManager.getSessionId());
@@ -185,7 +183,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   pi.on("before_agent_start", async (_event, ctx) => ({
     message: {
       customType: "agent-roles", display: false,
-      content: [agentAuthoringContext(), deckEnabled ? `角色实际能力（subagent_type；不继承主 Agent 的其他扩展）：\n${roleCapabilityCatalog(discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }))}\n本会话槽位 ${activeRunCount(ctx.sessionManager.getSessionId())}/8。Agent 新建；SendMessage 联系原任务；TaskStop 中断执行。` : "派遣已关闭，仍可停止任务、创建和编辑角色；开启派遣使用 /agent-deck 开启。"].join("\n"),
+      content: [agentAuthoringContext(), deckEnabled ? `角色实际能力（subagent_type；不继承主 Agent 的其他扩展）：\n${roleCapabilityCatalog(discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }))}\n本会话槽位 ${activeRunCount(ctx.sessionManager.getSessionId())}/8。Agent 新建；Agent.resume 明确续接；SendMessage 只补充；TaskStop 中断。` : "派遣已关闭，仍可停止任务、创建和编辑角色；开启派遣使用 /agent-deck 开启。"].join("\n"),
     },
   }));
 
@@ -209,40 +207,42 @@ export default function agentDeck(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "SendMessage", label: "联系 Agent", description: "向任务 ID 或实例名称发消息。delivery 默认 TriggerTurn，空闲时在原会话继续；QueueOnly 仅发信息，不启动空闲任务。运行中均在 Pi 消息边界补充。回答问题仅用 reply_to，不与 delivery 同传；普通消息不能解除等待。沿用原模型与思考强度。",
+    name: "SendMessage", label: "联系 Agent", description: "向任务 ID 或实例名称补充信息。运行中在 Pi 工具边界接收；已结束时仅暂存，不启动任务。开始下一次执行请明确调用 Agent({resume, prompt})。",
     parameters: SendMessageParameters,
     async execute(_id, raw, _signal, _update, ctx) {
       if (!deckEnabled) throw new Error("Agent 已关闭，请在 /agent-deck 开启后重试。");
       const params = parseMessageInput(raw);
       const run = await resolveTaskTarget(params.to, ctx.sessionManager.getSessionId());
       await reconcileRun(run.runId);
-      const sent = await sendToRun(run.runId, params.message, params.summary, params.replyTo, params.delivery);
-      const message = params.replyTo ? "已提交指定问题的答复。" : sent.delivery === "deferred" ? "信息已暂存于主 Pi 进程，未启动子 Agent；下次 TriggerTurn 时一起送入。" : sent.delivery === "queued" ? (sent.run.pendingQuestion ? "补充已排队，任务仍等待指定问题的答复。" : "消息已接收或排队，不表示模型已经读到；若恰逢执行结束，QueueOnly 信息留待下次继续。") : `已在原子会话继续；当前状态：${sent.run.status}。`;
-      return taskToolResult(sent.run, `${message}${sent.delivery === "deferred" ? "" : " 执行结果会自动返回。"} 摘要：${params.summary}`, sent.delivery, true);
+      const sent = await sendToRun(run.runId, params.message, params.summary);
+      return taskToolResult(sent.run, (sent.delivery === "deferred" ? "信息已暂存于当前主 Pi 进程，任务未启动；继续请调用 Agent({resume, prompt})。退出或重载不会重放暂存消息。" : "补充已接收或排队，将在 Pi 消息边界送入；这不表示模型已经读到。") + ` 摘要：${params.summary}`, sent.delivery, true);
     },
   });
 
   pi.registerTool({
     name: "Agent",
     label: "派遣子 Agent",
-    description: "创建独立后台 Agent 任务，返回实例 agentId，结果自动送回当前会话。general-purpose 负责实现，Explore 负责只读调查。继续已有任务请用 SendMessage。",
-    promptSnippet: "创建后台任务并自动接收结果；SendMessage 继续，TaskStop 停止",
+    description: "创建独立子任务并返回 agentId；明确传 resume 可复用已结束任务的 Pi 子会话。general-purpose 实现，Explore 只读调查，reviewer 审查。结果自动返回，进程自动释放，由主 Agent 验收。",
+    promptSnippet: "派发明确任务；Agent.resume 续接，SendMessage 只补充，TaskStop 停止",
     promptGuidelines: [
-      "独立任务可并行派遣；不要重复执行已经交给子 Agent 的工作。",
-      "你决定任务数量、角色、分工、依赖和验收。每个主会话最多 8 个活跃子任务（包含选配、等待答复和释放过程）；满额明确报错，不自动排队。",
-      "派发前核对角色实际工具能力，测试任务需要命令能力。划清文件和接口范围；有先后依赖或共享接口的任务顺序执行，独立任务才并行。所有任务共享工作目录。",
-      "默认省略 model，由 Jev 为新子任务选配模型和思考强度；仅在用户明确指定模型时传入覆盖值。Agent 不接受 thinking 参数。SendMessage 沿用符合当前策略的原配置。",
-      "审查任务使用 reviewer 或 reportProfile: 审查 的自定义角色，只能用 GPT-5.6 Sol / xhigh 或 max。非审查角色禁止 GPT-5.6 Sol；GPT-6 Sol/Luna 最低 high。Jev、显式配置和关闭选配均遵守该策略。",
-      "description 是简短标题；prompt 是完整任务；subagent_type 是角色；name 是可选实例名称。同一主会话内名称唯一，任务结束后仍保留绑定。",
-      "完成和提问会自动返回，不要轮询或使用 sleep 等待；有独立工作就继续，否则告知用户正在等待。",
-      "返回结果不等于验收通过：进程自动释放，你按证据独立验收。SendMessage 默认 TriggerTurn，在原会话继续；只传信息且不启动空闲任务时用 delivery: QueueOnly。to 用 agentId 或实例 name，不用角色名。",
-      "回答子 Agent 问题使用通知中的 reply_to，不能同时传 delivery；普通消息不解除等待。能根据已有授权回答时直接回复，只把真正缺少的用户决定交给用户。",
+      "你负责理解需求、澄清影响任务方向的关键歧义、分工、依赖和验收。常规可逆选择自主处理，只有必要的用户决定才询问用户。",
+      "简单工作直接完成；有明确分工价值时委派。每项任务的 prompt 写清目标、范围、预期交付和验收方法，任务数量按实际需要决定。",
+      "派发前核对角色的实际工具能力；只读角色不能运行测试。独立工作可并行，有依赖或共享接口的工作顺序执行；避免重复子 Agent 的工作。所有子任务共享工作目录。",
+      "最多 8 个活跃子任务，满额报错、不自动排队。Jev 只选择模型和思考强度，默认省略 model；用户明确指定时覆盖。审查只用 5.6 Sol 且最低 xhigh；6 Sol/Luna 最低 high；Astra 禁用。",
+      "新目标新建任务。同一任务的返工或补查明确 Agent({resume: agentId, prompt})，沿用原角色、模型和会话；运行中补充用 SendMessage。任务 ID 或实例 name 用于寻址，角色名不是任务 ID。",
+      "子 Agent 自主执行并返回结果；阻塞原因由你处理，必要时由你向用户澄清。完成通知自动送回，等待期间可做其他独立工作。",
+      "执行结束后进程自动释放。子 Agent 的完成和检查报告不是验收结论；你核对实际证据、必要的检查及整体兼容性，再向用户汇报。",
     ],
     parameters: AgentParameters,
 
     async execute(_toolCallId, raw, signal, onUpdate, ctx) {
       if (!deckEnabled) throw new Error("Agent 已关闭，请在 /agent-deck 开启后重试。");
       const params = parseAgentInput(raw);
+      if (params.resume !== undefined) {
+        const original = await resolveTaskTarget(params.resume, ctx.sessionManager.getSessionId());
+        const resumed = await resumeRun(original.runId, params.prompt, params.description);
+        return taskToolResult(resumed, "已明确续接原任务和 Pi 子会话；本轮结果会自动返回。", "resumed", true);
+      }
       const agents = discoverAgents(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
       const agent = resolveAgentRole(params.subagent_type, agents);
       const request: DelegationRequest = {
@@ -277,6 +277,9 @@ export default function agentDeck(pi: ExtensionAPI) {
           childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`);
           const childSessionPath = childManager.getSessionFile();
           if (!childSessionPath) throw new Error("无法创建持久化子 Session");
+          // Pi defers the first disk write until an assistant message. Materialize
+          // its native header before another process opens this new session.
+          await fs.promises.writeFile(childSessionPath, [childManager.getHeader(), ...childManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "wx" });
           const instruction = request.objective;
           const details: RunDetails = {
             autoDeliver: true,
@@ -360,7 +363,7 @@ export default function agentDeck(pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       return new Text([
-        theme.fg("toolTitle", theme.bold(`↗ 派遣 Agent：${args.name ?? args.subagent_type ?? "general-purpose"}`)),
+        theme.fg("toolTitle", theme.bold(`↗ 派遣 Agent：${args.resume ?? args.name ?? args.subagent_type ?? "general-purpose"}`)),
         theme.fg("muted", `  ${shortTask(args.description ?? "等待任务", 100)}`),
       ].join("\n"), 0, 0);
     },
@@ -399,19 +402,7 @@ export default function agentDeck(pi: ExtensionAPI) {
       ctx.ui.notify(`${run.agentName}：${stopped.status}`, stopped.status === "停止未确认" ? "warning" : "info");
       return;
     }
-    if (action.action === "继续" || action.action === "仅发信息" || action.action === "回答问题") {
-      if (!readDeckConfig().enabled) return void ctx.ui.notify("多 Agent 已关闭，请先 /agent-deck 开启。", "warning");
-      const question = action.action === "回答问题" ? run.pendingQuestion : undefined;
-      if (action.action === "回答问题" && question?.id !== action.questionId) return void ctx.ui.notify("该问题已经回答或失效，请刷新任务面板。", "warning");
-      const answer = await ctx.ui.editor(
-        question ? `回答 ${run.agentName}：${question.question}` : `${action.action === "仅发信息" ? "仅发信息（空闲时不启动）" : "继续工作 / 运行中补充"}：${run.agentName}`,
-        "",
-      );
-      if (!answer?.trim()) return;
-      const sent = await sendToRun(run.runId, answer, undefined, question?.id, question ? undefined : action.action === "仅发信息" ? "QueueOnly" : "TriggerTurn");
-      ctx.ui.notify(question ? "已提交指定问题的答复。" : sent.delivery === "deferred" ? "信息已暂存，未启动子 Agent。" : sent.delivery === "queued" ? `${runRoleLabel(run)}：消息已排队${sent.run.pendingQuestion ? "，仍等待问题答复" : "，将在 Pi 消息边界接收"}。` : `${runRoleLabel(run)}：已在原会话继续，${sent.run.status}。`, "info");
-      return;
-    }
+
   };
 
   const openAgentPanel = async (ctx: any): Promise<void> => {
@@ -423,7 +414,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   };
 
   pi.registerCommand("agent-panel", {
-    description: "打开可交互 Agent 控制台",
+    description: "打开只读 Agent 进度与子会话查看页",
     handler: async (_args, ctx) => openAgentPanel(ctx),
   });
 
@@ -437,20 +428,8 @@ export default function agentDeck(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agent-continue", {
-    description: "向原子 Session 补充或继续任务：/agent-continue A-xxxxxxxx [消息]；答复问题请用面板 A",
-    handler: async (args, ctx) => {
-      if (!readDeckConfig().enabled) return void ctx.ui.notify("多 Agent 已关闭，请先 /agent-deck 开启。", "warning");
-      const [runId, ...answerParts] = args.trim().split(/\s+/);
-      if (!runId) return void ctx.ui.notify("请提供运行编号，例如 /agent-continue A-12345678 保持兼容", "warning");
-      const run = await readRun(runId);
-      if (!run) return void ctx.ui.notify(`找不到运行：${runId}`, "error");
-      if (run.parentSessionId !== ctx.sessionManager.getSessionId()) return void ctx.ui.notify("只能操作当前会话的任务。", "warning");
-      let answer = answerParts.join(" ").trim();
-      if (!answer) answer = (await ctx.ui.editor(`补充 ${run.agentName}`, ""))?.trim() ?? "";
-      if (!answer) return;
-      const sent = await sendToRun(runId, answer);
-      ctx.ui.notify(sent.delivery === "queued" ? `${runRoleLabel(run)}：消息已排队${sent.run.pendingQuestion ? "，仍等待指定问题的答复" : "，将在工具边界接收"}。` : `${runRoleLabel(run)}：已在原会话继续，${sent.run.status}。`, "info");
-    },
+    description: "旧续接入口已移除；请在主会话要求主 Agent 明确 resume 原任务。",
+    handler: async (_args, ctx) => { ctx.ui.notify("请在主会话说明继续哪个任务及本次要求，由主 Agent 调用 Agent({resume, prompt})。此命令未启动任务。", "info"); },
   });
 
   pi.registerCommand("agent-deck", {
@@ -515,7 +494,7 @@ export default function agentDeck(pi: ExtensionAPI) {
         `Agent Deck ${AGENT_DECK_VERSION} · 主 Pi 管理 RPC 子会话`,
         `Pi 宿主：${process.execPath} · ${process.version} · 模式：${ctx.mode}`,
         `项目：${ctx.cwd} · 信任：${ctx.isProjectTrusted() ? "已信任" : "未信任（项目 Agent 已忽略）"}`,
-        `当前会话任务：${runs.length} · 待答问题：${runs.filter((run) => run.pendingQuestion).length}`,
+        `当前会话任务：${runs.length} · 需求澄清与验收由主 Agent 负责`,
         `槽位 ${activeRunCount(ctx.sessionManager.getSessionId())}/8 · 数量由主 Agent 决定 · Jev 只选模型/思考：${readDeckConfig().routing.enabled ? "开启" : "关闭"}`,
         "结果、失败、中断与进程资源分开记录；返回结果后自动释放进程，主 Agent 独立验收。",
         "关闭或重载主 Pi 会结束它管理的子进程；会话记录保留，之后可手动继续。",
@@ -525,7 +504,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agents", {
-    description: "查看当前会话任务、结果，继续或停止 Agent",
+    description: "查看任务进度、真实子会话和结果",
     handler: async (_args, ctx) => openAgentPanel(ctx),
   });
 

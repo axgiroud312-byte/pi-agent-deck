@@ -6,7 +6,6 @@ export type AgentSource = "内置" | "用户" | "项目";
 export type ReportProfile = "通用" | "侦察" | "执行" | "审查";
 export type RunStatus = "选配中" | "排队中" | "等待批准" | "运行中" | "等待决定" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
 export type ReportType = "进度" | "发现" | "问题" | "警告" | "最终";
-export type MessageDelivery = "QueueOnly" | "TriggerTurn";
 export type ResourceState = "starting" | "running" | "releasing" | "released";
 
 /** Read-only shape for historical records; no new writer leases are created. */
@@ -106,6 +105,16 @@ export interface RunEvent {
   text: string;
 }
 
+/** Child attestation; the parent independently accepts the task. */
+export interface TaskResult {
+  outcome: "完成" | "部分完成" | "阻塞";
+  summary: string;
+  completed: string[];
+  evidence: string[];
+  checks: { name: string; status: "通过" | "失败" | "未运行" | "不适用"; evidence: string }[];
+  remaining: string[];
+}
+
 export interface RunDetails {
   /** Stable task identity is runId. This identifies only the current execution. */
   turnId?: string;
@@ -147,6 +156,11 @@ export interface RunDetails {
   reports: AgentReport[];
   events: RunEvent[];
   finalText?: string;
+  result?: TaskResult;
+  failureReason?: string;
+  persistenceError?: string;
+  /** Observed tool completions are evidence of actions, not task acceptance. */
+  toolEvidence?: string[];
   stderr?: string;
   exitCode?: number;
   usage: Usage;

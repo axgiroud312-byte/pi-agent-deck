@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import * as runtime from "../src/runtime.ts";
+import { taskOutput, resultMessage } from "../src/delivery.ts";
+import { showAgentPanel } from "../src/ui.ts";
+import { conversationBlocks } from "../src/conversation.ts";
 import { activeRunCount } from "../src/run-capacity.ts";
 import { discoverAgents } from "../src/agents.ts";
 import { roleCapabilities } from "../src/capabilities.ts";
@@ -36,7 +39,7 @@ async function lines(file: string): Promise<any[]> {
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
-async function createRun(t: any, prompt: string, tools = ["agent_question"]) {
+async function createRun(t: any, prompt: string, tools = ["agent_report"]) {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-real-rpc-"));
   const runId = `rpc-integration-${randomUUID()}`;
   const parentSessionId = randomUUID();
@@ -45,6 +48,7 @@ async function createRun(t: any, prompt: string, tools = ["agent_question"]) {
   childManager.appendSessionInfo(`real RPC fixture ${runId}`);
   const childSessionPath = childManager.getSessionFile();
   assert.ok(childSessionPath);
+  await fs.writeFile(childSessionPath, [childManager.getHeader(), ...childManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
   const log = path.join(cwd, "provider.jsonl");
   const turnId = randomUUID();
   const startedAt = Date.now();
@@ -52,7 +56,7 @@ async function createRun(t: any, prompt: string, tools = ["agent_question"]) {
     version: 1, autoDeliver: true, runId, turnId,
     agentId: "scout", agentName: "local RPC fixture", agentSource: "内置",
     objective: prompt, instruction: prompt, acceptanceCriteria: [],
-    status: "运行中", model: "deck-local-fixture/scripted", thinking: "off", tools: ["agent_question"],
+    status: "运行中", model: "deck-local-fixture/scripted", thinking: "off", tools: ["agent_report"],
     writePermission: false, parentSessionId, childSessionId, childSessionPath, cwd, startedAt,
     reports: [], events: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -81,73 +85,56 @@ async function createRun(t: any, prompt: string, tools = ["agent_question"]) {
   return { runId, parentSessionId, childSessionId, childSessionPath, cwd, log };
 }
 
-test("真实 Pi RPC：运行中 steer、原生提问等待、指定答复及原会话续跑", async (t) => {
-  const fixture = await createRun(t, "DECK_QUESTION_CASE");
-  const subscribe = (runtime as any).subscribeRunEvents;
-  assert.equal(typeof subscribe, "function");
-  const observed: any[] = [];
-  const unsubscribe = subscribe((event: any) => observed.push(event));
-  t.after(() => unsubscribe?.());
-
+test("真实 Pi RPC：补充、结构结果、释放、空闲不启动及明确原会话 resume", async (t) => {
+  const fixture = await createRun(t, "DECK_TOOL_CASE", ["deck_pause", "agent_report"]);
   await runtime.launchRunner(fixture.runId);
-  await until(async () => (await runtime.readRun(fixture.runId))?.childPid || undefined, "真实 Pi 子进程启动");
-  await until(async () => (await lines(fixture.log)).some((entry) => entry.type === "provider_call") ? true : undefined, "首个本地模型调用");
-  const liveSteer = await runtime.sendToRun(fixture.runId, "DECK_EARLY_STEER");
-  assert.equal(liveSteer.delivery, "queued");
-
-  const waiting = await until(async () => {
-    const run = await runtime.readRun(fixture.runId);
-    return run?.status === "等待决定" && run.pendingQuestion?.id ? run : undefined;
-  }, "原生 extension_ui_request");
-  assert.ok(waiting.pendingQuestion?.id);
-  assert.ok(alive(waiting.childPid), "原生 UI 等待时子进程应保持存活");
-  assert.ok(observed.some((event) => event.kind === "question" && event.run?.pendingQuestion?.id === waiting.pendingQuestion?.id));
-  const questionId = waiting.pendingQuestion.id;
-
-  assert.equal((await runtime.sendToRun(fixture.runId, "DECK_ORDINARY_STEER")).delivery, "queued");
-  await runtime.sendToRun(fixture.runId, "DECK_QUEUED_INFO", undefined, undefined, "QueueOnly");
-  assert.equal(activeRunCount(fixture.parentSessionId), 1);
-  await new Promise((resolve) => setTimeout(resolve, 250));
-  const stillWaiting = (await runtime.readRun(fixture.runId))!;
-  assert.equal(stillWaiting.status, "等待决定");
-  assert.equal(stillWaiting.pendingQuestion?.id, questionId);
-  assert.equal((await lines(fixture.log)).filter((item) => item.type === "provider_call").length, 1);
-
-  await runtime.sendToRun(fixture.runId, "同意", undefined, questionId);
-  const answered = await until(async () => {
-    const run = await runtime.readRun(fixture.runId);
-    return run?.status === "已完成" && run.resourceState === "released" ? run : undefined;
-  }, "问题答复后完成");
-  assert.match(answered.finalText ?? "", /DECK_ANSWER_DONE 同意/);
-  assert.ok((await lines(fixture.log)).some((entry) => entry.type === "provider_call" && String(entry.transcript).includes("DECK_EARLY_STEER")));
-  assert.equal(answered.childSessionId, fixture.childSessionId);
-  assert.equal(answered.childSessionPath, fixture.childSessionPath);
-  const firstTurn = answered.turnId;
-  assert.equal(alive(waiting.childPid), false, "原问题结束后子进程自动退出");
+  const live = await until(async () => (await lines(fixture.log)).some((item) => item.type === "long_tool_start") ? runtime.readRun(fixture.runId) : undefined, "工具开始");
+  await assert.rejects(runtime.resumeRun(fixture.runId, "不得并行恢复"), /运行/);
+  await runtime.sendToRun(fixture.runId, "DECK_EARLY_STEER");
+  const result = await until(async () => { const r = await runtime.readRun(fixture.runId); return r?.resourceState === "released" ? r : undefined; }, "返回结果并释放");
+  assert.equal(result.status, "已完成");
+  assert.equal(result.result?.outcome, "完成");
+  assert.equal(alive(live.childPid), false);
   assert.equal(activeRunCount(fixture.parentSessionId), 0);
-  await assert.rejects(runtime.sendToRun(fixture.runId, "重复回答", undefined, questionId), /失效/);
-  const callsBefore = (await lines(fixture.log)).length;
-  const deferred = await runtime.sendToRun(fixture.runId, "DECK_IDLE_INFORMATION", undefined, undefined, "QueueOnly");
+  const calls = (await lines(fixture.log)).filter((item) => item.type === "provider_call");
+  assert.equal(calls.length, 2, "最终报告结束执行，无额外总结模型调用");
+  assert.match(calls[1].transcript, /DECK_EARLY_STEER/);
+  const sessionBefore = await fs.readFile(fixture.childSessionPath, "utf8");
+  const view = conversationBlocks(result, true).map((block) => block.text).join("\n");
+  assert.match(view, /DECK_TOOL_CASE/); assert.match(view, /工具调用：deck_pause/); assert.match(view, /tool completed/);
+  const actions: unknown[] = [];
+  await showAgentPanel({ mode: "tui", sessionManager: { getSessionId: () => fixture.parentSessionId }, ui: { custom: async (factory: any) => {
+    const theme = { fg: (_: string, value: string) => value, bg: (_: string, value: string) => value, bold: (value: string) => value };
+    const component = factory({ terminal: { rows: 48 }, requestRender() {} }, theme, undefined, (action: unknown) => actions.push(action));
+    try {
+      const list = component.render(120).join("\n");
+      assert.match(list, /进程已释放/);
+      component.handleInput("\r"); component.handleInput("\u001b[H");
+      const screen = component.render(120).join("\n");
+      assert.match(screen, /子会话 · 只读/); assert.match(screen, /DECK_TOOL_CASE/);
+      for (const key of ["c", "m", "a"]) component.handleInput(key);
+      assert.deepEqual(actions, []);
+      if (process.env.PI_AGENT_DECK_EVIDENCE_DIR) {
+        await fs.mkdir(process.env.PI_AGENT_DECK_EVIDENCE_DIR, { recursive: true });
+        await fs.writeFile(path.join(process.env.PI_AGENT_DECK_EVIDENCE_DIR, "tui-session.txt"), "真实 Pi RPC 本地模型会话，经实际 TUI 组件渲染\n\n" + list + "\n\n" + screen);
+      }
+    } finally { component.dispose(); }
+    return { action: "关闭" };
+  } } } as any);
+  assert.equal(await fs.readFile(fixture.childSessionPath, "utf8"), sessionBefore, "查看不写入会话");
+  const deferred = await runtime.sendToRun(fixture.runId, "DECK_IDLE_INFORMATION");
   assert.equal(deferred.delivery, "deferred");
-  assert.equal(deferred.run.turnId, firstTurn);
   assert.equal(deferred.run.resourceState, "released");
-  assert.equal(deferred.run.queuedMessageCount, 1);
   assert.equal(activeRunCount(fixture.parentSessionId), 0);
-  assert.equal((await lines(fixture.log)).length, callsBefore);
-
-  await runtime.sendToRun(fixture.runId, "DECK_CONTINUE_CASE");
-  const continued = await until(async () => {
-    const run = await runtime.readRun(fixture.runId);
-    return run?.status === "已完成" && run.resourceState === "released" && run.turnId !== firstTurn ? run : undefined;
-  }, "原会话续跑");
-  assert.match(continued.finalText ?? "", /DECK_CONTINUE_DONE/);
-  assert.equal(continued.childSessionId, fixture.childSessionId);
-  assert.equal(continued.childSessionPath, fixture.childSessionPath);
-  const lastCall = (await lines(fixture.log)).filter((entry) => entry.type === "provider_call").at(-1);
-  assert.match(lastCall.transcript, /DECK_IDLE_INFORMATION/);
-  assert.match(lastCall.transcript, /DECK_QUESTION_CASE/, "重新启动的子进程保留前次上下文");
-  assert.match(lastCall.transcript, /DECK_QUEUED_INFO/);
-  assert.equal(continued.queuedMessageCount, 0);
+  assert.equal((await lines(fixture.log)).filter((item) => item.type === "provider_call").length, 2);
+  await runtime.resumeRun(fixture.runId, "DECK_CONTINUE_CASE", "补充验证");
+  const resumed = await until(async () => { const r = await runtime.readRun(fixture.runId); return r?.resourceState === "released" && r.turnId !== result.turnId ? r : undefined; }, "resume 完成");
+  assert.equal(resumed.childSessionId, fixture.childSessionId);
+  assert.equal(resumed.childSessionPath, fixture.childSessionPath);
+  assert.equal(resumed.description, "补充验证");
+  const last = (await lines(fixture.log)).filter((item) => item.type === "provider_call").at(-1);
+  assert.match(last.transcript, /DECK_TOOL_CASE/); assert.match(last.transcript, /DECK_IDLE_INFORMATION/);
+  assert.equal(resumed.queuedMessageCount, 0);
 });
 
 test("真实 Pi RPC：停止会中断本地模型并清空待发送消息", async (t) => {
@@ -167,11 +154,11 @@ test("真实 Pi RPC：停止会中断本地模型并清空待发送消息", asyn
 });
 
 test("真实 Pi RPC：长工具调用后接收 QueueOnly 补充，同一次执行结束", async (t) => {
-  const fixture = await createRun(t, "DECK_TOOL_CASE", ["deck_pause", "agent_question"]);
+  const fixture = await createRun(t, "DECK_TOOL_CASE", ["deck_pause", "agent_report"]);
   await runtime.launchRunner(fixture.runId);
   await until(async () => (await lines(fixture.log)).some((entry) => entry.type === "long_tool_start") ? true : undefined, "长工具开始");
   const turn = (await runtime.readRun(fixture.runId))!.turnId;
-  await runtime.sendToRun(fixture.runId, "AT_TOOL_BOUNDARY", undefined, undefined, "QueueOnly");
+  await runtime.sendToRun(fixture.runId, "AT_TOOL_BOUNDARY");
   const completed = await until(async () => {
     const run = await runtime.readRun(fixture.runId);
     return run?.status === "已完成" && run.resourceState === "released" ? run : undefined;
@@ -194,22 +181,39 @@ test("真实 Pi RPC：角色目录与模型实际可调用工具一致", async (
   }
 });
 
-test("真实 Pi RPC：等待问题时停止，清除问题及消息，进程和槽位释放", async (t) => {
-  const fixture = await createRun(t, "DECK_QUESTION_CASE");
+test("真实 Pi RPC：阻塞直接返回，无提问工具、无等待进程", async (t) => {
+  const fixture = await createRun(t, "DECK_BLOCK_CASE");
   await runtime.launchRunner(fixture.runId);
-  const waiting = await until(async () => {
-    const run = await runtime.readRun(fixture.runId);
-    return run?.pendingQuestion ? run : undefined;
-  }, "问题");
-  await runtime.sendToRun(fixture.runId, "不能自动重启", undefined, undefined, "QueueOnly");
-  const stopped = await runtime.stopRun(fixture.runId);
-  assert.equal(stopped.status, "已停止");
-  assert.equal(stopped.pendingQuestion, undefined);
-  assert.equal(stopped.queuedMessageCount, 0);
-  assert.equal(stopped.resourceState, "released");
-  assert.equal(alive(waiting.childPid), false);
+  const result = await until(async () => { const r = await runtime.readRun(fixture.runId); return r?.resourceState === "released" ? r : undefined; }, "阻塞返回");
+  assert.equal(result.result?.outcome, "阻塞");
+  assert.equal(result.pendingQuestion, undefined);
   assert.equal(activeRunCount(fixture.parentSessionId), 0);
-  await assert.rejects(runtime.sendToRun(fixture.runId, "过期回答", undefined, waiting.pendingQuestion!.id), /失效/);
+  assert.match(taskOutput(result), /主 Agent 需要处理范围决定/);
+  const call = (await lines(fixture.log)).find((item) => item.type === "active_tools");
+  assert.ok(!call.tools.includes("agent_question"));
+});
+
+test("真实 Pi RPC：结果保存失败仍释放进程、通知真实错误", async (t) => {
+  const fixture = await createRun(t, "DECK_TOOL_CASE", ["deck_pause", "agent_report"]);
+  await fs.writeFile(path.join(runtime.runDirectory(fixture.runId), "results"), "故障注入：阻止创建结果目录");
+  const notices: any[] = [];
+  const unsubscribe = runtime.subscribeRunEvents((event) => { if (event.kind === "result" && event.run.runId === fixture.runId) notices.push(event); });
+  t.after(unsubscribe);
+  await runtime.launchRunner(fixture.runId);
+  const result = await until(async () => { const r = await runtime.readRun(fixture.runId); return r?.resourceState === "released" ? r : undefined; }, "故障后清理");
+  assert.equal(result.childPid, undefined); assert.equal(activeRunCount(fixture.parentSessionId), 0);
+  assert.match(result.persistenceError ?? "", /保存失败/);
+  assert.match(resultMessage(result, fixture.parentSessionId)!.content, /保存失败/);
+  await until(async () => notices.length === 1 ? true : undefined, "结果通知");
+});
+
+test("真实 Pi RPC：会话丢失时 resume 明确报错，不创建空白替代", async (t) => {
+  const fixture = await createRun(t, "DECK_BLOCK_CASE");
+  await runtime.launchRunner(fixture.runId);
+  await until(async () => (await runtime.readRun(fixture.runId))?.resourceState === "released" ? true : undefined, "完成");
+  await fs.unlink(fixture.childSessionPath);
+  await assert.rejects(runtime.resumeRun(fixture.runId, "继续"), /子会话不存在/);
+  assert.equal(activeRunCount(fixture.parentSessionId), 0);
 });
 
 test("真实 Pi RPC：模型失败和中断不会冒充完成，并自动释放资源", async (t) => {
@@ -221,7 +225,25 @@ test("真实 Pi RPC：模型失败和中断不会冒充完成，并自动释放�
       return run?.resourceState === "released" ? run : undefined;
     }, `${prompt} 结束`);
     assert.equal(result.status, status);
+    if (status === "失败") { assert.match(taskOutput(result), /原因：/); assert.match(taskOutput(result), /尚未验证/); }
     assert.equal(result.childPid, undefined);
     assert.equal(activeRunCount(fixture.parentSessionId), 0);
   }
+});
+
+
+test("只读会话查看折叠长工具参数和输出，展开后仍保留原文", async (t) => {
+  const fixture = await createRun(t, "只读显示测试");
+  const records = await fs.readFile(fixture.childSessionPath, "utf8");
+  const tail = "UNIQUE_TOOL_TAIL";
+  const assistant = { type: "message", id: "large-call", parentId: null, timestamp: new Date().toISOString(), message: {
+    role: "assistant", timestamp: 1, content: [{ type: "toolCall", id: "large", name: "write", arguments: { path: "demo.ts", content: "x".repeat(1000) + tail } }], stopReason: "toolUse",
+  } };
+  await fs.appendFile(fixture.childSessionPath, JSON.stringify(assistant) + "\n");
+  const run = (await runtime.readRun(fixture.runId))!;
+  assert.match(conversationBlocks(run).map((block) => block.text).join(""), /已折叠/);
+  assert.doesNotMatch(conversationBlocks(run).map((block) => block.text).join(""), new RegExp(tail));
+  assert.match(conversationBlocks(run, true).map((block) => block.text).join(""), new RegExp(tail));
+  assert.equal(await fs.readFile(fixture.childSessionPath, "utf8"), records + JSON.stringify(assistant) + "\n");
+  assert.equal((await runtime.readRun(fixture.runId))?.childPid, undefined);
 });

@@ -81,6 +81,7 @@ export async function persistCompletion(directory, run) {
     model: run.model, thinking: run.thinking, routing: run.routing, routingPending: run.routingPending,
     attemptStartedAt: run.attemptStartedAt, startedAt: run.startedAt, endedAt: run.endedAt,
     reports: run.reports ?? [], finalText: run.finalText, stderr: run.stderr,
+    result: run.result, failureReason: run.failureReason, persistenceError: run.persistenceError, toolEvidence: run.toolEvidence, resourceState: run.resourceState,
     events: (run.events ?? []).filter((event) => event.kind === "错误").slice(-1),
   };
   await atomicJson(file, snapshot);

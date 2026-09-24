@@ -1,192 +1,59 @@
 # Agent Deck 开发约定
 
-## 当前目标
+## 设计边界
 
-0.11.0 保持四个动作直观：派任务、接收结果、继续任务、停止任务。模型侧只注册 `Agent`、`SendMessage` 和 `TaskStop`。完整公开参数见 [README 的三个工具](README.md#三个工具)，参数 Schema 和运行时校验统一维护在 `tool-contract.ts`。
+0.12.0：用户与主 Agent 沟通；主 Agent 澄清、委派和验收；子 Agent 执行并返回结果。TUI 只读查看进度。保持 Agent / SendMessage / TaskStop 三个公开工具，完整参数见 README 和 src/tool-contract.ts。
 
-本版采用当前主 Pi 进程直接管理子 Pi RPC 会话的结构。活动任务不交给独立 Runner，也不通过持久消息队列跨重启转发。主进程退出或 `/reload` 时，当前活动控制器和子进程一起结束。
+- Agent 新建；Agent.resume 是已结束任务的唯一续接入口。运行中补充由 SendMessage 完成。
+- SendMessage 是 QueueOnly，不启动空闲任务。新建和明确 resume 是 TriggerTurn。
+- 程序管理最多 8 个活跃任务和进程生命周期；Jev 只选模型与思考强度。
+- 子 Agent 无问答等待工具，遇到必要决定时返回阻塞结果，由主 Agent 处理。
+- 执行结束不等于目标完成；子 Agent 报告不等于主 Agent 验收。
 
-## 模块职责
+## 模块
 
-- `index.ts`：扩展入口、三个模型工具、命令、父会话事件、活动控制器和结果交付。
-- `tool-contract.ts`：三个工具的参数 Schema、严格解析、角色/模型别名和公开回执。
-- `runtime.ts`：任务控制器、子 Session/RPC 生命周期、初始执行、`steer`、继续、停止和 turn 状态。
-- `run-capacity.ts`：当前主进程内按父会话同步占位，固定 8 个槽位；没有持久租约或自动排队。
-- `capabilities.ts`：同一份工具解析结果生成启动参数和派发前的角色能力目录。
-- `rpc-connection.ts`：Pi 原生 JSONL RPC 的薄连接层，处理请求匹配、事件、问答响应和进程退出。
-- `task-identity.ts`：按当前父会话解析任务 ID 或实例名称；名称只在所属父会话中绑定。
-- `child-runtime.ts`：子 Pi 的内部问题工具、阻塞状态和最小运行约束。
-- `delivery.ts`：把当前 turn 的结果或问题转换为父会话消息。
-- `types.ts`：任务、turn、问题、结果和界面使用的共享类型。
-- `config.ts`、`configuration-ui.ts`：全局设置和配置入口。
-- `config-editor.ts`、`menu.ts`：角色与全局配置编辑组件。
-- `agent-creation.ts`、`agent-authoring.md`：用当前模型创建角色，以及供主 Agent 使用的角色文件规范。
-- `agents.ts`：内置、个人、可信项目角色的发现、覆盖和校验。
-- `routing.ts`、`model-profiles.json`：根据模型能力和强制策略构造可选组合。
-- `router.mjs`：Jev/TypeSafe Choice 请求、响应校验和回退选择。
-- `routing-ui.ts`、`jev-ui.ts`、`jev-service.mjs`：Jev 命令、中文配置界面和个人凭据。
-- `child-providers.ts`：为子 Pi 准备可序列化的提供商配置。
-- `ui.ts`、`presentation.ts`：当前会话任务面板、详情和中文状态呈现。
-- `persistence.mjs`：历史记录和结果所需的原子文件操作；不承担活动消息队列重放。
+| 模块 | 职责 |
+| --- | --- |
+| index.ts | 主工具、短调度提示词、主会话事件和命令 |
+| tool-contract.ts | 参数解析、寻址字段、公开回执 |
+| instruction.ts / agents/*.md | 子任务执行约定和角色说明 |
+| runtime.ts | 当前主 Pi 持有的任务控制器、steer、明确 resume、停止和结果边界 |
+| rpc-connection.ts | Pi JSONL RPC 请求、事件和子进程退出 |
+| child-runtime.ts | 子提供商注册和一次性的最终 agent_report |
+| capabilities.ts | 同一份实际工具清单用于模型说明与启动参数 |
+| run-capacity.ts | 当前进程按主会话占位，固定 8，无排队调度器 |
+| task-identity.ts | 当前主会话的任务 ID / 实例名称解析 |
+| delivery.ts | 面板和主 Agent 共用结果说明、历史通知标注 |
+| conversation.ts | 只读解析 Pi 当前分支，合并执行中的公开消息 |
+| ui.ts / presentation.ts | 任务列表、只读会话、结果和资源状态 |
+| persistence.mjs | 状态与历史结果保存，不承担消息恢复 |
+| routing.ts / router.mjs | 候选模型策略、Jev 判断与回退 |
+| child-providers.ts | 可序列化的子进程模型提供商配置 |
+| config*.ts / *ui.ts / menu.ts | 中文配置、模型与角色编辑 |
+| agent-creation.ts / agent-authoring.md | 角色创建规范 |
 
-删除或改名模块后应同步更新本节。活跃文档不能继续把已经移除的 Runner 或持久队列写成当前架构。
+## 生命周期与保存
 
-## 公开工具契约
+稳定 task/runId 和 childSessionPath 对应保存的 Pi 会话；每次新执行产生 turnId，清空本轮报告、验证、错误和活动记录。初始任务使用 Pi SessionManager 生成原生头和会话信息，在启动子进程前写入文件，避免 Pi 的延迟落盘创建出另一个 ID。resume 必须读到有效会话，不能创建空白替代。
 
-0.11.0 保留原参数，为 `SendMessage` 新增可选的 `delivery`（reply_to 已在 0.10.0 提供）：
+先订阅 RPC 事件，再提交 prompt。运行中消息只用 steer；以 agent_settled 和当前 turn 的空闲快照判定结束。最终报告 terminate 直接结束本轮。模型错误原因与部分输出分开保存，恢复成功的单次重试错误不冒充整个任务失败。
 
-```ts
-Agent({
-  description: string,
-  prompt: string,
-  subagent_type?: string,
-  model?: string,
-  name?: string,
-  run_in_background?: true
-})
+结束时尝试保存结果，在 finally 中关闭子进程，确认退出后释放槽位。保存失败必须保留错误说明、执行清理并通知主会话。写入链失败不能阻断后续写入。停止清除消息；退出或重载不重放暂存消息。
 
-SendMessage({
-  to: string,
-  message: string,
-  summary?: string,
-  reply_to?: string,
-  delivery?: "QueueOnly" | "TriggerTurn"
-})
+历史记录中的问题字段只用于兼容读取。活动路径不再创建问题或等待答复。不新增持久回执、重试调度、工作树、写锁或自动验收层。
 
-TaskStop({ task_id: string })
-```
+## 结果证据
 
-三个接口只接受列出的字段。错误输入必须在创建 Session、调用模型或修改任务状态前失败。工具命名和部分字段参考 Claude 风格，不声明完整 Claude Code 兼容。
+TaskResult 包含 outcome、summary、completed、evidence、checks、remaining。每项检查是子 Agent 的自述，必须标明来源。工具成功写入可以证明发生过写入，不能证明功能正确。自然语言结果缺少结构化检查时显示未提供验证记录。
 
-公开 `task_id`、回执中的 `agentId` 和内部任务控制器使用同一个稳定任务编号。`agentType` 是角色 ID。实例名称是当前父会话内的可读别名，不能用于跨父会话操作任务。
+父会话通知和面板调用同一个 taskOutput。旧 turn 的通知标记为历史。主 Agent 的验收结论留在主会话，不从子 Agent 文本自动推导 UI 验收通过。
 
-## task、Session 与 turn
+## 只读会话页
 
-一个 task 对应一个稳定任务编号和一个稳定子 Session。初始执行、运行中 steer、结束后的补充以及问题答复都归属到明确的内部 `turnId`。
+Pi 会话通过纯解析和 inMemory SessionManager 构造，不向会话文件写入。当前分支的历史消息与当前进程的 message_start/update/end 合并显示。只展示公开文本、工具参数及结果；长工具输出可展开。进入/退出页面不调用 prompt、resume 或 switchSession，不改变任务状态。
 
-- `task_id` 用来找同一个任务和子 Session。
-- `turnId` 用来区分一次具体执行的事件、问题和结果。
-- 继续任务不能新建一个没有原上下文的 Session。
-- 上一 turn 的迟到结果不能覆盖当前 turn 的状态。
-- 一个问题只能由它所属 turn 中匹配的 `reply_to` 回答。
+## 验证与发布
 
-用户通常不需要直接填写 `turnId`。它属于内部关联标识，不应扩展公开工具参数。
+执行 npm run check、npm test 和 npm pack --dry-run。真实 RPC 测试使用隔离目录及本地可控模型，不调用付费服务。覆盖补充在工具边界送达、空闲消息不启动、同会话明确续接、保存失败清理、失败与部分结果、阻塞直接返回、停止、进程释放和模型策略。只读 TUI 验证包含真实会话及工具输出、滚动、宽度、只读按键。
 
-## 直接 RPC 通信
-
-主 Pi 进程持有活动任务控制器，并负责启动、监听和关闭子 Pi。必须在可能产生事件或退出的操作前完成 RPC 事件与进程结束监听。
-
-初始任务使用正常 prompt。任务运行时收到普通补充，调用同一子 Session 的 `steer`：
-
-- 消息在当前工具调用结束后的模型边界生效；
-- RPC 接受只表示子 Pi 已接收，不应描述成模型已执行；
-- 不承诺在正在生成的 token 中间立即打断；
-- turn 结束后收到的新要求，在同一 Session 中启动新的 turn。
-
-`delivery` 默认 TriggerTurn。运行中 TriggerTurn 使用 Pi 的 prompt + streamingBehavior: steer，避免完成边界把新要求遗留在原生空闲队列；QueueOnly 使用 steer，绝不能隐式启动空闲执行。等待问题时两者都仅 steer。
-
-结束检查、输入、停止在同一 task 的控制队列中顺序执行。最终事件使用 Pi agent_settled，再核对原生状态与所属 turn；不把 agent_end 当作完成。结束时 clear_queue 取回边界处未消费的信息，放入主进程邮箱，再关闭进程。下一次 TriggerTurn 才带着邮箱内容打开原 Session。消息内容不落盘重放。
-
-进度向主 Agent 发送时 triggerTurn: false；问题和最终结果使用 followUp + triggerTurn: true。不要把完成通知也改成不唤醒，导致依赖任务无人派发。
-
-活动控制器只存在于当前主 Pi 进程。`session_shutdown`、`/reload` 和显式停止必须关闭子会话及其受控进程。不要重新引入脱离主进程的 Runner，也不要通过磁盘队列尝试恢复一个已经不存在的活动控制器。
-
-## 问题与回答
-
-子 Agent 缺少必要决定时使用原有内部问题工具。发给主 Agent 的问题通知必须包含唯一 `questionId`；原工具调用等待匹配答复，并保持原 task 和 Session。
-
-- `SendMessage.reply_to` 与当前 `questionId` 匹配时，正文才是问题答复。
-- 没有 `reply_to` 的普通消息不能解除等待。
-- 不匹配或已经过期的 `reply_to` 必须拒绝，不能误答另一轮问题。
-- 问题答复在原工具调用中返回，不创建新的 turn；运行中补充也仍属于当前 turn。
-- 结果消息应清楚提示如何填写 `reply_to`。
-- reply_to 不能与 delivery 同传；回复走原生 extension_ui_response，不产生新 turn。
-
-## 停止与关闭
-
-`TaskStop` 定位当前父会话中的任务，关闭相应控制器和子 Pi。重复停止已经结束的任务应保留已有终态和结果。
-
-主 Pi 关闭或重载属于明确的活动任务生命周期边界。任务历史可继续显示，但不能把旧活动任务描述成仍在后台运行。
-
-正常返回后也自动关闭子进程，无需模型决定。执行 outcome 与 resourceState 分开：starting / running / releasing / released 不覆盖已完成、失败或已停止。完成结果可先保存，槽位在进程退出后释放。等待问题仍属于执行中，保留原进程与工具调用。
-
-创建、选配、运行、等待问题、停止和释放过程均占位。创建入口在写 Session 前 reserveRunSlot；runtime 初始化和续接也检查。第 9 项报错不排队；失败路径释放槽位；QueueOnly 空闲邮箱和问题回复不另占位。
-
-已删除旧工作区写锁及持久容量租约实现；历史字段只供兼容读取。不同文件可能存在接口和语义依赖，分工与顺序由主 Agent 决定，不引入工作树或自动依赖图。
-
-## 历史与升级
-
-0.9.x 的运行记录、结果和旧队列文件保留供查看。0.10.0 不自动执行旧 `follow-up.json` 或其他持久队列内容，也不把旧队列转换成一次隐式 `SendMessage`。
-
-需要继续旧任务时，应由用户或主 Agent 在新版本中明确发起补充；不能从磁盘状态猜测一条旧消息是否已经被模型处理。当前版本产生的新消息只走当前进程内的直接通信路径。
-
-## 模型和 Jev 边界
-
-主 Agent 决定任务拆分、Agent 数量、角色、依赖、顺序和验收。Jev 只选择一个已定义子任务的 `(model, thinking)`，不能决定任务数量或角色。
-
-强制策略集中在 `model-profiles.json`：
-
-- `reviewer` 或 `reportProfile: 审查` 只允许 GPT-5.6 Sol / `xhigh`、`max`；
-- 非审查任务不能使用 GPT-5.6 Sol；
-- GPT-6 Sol 和 GPT-6 Luna 最低为 `high`；
-- GPT-6 Astra 对所有子 Agent 停用；
-- 每个主 Pi 会话固定最多 8 个活跃子任务；Jev 不参与占位和调度。
-
-显式模型、角色固定值、模型别名、关闭 Jev 和回退路径都必须遵守同一策略。Jev 缺少密钥、超时或返回无效选项时，只能使用预先校验的合规回退。
-
-## 角色和提供商
-
-角色配置采用 Markdown + YAML。工具别名只映射实际支持的 Pi 工具；未知字段和无效配置必须在派遣前报告。角色修改影响以后创建的新任务，不应在已有子 Session 中静默更换权限、工具或系统提示。
-
-创建子 Session 前检查候选提供商。只向子 Pi 传递可序列化的声明式配置；函数、OAuth 回调和原生 Provider 不应被伪装成可复制配置。个人认证数据不得写入任务结果或公开日志。
-
-## 界面语义
-
-面板按 task 显示当前状态，并按 turn 显示问题和结果。状态文字必须区分：
-
-- RPC 已接受消息；
-- 消息将在工具边界进入下一次模型调用；
-- 子 Pi 已返回结果；
-- 任务正在等待匹配的问题答复；
-- 活动控制器已经停止。
-
-“已返回结果”不等于“已经通过验收”。主 Agent 仍需检查证据和用户目标。
-
-## 验证
-
-常规发布候选执行：
-
-```text
-npm ci
-npm run check
-npm test
-npm pack --dry-run
-```
-
-`npm run check` 包含 TypeScript 检查，以及仍在发布包中的 `router.mjs`、`persistence.mjs`、`jev-service.mjs` 语法检查。独立 `runner.mjs` 已不属于 0.10.0，因此不能继续保留对应检查。
-
-测试重点：
-
-- 三个工具的严格参数校验，尤其是 `reply_to`；
-- 同一 task 和子 Session 的多 turn 续接；
-- 运行中 `steer` 在工具边界送达；
-- 普通消息不能解除问题等待；
-- 旧问题不能回答新问题；
-- 主 Pi 关闭、重载和显式停止会清理活动子进程；
-- 旧持久队列保留但不会自动执行；
-- Jev 只选模型与思考强度，且所有入口遵守模型策略；
-- 并发创建和续接的 8/9 边界、等待占位、失败释放、QueueOnly 不唤醒；
-- 自动释放实际进程后，原任务和 Session 上下文仍能续接；
-- 角色目录与真实 Pi 模型收到的工具列表一致；
-- 父会话隔离、实例名称和任务编号解析；
-- 发布包包含当前 README、DEVELOPMENT 和 0.11.0 发布说明。
-
-自动化测试、受控假模型和本地 fixture 不能写成真实模型质量证明。最终通过数量、平台验收和打包清单只能在对应命令实际完成后写入发布说明。
-
-## 保持范围
-
-不提供完整 Claude Code 兼容、团队广播、前台等待、工作树隔离、远程执行、跨主进程活动任务恢复或持久消息队列重放。
-
-修改源码后需要 `/reload`。变更工具契约时，同步核对 README、当前开发约定、角色编写说明和当前版本发布说明。旧版本发布说明保留为历史资料，不回写成新架构说明。
-
-分别记录本地部署、Git 提交、远端推送和 Release 状态。只有获得对应证据后才报告完成。
+版本号同步 package.json、package-lock.json 和 src/version.ts；更新 README、发布说明和计划。提交推送前检查工作区和差异。运行中的旧任务不强行迁移。

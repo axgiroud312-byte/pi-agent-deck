@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -152,7 +153,7 @@ test("Jev 异步选配不阻塞任务入口；保存的密钥不进入任务记�
   assert.ok(!JSON.stringify(first).includes(key));
   assert.ok(!JSON.stringify(await readCompletions(runDirectory(f.id))).includes(key));
   const session = first.childSessionId, pid = first.childPid, turnId = first.turnId;
-  assert.equal((await sendToRun(f.id, "再次调查")).delivery, "resumed");
+  assert.equal((await resumeFixtureRun(f.id, "再次调查")).status, "运行中");
   const second = await until(async () => {
     const run = await readRun(f.id);
     return run?.status === "已完成" && run.turnId !== turnId ? run : undefined;

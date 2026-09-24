@@ -1,11 +1,12 @@
 import { Type } from "typebox";
-import type { AgentDefinition, MessageDelivery, RunDetails, RunStatus } from "./types.ts";
+import type { AgentDefinition, RunDetails, RunStatus } from "./types.ts";
 import type { DeckConfig } from "./config.ts";
 import type { RoutingContext } from "./routing.ts";
 
 export const AgentParameters = Type.Object({
-  description: Type.String({ minLength: 1, description: "简短任务标题，用于面板和回执；支持中文。" }),
-  prompt: Type.String({ minLength: 1, description: "完整任务说明，包含背景、范围和期望结果。" }),
+  description: Type.Optional(Type.String({ minLength: 1, description: "新建时必填的简短标题；续接时可更新本轮标题。" })),
+  prompt: Type.String({ minLength: 1, description: "本次任务的目标、范围、预期交付和验收方法。" }),
+  resume: Type.Optional(Type.String({ minLength: 1, description: "明确续接已结束的任务 ID 或实例名称，复用原 Pi 会话。与角色、模型、name 互斥；运行中请用 SendMessage 补充。" })),
   subagent_type: Type.Optional(Type.String({ minLength: 1, description: "角色，默认 general-purpose；Explore 为只读调查，也可使用准确的自定义角色 ID。" })),
   model: Type.Optional(Type.String({ minLength: 1, description: "仅在明确指定模型时填写 provider/model 或已配置别名；省略则交给 Jev。" })),
   name: Type.Optional(Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$", description: "可选实例名称，同一主会话内唯一；后续 SendMessage 和 TaskStop 可使用此名称。" })),
@@ -14,18 +15,16 @@ export const AgentParameters = Type.Object({
 
 export const SendMessageParameters = Type.Object({
   to: Type.String({ minLength: 1, description: "当前主会话内的任务 ID 或实例名称。" }),
-  message: Type.String({ minLength: 1, description: "完整补充要求或问题答复，按纯文本处理。" }),
-  delivery: Type.Optional(Type.Union([Type.Literal("QueueOnly"), Type.Literal("TriggerTurn")], { description: "本插件扩展。默认 TriggerTurn：空闲时在原会话继续；QueueOnly：仅发信息，不启动空闲任务。运行中均补充到当前执行；不能与 reply_to 同用。" })),
+  message: Type.String({ minLength: 1, description: "完整补充信息，按纯文本处理，不启动新执行。" }),
   summary: Type.Optional(Type.String({ minLength: 1, description: "可选消息摘要，只用于预览和记录；不会替换完整 message。" })),
-  reply_to: Type.Optional(Type.String({ minLength: 1, description: "回答待处理问题时填写其问题 ID；普通补充消息请省略。" })),
 }, { additionalProperties: false });
 
 export const TaskStopParameters = Type.Object({
   task_id: Type.String({ minLength: 1, description: "当前主会话内的任务 ID 或实例名称。" }),
 }, { additionalProperties: false });
 
-export interface AgentInput { description: string; prompt: string; subagent_type?: string; model?: string; name?: string; run_in_background?: true }
-export interface MessageInput { to: string; message: string; summary: string; replyTo?: string; delivery?: MessageDelivery }
+export type AgentInput = { resume: string; prompt: string; description?: string } | { resume?: undefined; description: string; prompt: string; subagent_type?: string; model?: string; name?: string; run_in_background?: true };
+export interface MessageInput { to: string; message: string; summary: string }
 
 function fields(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("参数必须是对象。");
@@ -43,20 +42,23 @@ export function validateInstanceName(name: string): string {
   return name;
 }
 export function parseAgentInput(value: unknown): AgentInput {
-  const input = fields(value, ["description", "prompt", "subagent_type", "model", "name", "run_in_background"]);
+  const input = fields(value, ["description", "prompt", "resume", "subagent_type", "model", "name", "run_in_background"]);
+  const resume = textField(input, "resume", true);
+  if (resume) {
+    if (["subagent_type", "model", "name", "run_in_background"].some((key) => input[key] !== undefined)) throw new Error("resume 沿用原角色和模型，不能同时指定 subagent_type、model、name 或 run_in_background。");
+    return { resume, prompt: textField(input, "prompt")!, description: textField(input, "description", true) };
+  }
   if (input.run_in_background !== undefined && input.run_in_background !== true) throw new Error("本版本仅支持后台任务：run_in_background 只能为 true 或省略。");
   const name = textField(input, "name", true);
   return { description: textField(input, "description")!, prompt: textField(input, "prompt")!, subagent_type: textField(input, "subagent_type", true), model: textField(input, "model", true), name: name === undefined ? undefined : validateInstanceName(name) };
 }
 export function messagePreview(message: string): string { return message.trim().split(/\r?\n/, 1)[0].slice(0, 200); }
 export function parseMessageInput(value: unknown): MessageInput {
-  const input = fields(value, ["to", "message", "summary", "reply_to", "delivery"]);
+  if (value && typeof value === "object" && ("delivery" in value || "reply_to" in value)) throw new Error("0.12.0 的 SendMessage 只传递补充信息，不再接受 delivery / reply_to；开始下一次执行请使用 Agent({resume, prompt})。需求澄清由主 Agent 处理。");
+  const input = fields(value, ["to", "message", "summary"]);
   textField(input, "message");
   const message = input.message as string;
-  const replyTo = textField(input, "reply_to", true);
-  if (input.delivery !== undefined && input.delivery !== "QueueOnly" && input.delivery !== "TriggerTurn") throw new Error("delivery 必须为 QueueOnly 或 TriggerTurn。");
-  if (replyTo && input.delivery !== undefined) throw new Error("reply_to 不能与 delivery 同时指定。");
-  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message), replyTo, ...(input.delivery ? { delivery: input.delivery as MessageDelivery } : {}) };
+  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message) };
 }
 export function parseStopInput(value: unknown): { task_id: string } { return { task_id: textField(fields(value, ["task_id"]), "task_id")! }; }
 

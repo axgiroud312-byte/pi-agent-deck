@@ -12,7 +12,7 @@ export const STATUS_VIEW: Record<RunStatus, { icon: string; label: string; color
   "等待决定": { icon: "◐", label: "等答复", color: "warning", order: 0 },
   "停止中": { icon: "◒", label: "停止中", color: "warning", order: 2 },
   "停止未确认": { icon: "!", label: "停止未确认", color: "error", order: 0 },
-  "已完成": { icon: "✓", label: "已返回结果", color: "success", order: 5 },
+  "已完成": { icon: "✓", label: "已返回结果", color: "accent", order: 5 },
   "失败": { icon: "✗", label: "失败", color: "error", order: 4 },
   "失联": { icon: "!", label: "失联", color: "error", order: 0 },
   "已停止": { icon: "■", label: "已停止", color: "muted", order: 5 },
@@ -45,7 +45,7 @@ export function runCounts(runs: PersistedRun[]) {
 }
 export function countSummary(runs: PersistedRun[], theme: Theme): string {
   const n = runCounts(runs);
-  return [...(n.selecting ? [theme.fg("accent", `选配 ${n.selecting}`)] : []), theme.fg("accent", `运行 ${n.running}`), theme.fg("muted", `排队 ${n.queued}`), theme.fg(n.waiting ? "warning" : "muted", `等答复 ${n.waiting}`), ...(n.stopping ? [theme.fg("warning", `停止中 ${n.stopping}`)] : []), ...(n.issues ? [theme.fg("error", `异常 ${n.issues}`)] : [])].join(" · ");
+  return [...(n.selecting ? [theme.fg("accent", `选配 ${n.selecting}`)] : []), theme.fg("accent", `运行 ${n.running}`), ...(n.queued ? [theme.fg("muted", `历史排队 ${n.queued}`)] : []), ...(n.waiting ? [theme.fg("warning", `旧版等待 ${n.waiting}`)] : []), ...(n.stopping ? [theme.fg("warning", `停止中 ${n.stopping}`)] : []), ...(n.issues ? [theme.fg("error", `异常 ${n.issues}`)] : [])].join(" · ");
 }
 export function executionLabel(run: PersistedRun): string {
   return run.routingPending ? "模型待选配" : `${run.model.split("/").at(-1)} · ${run.thinking}${run.routing?.mode === "fallback" ? " · 已回退" : ""}`;

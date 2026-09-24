@@ -44,11 +44,11 @@ test("启动后只暴露简洁任务工具；空白任务被拒绝", async () =>
     await handlers.get("session_start")({}, ctx);
     assert.deepEqual(active.sort(), ["Agent", "SendMessage", "TaskStop"]);
     assert.deepEqual([...tools.keys()].sort(), ["Agent", "SendMessage", "TaskStop"]);
-    assert.deepEqual(tools.get("Agent").parameters.required, ["description", "prompt"]);
+    assert.deepEqual(tools.get("Agent").parameters.required, ["prompt"]);
     assert.deepEqual(tools.get("SendMessage").parameters.required, ["to", "message"]);
     assert.deepEqual(tools.get("TaskStop").parameters.required, ["task_id"]);
     for (const tool of tools.values()) assert.equal(tool.parameters.additionalProperties, false);
-    assert.deepEqual(Object.keys(tools.get("Agent").parameters.properties), ["description", "prompt", "subagent_type", "model", "name", "run_in_background"]);
+    assert.deepEqual(Object.keys(tools.get("Agent").parameters.properties), ["description", "prompt", "resume", "subagent_type", "model", "name", "run_in_background"]);
     await assert.rejects(tools.get("Agent").execute("test", { description: "标题", prompt: " " }, undefined, undefined, ctx), /prompt/);
   } finally { handlers.get("session_shutdown")(); }
 });

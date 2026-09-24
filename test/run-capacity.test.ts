@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
@@ -32,7 +33,7 @@ test("并发创建原子占位 8；第 9 个不创建记录；父会话隔离；
   await initializeRun(foreign.details, foreign.request, true);
   assert.equal(activeRunCount(other), 1);
   const originalTurn = (await readRun(runs[0].id))?.turnId;
-  await sendToRun(runs[0].id, "创建中补充", undefined, undefined, "QueueOnly");
+  await sendToRun(runs[0].id, "创建中补充");
   assert.equal((await readRun(runs[0].id))?.turnId, originalTurn);
   assert.equal(activeRunCount(parent), 8);
   await stopRun(runs[0].id);
@@ -41,15 +42,15 @@ test("并发创建原子占位 8；第 9 个不创建记录；父会话隔离；
   assert.equal(activeRunCount(parent), 8);
 });
 
-test("空闲 QueueOnly 不占位；TriggerTurn 满额拒绝且保留邮箱；清理不重放", async (t) => {
+test("空闲补充不占位；明确 resume 满额拒绝且保留信息；清理不重放", async (t) => {
   const parent = randomUUID();
   t.after(() => shutdownRuns(parent));
   const idle = fixture(parent, "已完成");
   await initializeRun(idle.details, idle.request, true);
   const holders = Array.from({ length: 8 }, () => fixture(parent, "等待决定"));
   await Promise.all(holders.map(({ details, request }) => initializeRun(details, request, true)));
-  assert.equal((await sendToRun(idle.id, "仅供参考", undefined, undefined, "QueueOnly")).delivery, "deferred");
-  await assert.rejects(sendToRun(idle.id, "继续"), /8\/8/);
+  assert.equal((await sendToRun(idle.id, "仅供参考")).delivery, "deferred");
+  await assert.rejects(resumeFixtureRun(idle.id, "继续"), /8\/8/);
   assert.equal((await readRun(idle.id))?.queuedMessageCount, 1);
   assert.equal((await readRun(idle.id))?.status, "已完成");
   await stopRun(idle.id);

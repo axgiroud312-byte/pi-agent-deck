@@ -12,7 +12,7 @@ export function reserveRunSlot(parent: string, runId: string): () => void {
     if (previous.parent !== parent) throw new Error("任务已属于另一个主会话。");
     return previous.release;
   }
-  if (activeRunCount(parent) >= MAX_ACTIVE_RUNS) throw new Error("当前主会话已占用 8/8 个子任务槽位（包含选配、等待答复和释放中的任务）。请等待任务结束后再派发或继续；本次请求未排队。");
+  if (activeRunCount(parent) >= MAX_ACTIVE_RUNS) throw new Error("当前主会话已占用 8/8 个子任务槽位（包含选配、执行和释放中的任务）。请等待任务结束后再派发或继续；本次请求未排队。");
   const slot = { parent, release: () => { if (slots.get(runId) === slot) slots.delete(runId); } };
   slots.set(runId, slot);
   return slot.release;

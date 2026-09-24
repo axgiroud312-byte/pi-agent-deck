@@ -9,6 +9,7 @@ import { taskOutput } from "./delivery.ts";
 import { readCompletions } from "./persistence.mjs";
 import { readDeckConfig } from "./config.ts";
 import { decisionText } from "./router.mjs";
+import { conversationBlocks } from "./conversation.ts";
 import { executionLabel } from "./presentation.ts";
 import { activeRunCount } from "./run-capacity.ts";
 import { countSummary, fit, frame, panelHeight, plain, runTime, sortRuns, statusText, twoColumns } from "./presentation.ts";
@@ -17,10 +18,7 @@ export type AgentPanelAction =
   | { action: "关闭" }
   | { action: "创建" }
   | { action: "配置" }
-  | { action: "停止"; runId: string }
-  | { action: "回答问题"; runId: string; questionId: string }
-  | { action: "仅发信息"; runId: string }
-  | { action: "继续"; runId: string };
+  | { action: "停止"; runId: string };
 type LogEntry = { at: number; kind: string; text: string };
 
 class AgentPanelComponent {
@@ -30,6 +28,7 @@ class AgentPanelComponent {
   private page: "任务说明" | "实时记录" | "报告" = "实时记录";
   private scroll = 0;
   private following = true;
+  private expandedTools = false;
   private maxScroll = 0;
   private pageSize = 5;
   private anchor?: string;
@@ -118,28 +117,25 @@ class AgentPanelComponent {
     if (!selected) return;
     if (matchesKey(data, Key.enter)) {
       this.mode = "详情";
-      this.page = isTerminalStatus(selected.status) || selected.status === "等待决定" ? "报告" : "实时记录";
+      this.page = "实时记录";
       this.scroll = 0; this.following = true; this.anchor = undefined; this.requestRender(); void this.refresh(); return;
     }
     if (data.toLowerCase() === "x" && !isTerminalStatus(selected.status)) this.done({ action: "停止", runId: selected.runId });
-    if (data.toLowerCase() === "a" && selected.pendingQuestion) this.done({ action: "回答问题", runId: selected.runId, questionId: selected.pendingQuestion.id });
-    if (data.toLowerCase() === "c" && selected.status !== "停止中" && selected.status !== "停止未确认") this.done({ action: "继续", runId: selected.runId });
-    if (data.toLowerCase() === "m" && selected.status !== "停止中" && selected.status !== "停止未确认") this.done({ action: "仅发信息", runId: selected.runId });
+    if (data.toLowerCase() === "o") { this.expandedTools = !this.expandedTools; this.requestRender(); }
+
   }
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
     const height = panelHeight(this.terminalRows());
     const inner = Math.max(1, safeWidth - 4);
-    const title = this.theme.fg("accent", this.theme.bold(this.mode === "列表" ? "Agent 控制台" : "Agent 详情"));
+    const title = this.theme.fg("accent", this.theme.bold(this.mode === "列表" ? "Agent 控制台" : "子会话 · 只读"));
     const body = this.mode === "列表" ? this.renderList(inner, Math.max(1, height - 2)) : this.renderDetail(inner, Math.max(1, height - 2));
     return frame(title, body, safeWidth, this.theme).slice(0, height);
   }
 
   private actionHint(run?: PersistedRun): string {
     const actions = [];
-    if (run?.pendingQuestion) actions.push("A 回答问题");
-    if (run && run.status !== "停止中" && run.status !== "停止未确认") actions.push("C 继续", "M 仅发信息");
     if (run && !isTerminalStatus(run.status)) actions.push("X 停止");
     return [...actions, "N 新建", "G 配置", "Esc 返回"].join(" · ");
   }
@@ -158,11 +154,11 @@ class AgentPanelComponent {
       if (selected && this.theme.bg) row = this.theme.bg("selectedBg", fit(row, width));
       lines.push(row);
       const activity = run.pendingQuestion ? `待回答：${run.pendingQuestion.question}` : run.currentAction ?? (isTerminalStatus(run.status) ? taskOutput(run) : run.status === "排队中" ? "等待工作区写任务结束" : run.status === "等待决定" ? "等待答复后继续" : "等待新的活动记录");
-      lines.push(this.theme.fg("muted", `  ${plain(runRoleLabel(run))} · ${plain(executionLabel(run))} · ${plain(activity)}`));
+      lines.push(this.theme.fg("muted", `  ${plain(runRoleLabel(run))} · ${resourceLabel(run)} · ${plain(executionLabel(run))} · ${plain(activity)}`));
     }
     if (!this.runs.length) lines.push("还没有任务。直接告诉主 Agent 你要完成什么。", "按 N 描述并创建一个专用 Agent。");
     while (lines.length < height - 2) lines.push("");
-    lines.push(this.theme.fg(this.refreshError ? "error" : "muted", this.refreshError ? `刷新失败：${this.refreshError}` : this.runs.length ? `显示 ${start + 1}–${end} / ${this.runs.length} · ↑↓ 选择 · Enter 详情` : "↑↓ 选择 · Enter 详情"));
+    lines.push(this.theme.fg(this.refreshError ? "error" : "muted", this.refreshError ? `刷新失败：${this.refreshError}` : this.runs.length ? `显示 ${start + 1}–${end} / ${this.runs.length} · ↑↓ 选择 · Enter 子会话` : "↑↓ 选择 · Enter 子会话"));
     lines.push(this.theme.fg("muted", this.actionHint(this.runs[this.selected])));
     return lines.slice(0, height);
   }
@@ -171,17 +167,13 @@ class AgentPanelComponent {
     const run = this.runs[this.selected];
     if (!run) return ["任务记录不存在。", "Esc 返回"];
     const tabs = (["任务说明", "实时记录", "报告"] as const).map((page, index) => {
-      const label = `${index + 1} ${page === "报告" ? "结果" : page === "任务说明" ? "任务" : "实时"}`;
+      const label = `${index + 1} ${page === "报告" ? "结果" : page === "任务说明" ? "任务" : "会话"}`;
       return page === this.page ? this.theme.fg("accent", this.theme.bold(`[${label}]`)) : this.theme.fg("muted", label);
     }).join("   ");
     const resource = run.resourceState ? { starting: "进程启动中", running: "进程存活", releasing: "进程释放中", released: "进程已释放" }[run.resourceState] : "历史资源状态";
     const lines = [twoColumns(this.theme.bold(plain(runTitle(run))), `${statusText(run, this.theme)} · ${runTime(run)}`, width), this.theme.fg("muted", `${plain(runRoleLabel(run))} · ${resource} · 暂存信息 ${run.queuedMessageCount ?? 0}`), tabs, ""];
     let content = this.page === "任务说明" ? this.renderInstruction(run, width) : this.page === "报告" ? this.renderReports(run, width) : this.renderTranscript(run, width);
-    if (run.pendingQuestion) {
-      const question = run.pendingQuestion;
-      const choices = question.options.map((option, index) => `${index + 1}. ${option}`);
-      content = [...this.wrapLines([`待回答问题：${stripTerminalSequences(question.question)}`, ...choices, "A 回答问题；C/M 仅补充，不能解除等待。", ""].join("\n"), width), ...content];
-    }
+    if (run.pendingQuestion) content = [...this.wrapLines(`旧版问题记录：${stripTerminalSequences(run.pendingQuestion.question)}\n由主 Agent 处理后明确 resume。`, width), ...content];
     if (!content.length) content = [this.theme.fg("muted", this.page === "实时记录" ? run.currentAction ?? "等待新的活动记录…" : "暂无结果。")];
     height = Math.min(height, content.length + 7);
     this.pageSize = Math.max(1, height - 7);
@@ -198,7 +190,7 @@ class AgentPanelComponent {
     const position = `${this.scroll + 1}–${Math.min(content.length, this.scroll + this.pageSize)} / ${content.length}`;
     const mode = this.page === "实时记录" ? `${this.following ? "跟随最新" : "已暂停跟随 · End 最新"}${this.logCache?.truncated ? " · 近期日志" : ""}` : "↑↓ / PgUp PgDn 滚动";
     lines.push(this.theme.fg("muted", twoColumns(mode, position, width)));
-    lines.push(this.theme.fg("muted", "1 任务 · 2 实时 · 3 结果 · Tab 切换"));
+    lines.push(this.theme.fg("muted", "1 任务 · 2 会话 · 3 结果 · O 展开工具 · Tab 切换"));
     lines.push(this.theme.fg("muted", this.actionHint(run)));
     return lines.slice(0, height);
   }
@@ -212,6 +204,16 @@ class AgentPanelComponent {
   }
 
   private renderTranscript(run: PersistedRun, width: number): string[] {
+    const conversation = conversationBlocks(run, this.expandedTools);
+    if (conversation.length) {
+      const lines: string[] = [];
+      this.logKeys = [];
+      this.logCache = undefined;
+      for (const block of conversation) {
+        this.wrapLines(block.text, width).forEach((line, index) => { lines.push(line); this.logKeys.push(`${block.key}:${index}`); });
+      }
+      return lines;
+    }
     const file = path.join(runDirectory(run.runId), "events.jsonl");
     if (run.turnId) {
       this.logCache = { runId: run.runId, stamp: `${run.turnId}:${run.updatedAt}`, entries: run.events, truncated: run.events.length >= 200 };
@@ -256,8 +258,8 @@ class AgentPanelComponent {
   }
   private renderReports(run: PersistedRun, width: number): string[] {
     const blocks: string[] = [`当前执行：${run.turnId ?? "历史任务"} · ${run.status}`, ""];
-    if (run.finalText) blocks.push(run.finalText, "");
-    if (!run.reports.length && !run.finalText) blocks.push(isTerminalStatus(run.status) ? taskOutput(run) : "当前执行尚未返回结果。", "");
+    blocks.push(isTerminalStatus(run.status) ? taskOutput(run) : "当前执行尚未返回结果。", "");
+    if (!isTerminalStatus(run.status) && run.finalText) blocks.push("执行中输出（尚未作为最终结果）：", run.finalText);
     for (const report of run.reports) {
       blocks.push(`${report.type === "问题" && run.turnId ? "已回答的问题" : report.type}｜${report.title}`, report.summary);
       if (report.objectiveStatus) blocks.push(`目标状态：${report.objectiveStatus}`);
@@ -290,6 +292,8 @@ class AgentPanelComponent {
   invalidate(): void { this.reportCache = undefined; this.logRender = undefined; }
   dispose(): void { clearInterval(this.timer); }
 }
+
+export function resourceLabel(run: PersistedRun): string { return run.resourceState ? { starting: "进程启动中", running: "进程存活", releasing: "进程释放中", released: "进程已释放" }[run.resourceState] : "历史资源状态未知"; }
 
 export async function showAgentPanel(ctx: ExtensionContext): Promise<AgentPanelAction> {
   if (ctx.mode !== "tui") return { action: "关闭" };

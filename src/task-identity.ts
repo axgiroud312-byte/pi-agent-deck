@@ -10,7 +10,7 @@ export async function withTaskCreation<T>(parent: string, name: string | undefin
   if (name !== undefined) validateInstanceName(name);
   const lock = path.join(getAgentDir(), "agent-deck", "creation", `${createHash("sha256").update(parent).digest("hex")}.lock`);
   return withFileMutationQueue(lock, () => withDiskLock(lock, async () => {
-    if (name && (await listRuns(Number.MAX_SAFE_INTEGER, parent, true)).some((run) => run.instanceName?.toLowerCase() === name.toLowerCase())) throw new Error(`当前会话已有名为“${name}”的任务；请用 SendMessage 继续，或为新任务选择另一个 name。`);
+    if (name && (await listRuns(Number.MAX_SAFE_INTEGER, parent, true)).some((run) => run.instanceName?.toLowerCase() === name.toLowerCase())) throw new Error(`当前会话已有名为“${name}”的任务；请用 Agent.resume 继续，或为新任务选择另一个 name。`);
     return create();
   }));
 }

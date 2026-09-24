@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -36,7 +37,7 @@ if(q.type==="prompt"||q.type==="steer"){if(busy)queue.push(q.message);else start
   };
   let previous = await wait();
   for (let i=0;i<5;i++) {
-    await sendToRun(id, `FIRST-${i}`);
+    await resumeFixtureRun(id, `FIRST-${i}`);
     await sendToRun(id, `SECOND-${i}`);
     previous = await wait(previous.turnId);
   }
@@ -51,7 +52,7 @@ if(q.type==="prompt"||q.type==="steer"){if(busy)queue.push(q.message);else start
   }
 });
 
-test("旧 agent_settled 的空闲快照不能完成刚接收的新消息", async (t) => {
+test("结束边界上的补充只暂存，明确 resume 后再执行", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-review-settle-"));
   const id = "review-" + randomUUID();
   t.after(async () => { await shutdownRuns(id); await fs.rm(cwd, { recursive: true, force: true }); });
@@ -94,14 +95,15 @@ if(q.type==="prompt"){
   }
   assert.ok(inFlight, "应先观察到旧 agent_settled 正在核对空闲状态");
   const sent=await sendToRun(id,"FOLLOWUP");
-  assert.equal(sent.delivery,"resumed", "结束与输入串行：完成边界之后在原任务启动新执行");
+  assert.equal(sent.delivery,"deferred", "完成边界之后只暂存，不自动启动");
+  await resumeFixtureRun(id, "EXPLICIT_RESUME");
   let result;
   for(let i=0;i<500;i++){
     const run=await readRun(id);
-    if(run?.status==="已完成" && run.finalText==="FOLLOWUP"){result=run;break;}
+    if(run?.status==="已完成" && run.finalText?.includes("FOLLOWUP")){result=run;break;}
     await new Promise(resolve=>setTimeout(resolve,5));
   }
-  assert.equal(result?.finalText,"FOLLOWUP", "新消息不得被旧 agent_settled 提前吞掉");
+  assert.match(result?.finalText ?? "", /FOLLOWUP/, "补充随明确 resume 送入新执行");
 });
 
 test("执行超时进入停止流程后拒绝补充消息", async (t) => {

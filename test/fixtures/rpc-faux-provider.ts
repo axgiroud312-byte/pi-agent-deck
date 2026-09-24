@@ -15,33 +15,30 @@ function record(value: unknown): void {
 const respond = async (context: { messages: unknown[]; tools?: { name: string }[] }, options: { signal?: AbortSignal } | undefined, state: { callCount: number }) => {
   const transcript = JSON.stringify(context.messages);
   record({ type: "provider_call", call: state.callCount, transcript, tools: context.tools?.map((tool) => tool.name) });
+  const report = (outcome = "完成") => fauxAssistantMessage(fauxToolCall("agent_report", {
+    outcome, summary: outcome === "阻塞" ? "缺少业务决定" : "DECK_REPORT_DONE",
+    completed: ["已读取本地测试上下文"], evidence: ["本地可控模型记录"],
+    checks: [{ name: "测试检查", status: "通过", evidence: "本地测试样例" }],
+    remaining: outcome === "阻塞" ? ["主 Agent 需要处理范围决定"] : [],
+  }), { stopReason: "toolUse" });
+  if (transcript.includes("DECK_CONTINUE_CASE")) return report();
   if (transcript.includes("DECK_CAPABILITY_CASE")) return fauxAssistantMessage("CAPABILITIES_CHECKED");
-  if (transcript.includes("DECK_FAILURE_CASE")) return fauxAssistantMessage("", { stopReason: "error" });
+  if (transcript.includes("DECK_FAILURE_CASE")) return fauxAssistantMessage("已经调查入口，尚未验证", { stopReason: "error" });
   if (transcript.includes("DECK_ABORTED_CASE")) return fauxAssistantMessage("", { stopReason: "aborted" });
+  if (transcript.includes("DECK_BLOCK_CASE")) return report("阻塞");
   if (transcript.includes("DECK_TOOL_CASE")) {
     const completed = context.messages.some((message: any) => message.role === "toolResult" && message.toolName === "deck_pause");
-    return completed ? fauxAssistantMessage("TOOL_BOUNDARY_DONE") : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+    return completed ? report() : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
   }
-
   if (transcript.includes("DECK_STOP_CASE")) {
-    // Leave the model response pending until the runner aborts this process.
     await new Promise<void>((resolve) => {
       if (options?.signal?.aborted) return resolve();
       options?.signal?.addEventListener("abort", () => resolve(), { once: true });
     });
     return fauxAssistantMessage("stopped before completion", { stopReason: "aborted" });
   }
-
-  if (transcript.includes("DECK_CONTINUE_CASE")) return fauxAssistantMessage("DECK_CONTINUE_DONE");
-
-  const toolAnswer = [...context.messages].reverse().find((message) =>
-    typeof message === "object" && message !== null &&
-    "role" in message && message.role === "toolResult" &&
-    "toolName" in message && message.toolName === "agent_question");
-  if (toolAnswer) return fauxAssistantMessage(`DECK_ANSWER_DONE ${JSON.stringify(toolAnswer).includes("同意") ? "同意" : "未同意"}`);
-
   if (state.callCount === 1) await new Promise((resolve) => setTimeout(resolve, 300));
-  return fauxAssistantMessage(fauxToolCall("agent_question", { question: "是否同意继续？", options: ["同意", "取消"] }), { stopReason: "toolUse" });
+  return report();
 };
 
 provider.setResponses(Array.from({ length: 12 }, () => respond));

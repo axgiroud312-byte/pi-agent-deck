@@ -6,75 +6,25 @@ import test from "node:test";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import childRuntime from "../src/child-runtime.ts";
 import { initializeRun, runDirectory } from "../src/runtime.ts";
-import { parseMessageInput, publicTaskResult } from "../src/tool-contract.ts";
+import { parseAgentInput, parseMessageInput, publicTaskResult } from "../src/tool-contract.ts";
 import { showAgentPanel } from "../src/ui.ts";
 
-test("SendMessage retains existing fields and parses an optional question reply ID", () => {
-  assert.deepEqual(parseMessageInput({ to: "worker", message: "补充说明" }), {
-    to: "worker", message: "补充说明", summary: "补充说明", replyTo: undefined,
-  });
-  assert.deepEqual(parseMessageInput({ to: "worker", message: "保持兼容", summary: "决定", reply_to: "question-1" }), {
-    to: "worker", message: "保持兼容", summary: "决定", replyTo: "question-1",
-  });
-  assert.throws(() => parseMessageInput({ to: "worker", message: "答复", reply_to: "  " }), /reply_to/);
+test("消息参数只保留收件任务、正文与摘要；旧问答参数明确拒绝", () => {
+  assert.deepEqual(parseMessageInput({ to: "worker", message: "补充说明" }), { to: "worker", message: "补充说明", summary: "补充说明" });
+  assert.throws(() => parseMessageInput({ to: "worker", message: "答复", reply_to: "q" }), /不再接受/);
 });
 
-function childTools(): Map<string, any> {
+test("子 Agent 只提交最终报告，不注册问题工具或等待用户输入", async () => {
   const tools = new Map<string, any>();
   childRuntime({ registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
-  return tools;
-}
-
-test("agent_question waits for native UI reply inside the same tool call", async () => {
-  const tool = childTools().get("agent_question");
-  const controller = new AbortController();
-  let respond!: (value: string) => void;
-  const answer = new Promise<string>((resolve) => { respond = resolve; });
-  let inputArgs: any[] = [];
-  const execution = tool.execute("call-1", { question: "是否保持兼容？", options: ["保持", "移除"] }, controller.signal, () => {}, {
-    ui: { input: (...args: any[]) => { inputArgs = args; return answer; } },
-  });
-  let settled = false;
-  void execution.then(() => { settled = true; });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, false);
-  assert.equal(inputArgs[0], "是否保持兼容？");
-  assert.match(inputArgs[1], /1\. 保持/);
-  assert.equal(inputArgs[2].signal, controller.signal);
-  respond("保持兼容");
-  const result = await execution;
-  assert.match(result.content[0].text, /主 Agent 的答复：保持兼容/);
-  assert.equal(result.terminate, undefined);
+  assert.deepEqual([...tools.keys()], ["agent_report"]);
+  const report = { outcome: "阻塞", summary: "缺少业务决定", completed: [], evidence: [], checks: [], remaining: ["需要主 Agent 决策"] };
+  const result = await tools.get("agent_report").execute("call", report);
+  assert.equal(result.terminate, true);
+  assert.deepEqual(result.details.taskResult, report);
 });
 
-test("blocking agent_report waits for an answer while nonblocking reports remain immediate", async () => {
-  const tool = childTools().get("agent_report");
-  const controller = new AbortController();
-  let requested = 0;
-  const ctx = { ui: { input: async () => { requested++; return "采用方案二"; } } };
-  const base = { type: "问题", title: "需要选择", summary: "方案如何选？", question: "方案如何选？", options: ["一", "二"] };
-  const blocked = await tool.execute("call-2", { ...base, blocking: true }, controller.signal, () => {}, ctx);
-  assert.equal(requested, 1);
-  assert.match(blocked.content[0].text, /采用方案二/);
-  assert.equal(blocked.terminate, undefined);
-  const progress = await tool.execute("call-3", { type: "进度", title: "调查中", summary: "继续检查", blocking: false }, controller.signal, () => {}, ctx);
-  assert.equal(requested, 1);
-  assert.equal(progress.terminate, false);
-});
-
-test("aborting a waiting question rejects rather than inventing an answer", async () => {
-  const tool = childTools().get("agent_question");
-  const controller = new AbortController();
-  const execution = tool.execute("call-4", { question: "要继续吗？" }, controller.signal, () => {}, {
-    ui: { input: (_question: string, _choices: string, options: { signal: AbortSignal }) => new Promise<undefined>((resolve) => {
-      options.signal.addEventListener("abort", () => resolve(undefined), { once: true });
-    }) },
-  });
-  controller.abort(new Error("任务已停止"));
-  await assert.rejects(execution, /任务已停止/);
-});
-
-test("panel separates answering, stopping and ordinary continuation; public result includes pending question", async () => {
+test("只读面板保留旧问题记录，移除答复和续接输入，仅允许明确停止", async () => {
   const parent = randomUUID();
   const runId = `A-${randomUUID()}`;
   const run = await initializeRun({
@@ -91,7 +41,7 @@ test("panel separates answering, stopping and ordinary continuation; public resu
   const ctx: any = { mode: "tui", sessionManager: { getSessionId: () => parent }, ui: { custom: async (factory: any) => {
     const component = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, undefined, (action: any) => actions.push(action));
     try {
-      assert.match(component.render(100).join("\n"), /A 回答问题/);
+      assert.doesNotMatch(component.render(100).join("\n"), /A 回答问题|C 继续|M 仅发信息/);
       assert.match(component.render(100).join("\n"), /X 停止/);
       component.handleInput("\r");
       assert.match(component.render(100).join("\n"), /是否保持兼容/);
@@ -103,12 +53,7 @@ test("panel separates answering, stopping and ordinary continuation; public resu
     return { action: "关闭" };
   } } };
   await showAgentPanel(ctx);
-  assert.deepEqual(actions, [
-    { action: "回答问题", runId, questionId: "question-1" },
-    { action: "继续", runId },
-    { action: "仅发信息", runId },
-    { action: "停止", runId },
-  ]);
+  assert.deepEqual(actions, [{ action: "停止", runId }]);
 });
 
 test("answered question stays historical while current result and events remain visible", async () => {
@@ -143,4 +88,14 @@ test("answered question stays historical while current result and events remain 
     return { action: "关闭" };
   } } };
   await showAgentPanel(ctx);
+});
+
+
+test("resume 与创建参数互斥；续接只接收原任务和本轮要求", () => {
+  assert.deepEqual(parseAgentInput({ resume: "A-original", prompt: "补齐检查" }), { resume: "A-original", prompt: "补齐检查", description: undefined });
+  for (const field of ["model", "subagent_type", "name", "run_in_background"]) {
+    assert.throws(() => parseAgentInput({ resume: "A-original", prompt: "检查", [field]: field === "run_in_background" ? true : "x" }), /不能同时指定/);
+  }
+  assert.throws(() => parseAgentInput({ prompt: "新建缺标题" }), /description/);
+  assert.throws(() => parseAgentInput({ resume: "A-original", prompt: " " }), /prompt/);
 });

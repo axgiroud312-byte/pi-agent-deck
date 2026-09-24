@@ -300,7 +300,7 @@ test("声明式扩展模型传入真实 Pi 子进程且隔离父扩展工具和�
     const run = await settled(id);
     assert.equal(run.status, "已完成", run.stderr);
     assert.equal(run.finalText, "LOCAL_PROVIDER_SUCCESS");
-    await h.call("SendMessage", { to: id, message: "再检查一次" });
+    await h.call("Agent", { resume: id, prompt: "再检查一次" });
     assert.equal((await settled(id)).status, "已完成");
     for (const name of await fs.readdir(runDirectory(id))) {
       if (!/\.(json|jsonl|log|md)$/.test(name)) continue;
@@ -315,7 +315,7 @@ test("声明式扩展模型传入真实 Pi 子进程且隔离父扩展工具和�
     assert.equal(request.headers["x-fixture"], "private-fixture-header");
     assert.equal(request.body.model, "review-model");
     const tools = request.body.tools.map((tool: any) => tool.function.name);
-    assert.ok(tools.includes("read")); assert.ok(tools.includes("agent_question"));
+    assert.ok(tools.includes("read")); assert.ok(tools.includes("agent_report"));
     for (const name of ["Agent", "SendMessage", "TaskStop", "parent_only_tool", "edit", "write", "bash"]) assert.ok(!tools.includes(name));
   }
 });
@@ -356,7 +356,7 @@ test("运行中的普通补充通过 RPC 送达，正文和顺序保留；结束
   assert.equal(done.childSessionId, original.childSessionId);
   assert.equal(done.model, original.model); assert.equal(done.thinking, original.thinking);
   assert.equal((await executions(h.cwd)).filter((item) => item.type === "steer").length, 2);
-  const next = receipt(await h.call("SendMessage", { to: id, message: "NEXT_TURN" }));
+  const next = receipt(await h.call("Agent", { resume: id, prompt: "NEXT_TURN" }));
   assert.equal(next.delivery, "resumed");
   const resumed = await until(async () => { const run = await readRun(id); return run?.status === "已完成" && run.turnId !== done.turnId ? run : undefined; });
   assert.match(resumed.finalText ?? "", /NEXT_TURN/);
@@ -366,28 +366,21 @@ test("运行中的普通补充通过 RPC 送达，正文和顺序保留；结束
   assert.equal((await executions(h.cwd)).filter((item) => item.type === "prompt").length, 2);
 });
 
-test("问题必须用匹配的 reply_to 回答；普通补充和错误 ID 均不解除等待", async (t) => {
+test("旧问答参数拒绝；空闲消息不启动，明确 resume 才开始", async (t) => {
   const h = await harness(t, 80);
-  const id = receipt(await h.call("Agent", { ...input, prompt: "ASK_COMPAT_CASE", name: "ask-compat", description: "兼容检查" })).agentId;
-  const waiting = await until(async () => { const run = await readRun(id); return run?.pendingQuestion?.id ? run : undefined; });
-  const questionId = waiting.pendingQuestion!.id;
-  assert.equal(waiting.status, "等待决定");
-  assert.equal(waiting.pendingQuestion?.question, "是否保持兼容？");
-  const ordinary = receipt(await h.call("SendMessage", { to: "ask-compat", message: "这里是背景补充" }));
-  assert.equal(ordinary.delivery, "queued");
-  assert.equal((await readRun(id))?.pendingQuestion?.id, questionId);
-  await assert.rejects(h.call("SendMessage", { to: id, message: "误答", reply_to: "question-wrong" }), /问题不存在|失效/);
-  assert.equal((await readRun(id))?.pendingQuestion?.id, questionId);
-  const answered = receipt(await h.call("SendMessage", { to: "ask-compat", message: "保持兼容", reply_to: questionId }));
-  assert.equal(answered.delivery, "queued");
+  const id = receipt(await h.call("Agent", { ...input, name: "old-task" })).agentId;
+  await assert.rejects(h.call("Agent", { resume: id, prompt: "过早续接" }), /运行/);
+  const original = await settled(id);
+  await assert.rejects(h.call("SendMessage", { to: id, message: "旧答复", reply_to: "old" }), /不再接受/);
+  const deferred = receipt(await h.call("SendMessage", { to: id, message: "仅供参考" }));
+  assert.equal(deferred.delivery, "deferred");
+  assert.equal((await readRun(id))?.turnId, original.turnId);
+  assert.equal((await executions(h.cwd)).filter((item) => item.type === "prompt").length, 1);
+  const resumed = receipt(await h.call("Agent", { resume: "old-task", prompt: "明确继续" }));
+  assert.equal(resumed.agentId, id);
   const done = await settled(id);
-  assert.equal(done.status, "已完成", done.stderr);
-  assert.equal(done.pendingQuestion, undefined);
-  assert.match(done.finalText ?? "", /ANSWER:保持兼容/);
-  assert.match(done.finalText ?? "", /这里是背景补充/);
-  assert.equal(done.childSessionId, waiting.childSessionId);
-  assert.deepEqual((await executions(h.cwd)).filter((item) => item.type === "answer").map((item) => item.value), ["保持兼容"]);
-  await assert.rejects(h.call("SendMessage", { to: id, message: "重复回答", reply_to: questionId }), /问题不存在|失效/);
+  assert.notEqual(done.turnId, original.turnId);
+  assert.match(done.finalText ?? "", /仅供参考/);
 });
 
 test("同工作区写任务可独立执行；TaskStop 清理消息并保留真实终态", async (t) => {
@@ -398,6 +391,7 @@ test("同工作区写任务可独立执行；TaskStop 清理消息并保留真�
   await until(async () => Boolean((await readRun(second.agentId))?.childPid));
   assert.equal((await readRun(first))?.writerLease, undefined);
   assert.equal((await readRun(second.agentId))?.status, "运行中");
+  await until(async () => (await executions(h.cwd)).filter((item) => item.type === "prompt").length === 2);
   await h.call("SendMessage", { to: "writer-two", message: "不应继续" });
   assert.equal(receipt(await h.call("TaskStop", { task_id: "writer-two" })).status, "stopped");
   assert.ok(!(await executions(h.cwd)).some((item) => item.type === "prompt" && String(item.message).includes("不应继续")));
@@ -412,7 +406,7 @@ test("旧记录没有新字段仍可读取、继续和停止；停止未确认�
   await h.handlers.get("session_shutdown")();
   delete old.description; delete old.instanceName;
   await writeJsonAtomic(path.join(runDirectory(id), "status.json"), old);
-  const resumed = receipt(await h.call("SendMessage", { to: id, message: "继续旧记录" }));
+  const resumed = receipt(await h.call("Agent", { resume: id, prompt: "继续旧记录", description: old.objective }));
   assert.equal(resumed.description, old.objective);
   const done = await settled(id);
   assert.equal(done.childSessionId, old.childSessionId);

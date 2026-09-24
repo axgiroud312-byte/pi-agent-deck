@@ -42,9 +42,9 @@ test("面板准确区分运行、排队、等答复和停止，主界面计数�
   const f = await runs(["运行中", "排队中", "排队中", "等待决定", "停止中", "失败"]);
   await withPanel(f.parent, (component) => {
     const output = component.render(110).join("\n");
-    assert.match(output, /运行 1 · 排队 2 · 等答复 1 · 停止中 1 · 异常 1/);
+    assert.match(output, /运行 1 · 历史排队 2 · 旧版等待 1 · 停止中 1 · 异常 1/);
     const fleet = renderFleet(f.values, 110, 24, theme).join("\n");
-    assert.match(fleet, /运行 1 · 排队 2 · 等答复 1/);
+    assert.match(fleet, /运行 1 · 历史排队 2 · 旧版等待 1/);
     assert.match(fleet, /另有 2 项/);
   });
 });
@@ -66,7 +66,7 @@ test("长中文任务名不挤掉状态和耗时，窄宽终端都不越界", as
   });
 });
 
-test("控制台区分执行结果与资源释放，并提供两种消息入口", async () => {
+test("控制台区分执行结果与资源释放，消息和续接按键不再产生操作", async () => {
   const f = await runs(["已完成"]);
   const run = { ...f.values[0], resourceState: "released", queuedMessageCount: 2 };
   await fs.writeFile(path.join(runDirectory(run.runId), "status.json"), JSON.stringify(run));
@@ -77,10 +77,10 @@ test("控制台区分执行结果与资源释放，并提供两种消息入口",
     assert.match(output, /已返回结果/);
     assert.match(output, /进程已释放/);
     assert.match(output, /暂存信息 2/);
-    assert.match(output, /M 仅发信息/);
+    assert.doesNotMatch(output, /M 仅发信息|C 继续/);
     component.handleInput("m");
     component.handleInput("c");
-    assert.deepEqual(actions, [{ action: "仅发信息", runId: run.runId }, { action: "继续", runId: run.runId }]);
+    assert.deepEqual(actions, []);
   });
 });
 
@@ -122,7 +122,7 @@ test("面板随终端高度扩大，分页与首尾键选择任务", async () =>
     component.handleInput("\u001b[F");
     assert.match(component.render(90).join("\n"), /显示 .*15 \/ 15/);
     component.handleInput("c");
-    assert.equal(actions.at(-1).action, "继续");
+    assert.deepEqual(actions, []);
     component.handleInput("\u001b[H");
     assert.match(component.render(90).join("\n"), /显示 1–/);
   });

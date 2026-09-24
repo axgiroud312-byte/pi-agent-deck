@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -180,11 +181,11 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
   const childPid = first.childPid;
   assert.equal(alive(childPid), false, "单轮完成后自动释放子 Pi");
 
-  const resumed = await sendToRun(fixture.runId, "SECOND");
-  assert.equal(resumed.delivery, "resumed");
-  assert.notEqual(resumed.run.turnId, firstTurn);
-  assert.equal(resumed.run.finalText, undefined);
-  assert.deepEqual(resumed.run.reports, []);
+  const resumed = await resumeFixtureRun(fixture.runId, "SECOND");
+  assert.equal(resumed.status, "运行中");
+  assert.notEqual(resumed.turnId, firstTurn);
+  assert.equal(resumed.finalText, undefined);
+  assert.deepEqual(resumed.reports, []);
   const second = await until(async () => {
     const run = await readRun(fixture.runId);
     return run?.status === "已完成" && run.resourceState === "released" && run.turnId !== firstTurn ? run : undefined;
@@ -199,7 +200,7 @@ test("QueueOnly 恰逢 settled 时未消费信息回到邮箱；下次继续只�
   await launchRunner(fixture.runId);
   await until(async () => (await readRun(fixture.runId))?.currentAction === "子 Agent 正在执行" ? true : undefined, "首条任务已提交");
   const before = (await readRun(fixture.runId))!;
-  await sendToRun(fixture.runId, "BOUNDARY_INFO", undefined, undefined, "QueueOnly");
+  await sendToRun(fixture.runId, "BOUNDARY_INFO");
   const first = await until(async () => {
     const run = await readRun(fixture.runId);
     return run?.status === "已完成" ? run : undefined;
@@ -208,7 +209,7 @@ test("QueueOnly 恰逢 settled 时未消费信息回到邮箱；下次继续只�
   assert.equal(first.finalText, "BOUNDARY_DONE");
   assert.equal(first.queuedMessageCount, 1);
   assert.equal(first.resourceState, "released");
-  await sendToRun(fixture.runId, "CONTINUE");
+  await resumeFixtureRun(fixture.runId, "CONTINUE");
   const second = await until(async () => {
     const run = await readRun(fixture.runId);
     return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined;

@@ -25,13 +25,14 @@ test("排队旧结果和已回答的问题标为历史，不修改保存的原�
   assert.equal(labelHistoricalMessage(message, run), message);
   const question = { ...run, status: "等待决定", pendingQuestion: { id: "q1", turnId: "first", question: "选哪个？", options: ["A", "B"] } };
   const asked = resultMessage(question, "parent")!;
-  assert.match(asked.content, /reply_to: q1/);
+  assert.match(asked.content, /resume/);
   assert.match(String(labelHistoricalMessage(asked, { ...run, status: "运行中" }).content), /历史通知/);
 });
 
 test("最终文本不会被同一轮已经回答的旧问题报告替代", () => {
   const completed = { ...run, reports: [{ type: "问题", blocking: true, summary: "旧问题", question: "旧问题", evidence: [], tests: [], risks: [] }] };
-  assert.equal(taskOutput(completed), "找到原因");
+  assert.match(taskOutput(completed), /找到原因/);
+  assert.doesNotMatch(taskOutput(completed), /旧问题/);
 });
 
 test("重载不补送旧结果或重放旧任务；当前会话边界仍有效", async () => {

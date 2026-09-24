@@ -1,3 +1,4 @@
+import { resumeFixtureRun } from "./fixtures/resume-fixture.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -86,8 +87,8 @@ test("独立写任务同工作区并行；完成释放进程后复用原会话�
   assert.equal(first.status, "已完成");
   const second = await finished(b);
   assert.equal(second.status, "已完成");
-  const resumed = await sendToRun(a, "继续已经完成的任务");
-  assert.equal(resumed.delivery, "resumed");
+  const resumed = await resumeFixtureRun(a, "继续已经完成的任务");
+  assert.equal(resumed.status, "运行中");
   const last = await until(async () => { const run = await readRun(a); return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined; }, "原会话续跑");
   assert.match(last.finalText ?? "", /继续已经完成的任务/);
   assert.equal(last.childPid, undefined);
