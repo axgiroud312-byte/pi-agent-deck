@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-deck",
-  "version": "0.12.0",
-  "description": "Pi 中文多 Agent 扩展：Claude 风格工具、后台任务面板、上下文续接与 Jev 模型/思考强度选配",
+  "version": "0.13.0",
+  "description": "Pi 原生子会话的轻量多 Agent 编排、前后台执行、角色扩展与显式续接",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -13,26 +13,14 @@
   "files": [
     "src",
     "agents",
+    "scripts/check-docs.mjs",
     "README.md",
     "DEVELOPMENT.md",
     "LICENSE",
     "docs/jev-routing.md",
-    "docs/0.8.0-release.md",
-    "docs/0.9.0-release.md",
-    "docs/0.9.1-release.md",
-    "docs/0.9.2-release.md",
-    "docs/evidence/0.9.0/tui-preview.html",
     "docs/publishing.md",
-    "docs/0.9.3-release.md",
-    "docs/evidence/0.9.3/jev-config-preview.html",
-    "docs/0.9.4-release.md",
-    "docs/0.10.0-release.md",
-    "docs/0.11.0-release.md",
-    "docs/0.11.0-optimization-plan.md",
-    "docs/0.12.0-release.md",
-    "docs/0.12.0-optimization-plan.md",
-    "docs/evidence/0.12.0/validation.md",
-    "docs/evidence/0.12.0/tui-session.txt"
+    "docs/0.13.0-release.md",
+    "docs/single-workspace-subagent-plan.md"
   ],
   "pi": {
     "extensions": [
@@ -40,6 +28,7 @@
     ]
   },
   "scripts": {
+    "docs:check": "node scripts/check-docs.mjs",
     "check": "tsc --noEmit && node --check src/router.mjs && node --check src/persistence.mjs && node --check src/jev-service.mjs",
     "test": "node --import ./test/environment.mjs --import tsx --test --test-concurrency=1 test/*.test.ts"
   },

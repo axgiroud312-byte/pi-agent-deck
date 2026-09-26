@@ -9,7 +9,7 @@ export const STATUS_VIEW: Record<RunStatus, { icon: string; label: string; color
   "运行中": { icon: "●", label: "运行中", color: "accent", order: 1 },
   "排队中": { icon: "○", label: "排队中", color: "muted", order: 3 },
   "等待批准": { icon: "◐", label: "等待批准", color: "warning", order: 0 },
-  "等待决定": { icon: "◐", label: "等答复", color: "warning", order: 0 },
+  "等待决定": { icon: "◐", label: "旧版待决定", color: "warning", order: 0 },
   "停止中": { icon: "◒", label: "停止中", color: "warning", order: 2 },
   "停止未确认": { icon: "!", label: "停止未确认", color: "error", order: 0 },
   "已完成": { icon: "✓", label: "已返回结果", color: "accent", order: 5 },
@@ -62,7 +62,7 @@ export function renderFleet(runs: PersistedRun[], width: number, height: number,
     lines.push(twoColumns(`${theme.fg(view.color, view.icon)} ${plain(runTitle(run))} · ${plain(runRoleLabel(run))}`, theme.fg(view.color, `${plain(executionLabel(run))} · ${view.label}`), width));
   }
   const rest = visible.length - maxRows;
-  lines.push(truncateToWidth(theme.fg("muted", `${rest > 0 ? `另有 ${rest} 项 · ` : ""}/agents 查看 · 最多 8 个活跃子任务 · 主 Agent 安排依赖顺序`), width));
+  lines.push(truncateToWidth(theme.fg("muted", `${rest > 0 ? `另有 ${rest} 项 · ` : ""}/agents 查看 · 并发与依赖由主 Agent 决定`), width));
   return lines;
 }
 

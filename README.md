@@ -1,20 +1,27 @@
 # Pi Agent Deck
 
-Pi 中文多 Agent 扩展，当前版本 **0.12.0**，MIT 许可证。
+Pi Agent Deck 是一个面向 Pi 的轻量多 Agent 扩展，当前版本 **0.13.0**，MIT 许可证。
 
-**主 Agent 澄清和派发 → 子 Agent 执行 → 返回结果并释放进程 → 主 Agent 验收。**
+它不在 Pi 之外再造一套 Agent 框架。主模型从 `Agent` 工具描述中看到可用角色、职责、工具范围和扩展数量，自行判断是否委派、派给谁、是否并行以及前台还是后台；运行时只负责建立独立 Pi 子会话、转发消息、保存结果和清理进程。
 
-用户始终在主会话提出需求。TUI 用于查看子任务真实进度和结果，不要求用户逐个管理或回答子 Agent。
+## 设计边界
+
+- 所有 Agent 使用调用者的同一工作目录。不创建 worktree，不自动合并，不实现任务 DAG、复杂队列或常驻调度服务。
+- 主 Agent 负责拆分任务、判断输入是否充分、选择角色和数量、安排顺序并最终验收。简单工作可以直接完成，不强制经过探索、实施、审查流水线。
+- “同一时间只让一个实施者修改正式交付文件”是给模型的协作约定，不是程序写锁。程序不解析 Bash，不拦截文件系统，也不根据模型或角色名称强制判定谁是实施者。
+- reviewer 和 scout 默认只排除 `edit`、`write`。它们可以使用 Bash、读取差异、运行合适的检查和测试；Bash 不等于实施权限。
+- 子 Agent 有独立 Pi 上下文。任务结束后进程释放，但任务记录和 Pi Session 保留；只有显式 `resume` 才继续原任务。
+- Jev 只选择模型和思考强度。角色、模型型号和 thinking 不构成任务硬门禁；Jev 无密钥、超时、返回无效或偏好模型不可用时，会在隔离子 Pi 能加载的兼容模型中回退。若一个兼容模型都没有，任务会在创建前明确失败。
 
 ## 安装与启用
 
-需要 Pi 0.87.1 或更新版本。本项目的实测基线为 Pi 0.87.1。
+需要 Pi 0.87.1 或更新版本。本项目的验证基线为 Pi 0.87.1。
 
 ```sh
 pi install git:github.com/axgiroud312-byte/pi-agent-deck
 ```
 
-已有 Git 安装可用 `pi update --extensions` 更新；本地源码安装直接使用对应目录。先通过 `pi list` 确认只保留一个加载入口。已有任务先等它们结束，再输入：
+已有 Git 安装可以使用 `pi update --extensions` 更新。本地源码使用对应项目目录。更新前先等待活动任务结束，再执行：
 
 ```text
 /reload
@@ -22,134 +29,192 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 /agents
 ```
 
-例如对主 Agent 说：“调查登录失败的原因，确认原因后修复并验证。独立的调查可以交给子 Agent。”
+本项目只注册三个公开任务工具：`Agent`、`SendMessage`、`TaskStop`。
 
-## 工作方式
+## 主模型怎样编排
 
-- 主 Agent 决定是否委派、任务数量、角色、分工、依赖和验收。每项任务写清目标、范围、交付和验收方法。关键需求不清楚时由主 Agent 向用户确认。
-- 子 Agent 在范围内自主作技术判断，只处理本次任务；无法继续时返回阻塞原因和已完成部分，不进入提问等待。
-- 独立工作并行，有先后依赖或共享接口的工作顺序执行。共享工作目录，不自动建立工作树或写锁。
-- 每个主会话最多 **8 个活跃子任务**。选配、执行和释放过程占位；第 9 个创建或续接请求报错，不自动排队。历史记录不占位。
-- 执行结束后自动释放进程。任务 ID、Pi 子会话和历史结果保留；主 Agent 根据证据独立验收。
-- 主 Pi 退出、重载或切换会话时结束其管理的子进程。已保存的子会话可明确续接，不自动恢复旧消息。
+`Agent` 的工具描述动态列出当前可用角色，例如：
 
-## 三个工具
+```text
+worker：实施最小修改并验证；tools=Pi 默认工具；排除=无
+scout：调查入口、调用链和证据；tools=Pi 默认工具；排除=edit, write
+reviewer：独立审查和运行检查；tools=Pi 默认工具；排除=edit, write
+```
 
-名称和基础字段参考 Claude 风格，行为以本文为准，不宣称完整 Claude Code 兼容。`resume` 是本插件的明确续接入口。
+同一段工具描述还告诉主模型：
 
-### Agent：新建或明确续接
+- 只委派适合独立处理的工作，任务提示应包含目标、范围和期望结果；
+- 同一模型轮次可以发起多个互不依赖的 `Agent` 调用；
+- 省略 `run_in_background` 时等待结果，传 `true` 时通常先返回任务 ID；若任务在初始工具调用返回前已经结束，则直接返回最终结果；
+- 运行中用 `SendMessage` 补充信息，结束后用 `Agent({ resume, prompt })` 明确续接；
+- `completed` 只表示子运行正常结束，不表示任务要求已经通过验收。
 
-新建：
+项目不会给主 system prompt 注入一整篇编排 Skill，也不会要求模型维护额外的计划状态机。
+
+## Agent：新建或明确续接
+
+新建任务：
 
 ```ts
 Agent({
   description: "调查登录失败",
-  prompt: "目标：定位登录失败原因。范围：只读调查登录链路。交付：原因、文件位置和依据。验收：给出可复现步骤或日志证据。",
+  prompt: "定位登录失败原因，给出文件位置、日志证据和仍不确定的部分。不要修改文件。",
   subagent_type: "Explore",
   name: "login-investigation"
 })
 ```
 
-新建必填 `description`、`prompt`。可选 `subagent_type`、`model`、`name`、`run_in_background: true`。默认角色 `general-purpose`。默认省略 model，由 Jev 选配；支持显式 provider/model 或已配置别名。
+新建时必填 `description`、`prompt`。可选字段为 `subagent_type`、`model`、`name`、`run_in_background`。
 
-同一任务的返工或补查，明确续接：
+- 省略 `run_in_background` 或传 `false`：前台等待当前轮正常结束、结果保存和进程清理，然后直接返回最终文本。
+- 传 `true`：通常立即返回任务 ID；同一条运行流程在后台执行。若任务极快结束，初始工具调用会直接返回最终结果且不再重复通知；否则完成后会尝试唤醒当前进程中仍处于活动状态的所属父会话。
+- 同一模型轮次的多个独立 `Agent` 工具调用可以并行。项目没有固定的 8 任务上限或内置排队器，实际并发由主模型和运行环境决定。
+
+后台结果始终落盘并可从 `/agents` 查看。切换到其他父会话或重载 Pi 后，旧会话不会补收内存中的完成通知。
+
+明确续接原任务：
 
 ```ts
 Agent({
   resume: "login-investigation",
-  prompt: "根据刚补充的失败日志，补齐原因判断和对应证据。",
-  description: "补查登录失败日志"
+  prompt: "结合刚补充的失败日志继续调查，并说明判断发生了什么变化。",
+  description: "补查刷新后的登录失败"
 })
 ```
 
-`resume` 接受当前主会话的任务 ID 或实例名称；必填本次 `prompt`，可选新标题。不能同时指定角色、模型、name 或 run_in_background。沿用原角色、模型、工具权限、任务 ID 和 Pi 子会话。每次续接有新的内部执行编号，本轮结果和检查从空状态开始，历史结果保留。
+`resume` 接受当前父会话中的任务 ID 或实例名称。续接复用原任务 ID、Pi Session、模型以及创建任务时保存的 `tools / disallowedTools / extensions`；角色文件之后的修改只影响新任务。会话文件丢失或损坏时会明确失败，不会偷偷创建空白上下文。
 
-运行中或释放中不能 resume；补充要求用 SendMessage。会话文件丢失或无效时明确报错，不偷偷创建没有原上下文的替代会话。不同目标新建任务；独立审查使用新的审查任务。
-
-### SendMessage：只补充信息
+## SendMessage：只补充，不暗中执行
 
 ```ts
-SendMessage({ to: "login-investigation", message: "补充：失败只发生在刷新页面后。", summary: "刷新后失败" })
+SendMessage({
+  to: "login-investigation",
+  message: "补充：失败只发生在刷新页面以后。",
+  summary: "刷新后失败"
+})
 ```
 
-保留 `to / message / summary?`。
+- 子任务正在运行：消息通过 Pi RPC steer 送入当前执行。
+- 子任务正在选配或启动：消息在当前进程内暂存，启动后送入。
+- 子任务已经结束：消息只暂存，不启动新一轮；主 Agent 必须显式 resume。
+- 暂存消息不承诺跨 Pi 重载恢复；回执“已排队”也不等于模型已经读到。
 
-- 运行中：通过 Pi `steer` 在工具结束、下一次模型请求前接收，不等整个任务结束。
-- 创建/选配中：当前主进程暂存，启动时送入。
-- 已结束：仅暂存信息，不启动进程；后续明确 resume 时带入。
-- 暂存信息仅在当前主 Pi 进程内存在，退出或重载不恢复。
-- 回执“已接收或排队”不等于模型已经读到。
+旧 `reply_to`、子 Agent 提问工具和挂起等待答复流程已经移除。关键输入不足时，子 Agent 应在最终文本中说明阻塞原因、已经完成的部分和需要主 Agent 决定的事项，然后结束本轮。
 
-内部仍区分 QueueOnly（传信息）与 TriggerTurn（新建/明确 resume），主 Agent 不再为普通消息选择启动模式。
-
-### TaskStop：停止当前执行
+## TaskStop：停止当前执行
 
 ```ts
 TaskStop({ task_id: "login-investigation" })
 ```
 
-清除待发送消息、停止当前执行并释放进程，保留会话和记录。已结束任务保留原终态。任务 ID、实例名称与角色 ID 是不同概念，不能用 `worker` 代替具体任务 ID。
+它会清除当前进程内的待发送消息、结束该任务的当前子进程并保留会话与记录。若进程退出无法确认，会显示“停止未确认”并保留进程身份，之后可以再次调用 `TaskStop`，不会假装已经释放。
 
-## 查看真实进度
+## 正常结束与 `completed`
 
-输入 `/agents` 或 `/agent-panel`。列表显示执行状态、进程状态和当前活动。选中任务按 Enter，进入同一 TUI 内的**只读子会话**：
+子 Agent 继续执行 Pi 原生的模型—工具循环，直到模型不再发出可执行工具调用且 Pi 报告本轮 settled。运行时拿到最后一段 assistant 文本后保存；只要没有模型、RPC、进程、扩展、持久化、超时、取消或停止错误，本轮就是 `completed`。
 
-| 按键 | 功能 |
-| --- | --- |
-| Enter | 打开子会话，默认查看真实对话和工具记录 |
-| 1 / 2 / 3 | 本次任务 / 子会话 / 本轮结果与历史结果 |
-| ↑↓、PgUp、PgDn | 滚动 |
-| End | 跟随最新输出 |
-| O | 展开或折叠长工具输出 |
-| Esc | 返回列表，再按一次返回主界面 |
-| X | 明确停止选中任务 |
-| N / G | 创建角色 / 打开配置 |
+运行时不会再次判断“任务要求是否全部做到了”。以下都可能是正常的 `completed`：
 
-查看页面不启动模型、不恢复任务、不切换主 Pi 会话，也不阻止进程结束。主 Agent 和其他子 Agent 继续工作。TUI 无子会话聊天、问题答复或续接输入框；需要调整任务时在主会话说明。
+- 完整结果；
+- “我做不到，因为缺少某个业务决定”；
+- 部分完成说明；
+- 空文本；
+- 没有 `message_end`、但 Pi 正常 settled。
 
-历史消息读取 Pi 会话的当前分支；执行中的公开文本从 RPC 消息事件显示。图片显示占位，模型内部思考不作为进度文本展示。旧任务缺少会话记录时显示已有活动记录。
+这不等于业务验收通过。主 Agent 直接阅读最终文本、子会话工具记录和错误信息，决定接受、补充信息、resume、重新委派或亲自处理。项目不再要求 `agent_report`，也不维护 `TaskResult`、结果完整性评分、检查声明或工具证据汇总等第二套语义。
 
-## 结果、验证与验收
+## 角色配置
 
-子 Agent 用简短的 `agent_report` 最终报告返回：完成/部分完成/阻塞、摘要、已完成部分、证据、检查和剩余工作。该工具直接结束本轮，不为格式化结果再请求一次模型。未使用结构化报告的自然语言结果仍可返回，但不会冒充验证通过。
+角色是普通 Markdown + YAML frontmatter。配置来源是 Pi 原生工具选择和扩展加载参数：
 
-面板与主 Agent 通知使用同一个结果格式：
+```md
+---
+id: security-reviewer
+name: 安全审查员
+description: 检查安全边界并给出文件和命令证据，不直接修改项目
+tools: [read, bash, grep, find, ls, SecurityProbe]
+disallowedTools: [edit, write]
+extensions:
+  - ../extensions/security-probe.ts
+model: inherit
+thinking: inherit
+timeoutMs: 0
+---
 
-```text
-执行状态：失败
-原因：模型请求失败
-已完成部分：文件写入 A（有工具记录）
-证据：子会话工具输出
-验证：未提供结构化验证记录
-剩余工作：需主 Agent 根据结果确认
-验收：由主 Agent 根据证据独立判断
+独立检查任务相关改动。优先给出可定位的证据；不要修改、创建或删除正式交付文件。
 ```
 
-正常返回不等于业务目标完成，子 Agent 自述的检查通过不等于主 Agent 已验收。调查任务发现 CI 失败可以正常交付调查结论；修复任务是否达到目标由验收方法决定。旧执行的迟到通知标为历史，不能覆盖本轮状态。
+字段含义：
 
-错误原因不会被先前的正常输出覆盖；结果保存失败会明确提示，同时继续清理进程。进程确认退出后才显示“已释放”。
+- `tools`：可选的 Pi 工具 allowlist。省略表示使用 Pi 默认工具，不是空工具集。扩展工具名保留大小写。
+- `disallowedTools`：交给 Pi 的 denylist，优先排除同名工具。只读角色通常配置 `[edit, write]`，无需禁用 Bash。
+- `extensions`：该角色明确加载的可信本地 Pi 扩展入口。相对路径以角色文件目录解析。
+- `model / thinking`：偏好值；省略或 `inherit` 时交给当前会话/Jev。不可用偏好会在兼容模型中软回退；若隔离子 Pi 没有任何可加载模型，则在创建任务前失败。
+- `timeoutMs`：任务时限；`0` 表示不限时。
+- 正文：角色职责和行为约束。是否修改项目主要由任务分工、角色提示词和主模型协调；程序不建立第二套实施者字段或写锁。
 
-## 角色与 Jev
+子进程以 `--no-extensions` 启动，只加载角色选择的扩展和 Agent Deck 必需的 provider bridge，不继承主 Pi 的全部扩展。工具选择直接交给 Pi 的 `--tools / --exclude-tools`。项目不解析扩展源码，也不建立 `capabilities.json` 来源握手；真实扩展加载或执行错误会作为运行错误保存并返回。
 
-内置角色：`worker / general-purpose` 实现，`scout / Explore` 只读调查，`reviewer` 只读审查。派发前主 Agent 可看到实际工具能力；scout 和 reviewer 没有 bash，不能执行测试。
+内置 provider 和 `models.json` 可直接供子 Pi 使用；扩展注册的 provider 只有在配置可完整序列化时才能桥接。原生 provider 或含函数、`symbol`、`bigint` 的配置当前不能传入隔离子进程，这是一项技术兼容限制，不是模型或角色白名单。
 
-Jev 只为已经定义好的任务选择模型和思考强度，不拆任务、不决定数量。
+旧角色中的 `writePermission` 和 `reportProfile` 只为历史读取兼容。`writePermission: false` 会迁移成排除 `edit`、`write`；配置编辑器再次保存时会移除这两个旧字段。新角色不要再写它们。
 
-- 子 Agent 禁用 GPT-6 Astra。
-- 审查角色只用 GPT-5.6 Sol，最低 xhigh；非审查角色不使用 5.6 Sol。
-- GPT-6 Sol、GPT-6 Luna 最低 high。
-- 续接沿用原模型，不重新调用 Jev；执行前继续检查已有模型策略。
+角色读取优先级：内置 `agents/*.md` → 个人 Agent 目录 → 已信任项目的 `.pi/agents/*.md`。`/agent-create 描述` 可生成角色，`/agent-config 角色ID` 可分别编辑工具、排除项和扩展。
 
-`/agent-config` 可视化配置角色和全局设置；`/agent-router` 或 `/agent-config jev` 打开 Jev 配置；`/agent-route-test Explore 调查登录问题` 只试选，不创建任务。详细配置见 [Jev 配置](docs/jev-routing.md)。
+## Jev
 
-`/agent-create 描述` 可创建角色。角色读取优先级：内置 `agents/*.md` → 个人 `~/.pi/agent/agents/*.md` → 可信项目 `.pi/agents/*.md`。角色变更用于新建任务，续接保留原角色。
+Jev 接收已经确定的任务、角色说明、可选工具范围以及隔离子 Pi 可加载的模型/思考组合，只返回模型与 thinking 选择。它不会拆任务、指定角色、决定 Agent 数量或评价最终结果。
 
-其他命令：`/agent-deck [开启|关闭|状态]`、`/agent-stop 任务ID`、`/agent-roles`、`/agent-doctor`。旧 `/agent-continue` 只给迁移提示，不再执行任务。
+- 显式且当前可用的模型/思考配置优先；
+- 兼容模型从当前 Pi 可用模型中动态形成候选，不按 Astra、reviewer、Sol/Luna 等名称硬过滤；
+- 不支持的 thinking 由 Pi 能力映射到可用档位；
+- Jev 无密钥、超时、HTTP 错误或返回无效时沿用兼容回退配置并继续；没有兼容模型时不创建任务。
 
-## 从 0.11.0 升级
+`/agent-router` 或 `/agent-config jev` 打开配置；`/agent-route-test Explore 调查登录问题` 只试选，不创建子任务。详细说明见 [Jev 路由](docs/jev-routing.md)。
 
-这是一次有意收紧的接口变更：SendMessage 不再接受 `delivery` 和 `reply_to`，旧调用会明确提示使用 Agent.resume；子 Agent 的 `agent_question` 与等待答复流程已移除。旧角色中的问题工具声明会被过滤。
+## 数据与历史兼容
 
-旧会话和历史报告不删除，旧队列不重放。旧任务首次 resume 更新插件的执行约定和已移除工具，保留原角色内容、模型与 Pi 会话。请在现有任务结束后更新并 `/reload`，不迁移运行中的旧进程。
+当前记录版本是 v3，核心关系很小：
 
-[优化计划](docs/0.12.0-optimization-plan.md) · [发布说明](docs/0.12.0-release.md) · [开发约定](DEVELOPMENT.md)
+```text
+角色定义 roleId
+  └─ 任务 runId（保存角色工具/扩展快照和一个 Pi childSession）
+       └─ 执行轮次 turnId（前台或后台、状态、最终文本、错误和用量）
+```
+
+- `request.json` 保存可明确 resume 的 Pi 启动配置；
+- `status.json` 保存当前任务和轮次状态；
+- `results/*.json` 保存每轮终态快照；
+- Pi Session JSONL 保存真实消息和工具调用。
+
+扩展注册的声明式 provider 配置会按任务保存到 Pi 个人目录 `agent-deck/providers/<runId>.json`，供隔离子进程和以后 resume 复用。任务记录只保存该快照路径，但快照本身可能含 API key 或自定义 header；它属于私密认证状态，不进入项目或 npm 包，也不应提交、分享或复制到公开位置。
+
+v1/v2 旧问答、报告、租约、`writePermission`、结构化结果和工具证据只投影到 `legacy` 供读取，不会恢复旧协议。启动时不批量改写历史；只有显式 resume 才把当前任务迁移到 v3，并移除已退役的 `agent_question / agent_report` 工具。
+
+## 查看与命令
+
+`/agents` 或 `/agent-panel` 打开只读任务面板：
+
+- Enter 查看任务、真实子会话和结果；
+- `1 / 2 / 3` 切换任务说明、实时记录、结果；
+- `O` 展开或折叠长工具输出；
+- `X` 停止当前任务；
+- `N / G` 创建角色或打开配置。
+
+查看不会启动模型、resume 任务或改写子会话。
+
+其他命令：`/agent-deck [开启|关闭|状态]`、`/agent-stop 任务ID`、`/agent-roles`、`/agent-doctor`。旧 `/agent-continue` 只显示迁移提示。
+
+## 开发与验证
+
+```sh
+npm run check
+npm test
+npm run docs:check
+npm pack --dry-run --json
+git diff --check
+```
+
+本地测试把“模拟 RPC 状态机”“真实 Pi 宿主 + 本地受控 provider/扩展”“在线真实模型”分开记录；前两层可自动重复，默认测试不会发起付费在线模型请求。
+
+[0.13.0 发布说明](docs/0.13.0-release.md) · [0.13.0 验证记录](https://github.com/axgiroud312-byte/pi-agent-deck/blob/main/docs/0.13.0-validation.md) · [P0—P6 计划与进度](docs/single-workspace-subagent-plan.md) · [开发约定](DEVELOPMENT.md) · [0.12.0 历史计划](https://github.com/axgiroud312-byte/pi-agent-deck/blob/main/docs/0.12.0-optimization-plan.md)

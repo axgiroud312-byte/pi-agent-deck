@@ -8,7 +8,6 @@ import agentDeck from "../src/index.ts";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const indexSource = fs.readFileSync(path.join(root, "src/index.ts"), "utf8");
 const uiSource = fs.readFileSync(path.join(root, "src/ui.ts"), "utf8");
-const waitPolicySource = fs.readFileSync(path.join(root, "src/wait-policy.ts"), "utf8");
 
 test("保留兼容面板入口，不注册全局快捷键", () => {
   assert.match(indexSource, /registerCommand\("agent-panel"/);

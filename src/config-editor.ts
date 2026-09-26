@@ -3,11 +3,10 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getAgentDir, parseFrontmatter, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
-import { parseAgentDefinition, validateAgentDefinition } from "./agents.ts";
+import { normalizeToolName, parseAgentDefinition, parseLegacyWritePermission, parseStringList, validateAgentDefinition } from "./agents.ts";
 import { parseDeckConfig, readDeckConfig, writeDeckConfig, type DeckConfig } from "./config.ts";
 import { frame, plain } from "./presentation.ts";
 import { withDiskLock } from "./persistence.mjs";
-import { EXECUTION_POLICY } from "./router.mjs";
 import type { AgentDefinition } from "./types.ts";
 import { selectMenu as choose } from "./menu.ts";
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -51,7 +50,7 @@ export async function editGlobalConfig(ctx: ExtensionContext, changed: (ctx: Ext
       const value = await choose(ctx, "允许主 Agent 派遣新任务", [{ value: true, label: "开启" }, { value: false, label: "关闭" }]);
       if (value !== undefined) draft.enabled = value;
     } else if (action === "routing") {
-      const value = await choose(ctx, "让 Jev 选择新任务的模型与思考强度", [{ value: true, label: "开启" }, { value: false, label: "关闭，使用合规回退配置" }]);
+      const value = await choose(ctx, "让 Jev 选择新任务的模型与思考强度", [{ value: true, label: "开启" }, { value: false, label: "关闭，沿用角色或主会话配置" }]);
       if (value !== undefined) draft.routing.enabled = value;
     } else if (action === "timeout") {
       const value = await chooseDuration(ctx, draft.timeoutMs, false);
@@ -81,8 +80,9 @@ export async function editGlobalConfig(ctx: ExtensionContext, changed: (ctx: Ext
 const TOOL_LABELS: Record<string, string> = { read: "读取文件", grep: "搜索内容", find: "查找文件", ls: "查看目录", edit: "修改已有文件", write: "写入文件", bash: "运行命令（可以修改文件）" };
 export async function selectAgentTools(ctx: ExtensionContext, initial: string[]): Promise<string[] | undefined> {
   return ctx.ui.custom<string[] | undefined>((tui, theme, _keys, done) => {
-    const tools = ["read", "grep", "find", "ls", "edit", "write", "bash"];
-    const selected = new Set(initial.filter((tool) => tools.includes(tool)));
+    const builtins = ["read", "grep", "find", "ls", "edit", "write", "bash"];
+    const tools = [...builtins, ...initial.filter((tool) => !builtins.includes(tool))];
+    const selected = new Set(initial);
     let cursor = 0;
     return {
       render(width: number) {
@@ -91,7 +91,7 @@ export async function selectAgentTools(ctx: ExtensionContext, initial: string[])
         const lines = [`已选 ${selected.size} 个工具`, ""];
         for (let index = start; index < start + count; index++) {
           const tool = tools[index];
-          const line = `${index === cursor ? "›" : " "} ${selected.has(tool) ? "[✓]" : "[ ]"} ${TOOL_LABELS[tool]} · ${tool}`;
+          const line = `${index === cursor ? "›" : " "} ${selected.has(tool) ? "[✓]" : "[ ]"} ${TOOL_LABELS[tool] ?? "扩展工具"} · ${tool}`;
           lines.push(index === cursor ? theme.fg("accent", line) : line);
         }
         lines.push("", theme.fg("muted", "↑↓ 选择 · 空格 勾选 · Enter 应用 · Esc 取消"));
@@ -117,10 +117,10 @@ async function readOptional(file: string): Promise<string | undefined> {
 }
 
 async function chooseModel(ctx: ExtensionContext): Promise<string | undefined> {
-  const models = ctx.modelRegistry.getAvailable().filter((model) => !EXECUTION_POLICY.disabledModels.includes(model.id));
+  const models = ctx.modelRegistry.getAvailable();
   const providers = [...new Set(models.map((model) => model.provider))].sort();
   const provider = await choose(ctx, "选择模型来源", [
-    { value: "inherit", label: "自动选配（始终遵守角色策略）" },
+    { value: "inherit", label: "继承或交给 Jev 选配" },
     ...providers.map((value) => ({ value, label: value })),
   ]);
   if (!provider || provider === "inherit") return provider;
@@ -138,6 +138,19 @@ export async function editAgentConfig(ctx: ExtensionContext, agent: AgentDefinit
     let fields: Record<string, unknown>, body: string, definition: AgentDefinition;
     try {
       ({ frontmatter: fields, body } = parseFrontmatter<Record<string, unknown>>(text));
+      if ("writePermission" in fields || "reportProfile" in fields) {
+        const legacyWritePermission = "writePermission" in fields ? parseLegacyWritePermission(fields.writePermission) : undefined;
+        if ("writePermission" in fields && legacyWritePermission === undefined) throw new Error("writePermission 必须是布尔值");
+        if (legacyWritePermission === false) {
+          const rawDenied = fields.disallowedTools;
+          if (rawDenied !== undefined && typeof rawDenied !== "string" && (!Array.isArray(rawDenied) || rawDenied.some((item) => typeof item !== "string"))) throw new Error("disallowedTools 必须是工具名列表");
+          const denied = (parseStringList(rawDenied) ?? []).map(normalizeToolName);
+          fields.disallowedTools = [...new Set([...denied, "edit", "write"])];
+        }
+        delete fields.writePermission;
+        delete fields.reportProfile;
+        text = serialize(fields, body);
+      }
       definition = parseAgentDefinition(text, destination, agent.source === "项目" ? "项目" : "用户");
     } catch (error) {
       ctx.ui.notify(`配置需要修正：${errorText(error)}`, "warning");
@@ -146,9 +159,12 @@ export async function editAgentConfig(ctx: ExtensionContext, agent: AgentDefinit
       text = edited; continue;
     }
     if (!action) action = await choose(ctx, `${plain(definition.name)}${text !== original ? " · 未保存" : ""}`, [
-      { value: "model", label: `模型         ${definition.model ?? "自动选配（遵守角色策略）"}` },
-      { value: "thinking", label: `思考强度     ${definition.thinking ?? "自动选配（遵守角色策略）"}` },
-      { value: "tools", label: `工具         ${definition.tools?.length ?? 0} 项 · ${definition.writePermission ? "含写入/命令" : "只读"}` },
+      { value: "model", label: `模型         ${definition.model ?? "继承或 Jev 选配"}` },
+      { value: "thinking", label: `思考强度     ${definition.thinking ?? "继承或 Jev 选配"}` },
+      { value: "tools", label: `工具         ${definition.tools ? `${definition.tools.length} 项` : "Pi 默认"}` },
+      { value: "toolNames", label: "工具名称     编辑内置及扩展工具" },
+      { value: "disallowedTools", label: `排除工具     ${definition.disallowedTools?.length ?? 0} 项` },
+      { value: "extensions", label: `扩展         ${definition.extensions.length} 项` },
       { value: "timeout", label: `执行时限     ${duration(definition.timeoutMs)}` },
       { value: "prompt", label: "编辑角色提示词" }, { value: "description", label: "编辑调用描述" }, { value: "name", label: "修改显示名称" },
       { value: "save", label: "保存并返回" }, { value: "raw", label: "高级：编辑完整配置" }, { value: "cancel", label: "返回，不保存" },
@@ -159,13 +175,32 @@ export async function editAgentConfig(ctx: ExtensionContext, agent: AgentDefinit
       const model = await chooseModel(ctx);
       if (model) { fields.model = model; text = serialize(fields, body); }
     } else if (action === "thinking") {
-      const level = await choose(ctx, "思考强度（保存时检查角色和模型策略）", [
-        { value: "inherit", label: "自动选配（遵守角色策略）" }, { value: "off", label: "关闭 · off（需符合模型策略）" }, { value: "minimal", label: "最低 · minimal（由模型映射）" }, { value: "low", label: "低 · low" }, { value: "medium", label: "中 · medium" }, { value: "high", label: "高 · high" }, { value: "xhigh", label: "更高 · xhigh" }, { value: "max", label: "最高 · max" },
+      const level = await choose(ctx, "思考强度", [
+        { value: "inherit", label: "继承或交给 Jev 选配" }, { value: "off", label: "关闭 · off" }, { value: "minimal", label: "最低 · minimal（由模型映射）" }, { value: "low", label: "低 · low" }, { value: "medium", label: "中 · medium" }, { value: "high", label: "高 · high" }, { value: "xhigh", label: "更高 · xhigh" }, { value: "max", label: "最高 · max" },
       ]);
       if (level) { fields.thinking = level; text = serialize(fields, body); }
     } else if (action === "tools") {
       const tools = await selectAgentTools(ctx, definition.tools ?? []);
-      if (tools) { fields.tools = tools; delete fields.disallowedTools; delete fields.writePermission; text = serialize(fields, body); }
+      if (tools) { fields.tools = tools; text = serialize(fields, body); }
+    } else if (action === "toolNames") {
+      const edited = await ctx.ui.editor("工具名称（每行或逗号分隔；扩展工具大小写敏感）", (definition.tools ?? []).join("\n"));
+      if (edited !== undefined) {
+        fields.tools = edited.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
+        text = serialize(fields, body);
+      }
+    } else if (action === "disallowedTools") {
+      const edited = await ctx.ui.editor("排除工具（每行或逗号分隔；优先于允许工具）", (definition.disallowedTools ?? []).join("\n"));
+      if (edited !== undefined) {
+        fields.disallowedTools = edited.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
+        text = serialize(fields, body);
+      }
+    } else if (action === "extensions") {
+      const configured = Array.isArray(fields.extensions) ? fields.extensions.filter((item): item is string => typeof item === "string") : typeof fields.extensions === "string" ? fields.extensions.split(",").map((item) => item.trim()).filter(Boolean) : [];
+      const edited = await ctx.ui.editor("本地扩展入口（每行一个；相对路径以角色文件为准）", configured.join("\n"));
+      if (edited !== undefined) {
+        fields.extensions = edited.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+        text = serialize(fields, body);
+      }
     } else if (action === "timeout") {
       const value = await chooseDuration(ctx, definition.timeoutMs, true);
       if (value) { fields.timeoutMs = value.value; text = serialize(fields, body); }

@@ -1,6 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
+export interface RpcCloseTimeouts {
+  gracefulMs: number;
+  taskkillMs: number;
+  confirmMs: number;
+}
+const DEFAULT_CLOSE_TIMEOUTS: RpcCloseTimeouts = { gracefulMs: 1500, taskkillMs: 3000, confirmMs: 3000 };
+
 /** One owned Pi process speaking Pi's existing JSONL RPC protocol. No message replay. */
 export class RpcConnection {
   readonly child: ChildProcessWithoutNullStreams;
@@ -9,10 +16,12 @@ export class RpcConnection {
   private failure?: Error;
   private closing = false;
   private closePromise?: Promise<void>;
+  private closeTimeouts: RpcCloseTimeouts;
   private pending = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
 
   constructor(command: string, args: string[], cwd: string, env: Record<string, string> | undefined,
-    onEvent: (event: any) => void, onExit: (error: Error) => void) {
+    onEvent: (event: any) => void, onExit: (error: Error) => void, closeTimeouts: Partial<RpcCloseTimeouts> = {}) {
+    this.closeTimeouts = { ...DEFAULT_CLOSE_TIMEOUTS, ...closeTimeouts };
     this.child = spawn(command, args, { cwd, env: { ...process.env, ...env }, windowsHide: true, shell: false, stdio: "pipe" });
     // Install every listener before awaiting anything: a local child may finish immediately.
     const parseLine = (line: string) => {
@@ -66,8 +75,9 @@ export class RpcConnection {
     });
   }
 
-  reply(id: string, value?: string): Promise<void> {
-    return this.write({ type: "extension_ui_response", id, ...(value === undefined ? { cancelled: true } : { value }) });
+  /** Cancel an RPC-only extension UI request so a child cannot hang for input. */
+  cancelUiRequest(id: string): Promise<void> {
+    return this.write({ type: "extension_ui_response", id, cancelled: true });
   }
 
   private write(value: unknown): Promise<void> {
@@ -76,24 +86,43 @@ export class RpcConnection {
   }
 
   close(): Promise<void> {
-    return this.closePromise ??= this.closeOwned();
+    if (this.closePromise) return this.closePromise;
+    const attempt = this.closeOwned();
+    this.closePromise = attempt.catch((error) => {
+      this.closePromise = undefined; // A failed close must be retryable by TaskStop.
+      throw error;
+    });
+    return this.closePromise;
   }
 
   private async closeOwned(): Promise<void> {
     this.closing = true;
-    this.child.stdin.end(); // Pi shuts its session down on EOF.
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([this.closed, new Promise<void>((resolve) => { timer = setTimeout(resolve, 1500); })]);
-    clearTimeout(timer);
+    if (!this.child.stdin.writableEnded) this.child.stdin.end(); // Pi shuts its session down on EOF.
+    if (await this.waitForClose(this.closeTimeouts.gracefulMs)) return;
     if (this.child.exitCode === null && this.child.signalCode === null) {
       if (process.platform === "win32" && this.child.pid) {
         await new Promise<void>((resolve) => {
           const killer = spawn("taskkill", ["/PID", String(this.child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-          killer.once("error", () => { this.child.kill(); resolve(); });
-          killer.once("close", () => resolve());
+          let settled = false;
+          const finish = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+          const timer = setTimeout(() => { killer.kill(); this.child.kill(); finish(); }, this.closeTimeouts.taskkillMs);
+          killer.once("error", () => { this.child.kill(); finish(); });
+          killer.once("close", finish);
         });
       } else this.child.kill("SIGKILL");
     }
-    await this.closed;
+    if (!await this.waitForClose(this.closeTimeouts.confirmMs)) {
+      throw new Error(`子 Pi 进程退出未确认（PID ${this.child.pid ?? "未知"}）；请用 TaskStop 重试。`);
+    }
+  }
+
+  private async waitForClose(timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    const result = await Promise.race([
+      this.closed.then(() => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs)); }),
+    ]);
+    clearTimeout(timer);
+    return result;
   }
 }

@@ -14,14 +14,10 @@ test("消息参数只保留收件任务、正文与摘要；旧问答参数明�
   assert.throws(() => parseMessageInput({ to: "worker", message: "答复", reply_to: "q" }), /不再接受/);
 });
 
-test("子 Agent 只提交最终报告，不注册问题工具或等待用户输入", async () => {
+test("子 Agent 运行桥不注册报告或问答工具，最终文本由 Pi 原生循环产生", () => {
   const tools = new Map<string, any>();
   childRuntime({ registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
-  assert.deepEqual([...tools.keys()], ["agent_report"]);
-  const report = { outcome: "阻塞", summary: "缺少业务决定", completed: [], evidence: [], checks: [], remaining: ["需要主 Agent 决策"] };
-  const result = await tools.get("agent_report").execute("call", report);
-  assert.equal(result.terminate, true);
-  assert.deepEqual(result.details.taskResult, report);
+  assert.deepEqual([...tools.keys()], []);
 });
 
 test("只读面板保留旧问题记录，移除答复和续接输入，仅允许明确停止", async () => {
@@ -34,8 +30,9 @@ test("只读面板保留旧问题记录，移除答复和续接输入，仅允�
     reports: [], events: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
     pendingQuestion: { id: "question-1", turnId: "turn-1", question: "是否保持兼容？", options: ["保持", "移除"] },
   } as any, { version: 1, cwd: getAgentDir(), command: process.execPath, argsPrefix: [], prompt: "fixture" } as any, true);
-  assert.deepEqual(publicTaskResult(run, "请回答").pendingQuestion, run.pendingQuestion);
-  assert.equal("pendingQuestion" in publicTaskResult({ ...run, pendingQuestion: undefined }, "普通补充"), false);
+  assert.deepEqual(publicTaskResult(run, "请回答").pendingQuestion, run.legacy?.pendingQuestion);
+  assert.equal("pendingQuestion" in publicTaskResult({ ...run, legacy: { ...run.legacy, pendingQuestion: undefined } }, "普通补充"), false);
+  assert.equal("pendingQuestion" in publicTaskResult({ ...run, version: 3, status: "已完成" }, "新一轮结果"), false);
   const actions: any[] = [];
   const theme: any = { fg: (_name: string, value: string) => value, bg: (_name: string, value: string) => value, bold: (value: string) => value };
   const ctx: any = { mode: "tui", sessionManager: { getSessionId: () => parent }, ui: { custom: async (factory: any) => {
@@ -92,10 +89,12 @@ test("answered question stays historical while current result and events remain 
 
 
 test("resume 与创建参数互斥；续接只接收原任务和本轮要求", () => {
-  assert.deepEqual(parseAgentInput({ resume: "A-original", prompt: "补齐检查" }), { resume: "A-original", prompt: "补齐检查", description: undefined });
-  for (const field of ["model", "subagent_type", "name", "run_in_background"]) {
-    assert.throws(() => parseAgentInput({ resume: "A-original", prompt: "检查", [field]: field === "run_in_background" ? true : "x" }), /不能同时指定/);
+  assert.deepEqual(parseAgentInput({ resume: "A-original", prompt: "补齐检查" }), { resume: "A-original", prompt: "补齐检查", description: undefined, run_in_background: false });
+  assert.equal(parseAgentInput({ resume: "A-original", prompt: "后台补查", run_in_background: true }).run_in_background, true);
+  for (const field of ["model", "subagent_type", "name"]) {
+    assert.throws(() => parseAgentInput({ resume: "A-original", prompt: "检查", [field]: "x" }), /不能同时指定/);
   }
+  assert.equal(parseAgentInput({ description: "前台", prompt: "检查", run_in_background: false }).run_in_background, false);
   assert.throws(() => parseAgentInput({ prompt: "新建缺标题" }), /description/);
   assert.throws(() => parseAgentInput({ resume: "A-original", prompt: " " }), /prompt/);
 });

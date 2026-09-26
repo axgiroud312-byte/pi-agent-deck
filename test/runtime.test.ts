@@ -13,32 +13,31 @@ import {
   sendToRun,
   shutdownRuns,
   stopRun,
-  waitForRun,
+  waitForRunTurn,
   writeJsonAtomic,
 } from "../src/runtime.ts";
-import { activeRunCount } from "../src/run-capacity.ts";
+import { readCompletions } from "../src/persistence.mjs";
 
 function details(runId: string, cwd: string, overrides: Record<string, unknown> = {}): any {
   return {
-    version: 1,
+    version: 3,
     runId,
-    agentId: "windows-test",
+    roleId: "windows-test",
     agentName: "Windows 测试 Agent",
     agentSource: "内置",
     objective: "验证主 Pi 直接管理子进程",
     instruction: "测试",
-    acceptanceCriteria: [],
     status: "运行中",
     model: "test/model",
     thinking: "off",
     tools: [],
-    writePermission: false,
+    disallowedTools: [],
+    extensions: [],
     cwd,
     parentSessionId: `parent-${runId}`,
     childSessionId: randomUUID(),
     childSessionPath: path.join(cwd, "child.jsonl"),
     startedAt: Date.now(),
-    reports: [],
     events: [],
     usage: {
       input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -92,7 +91,8 @@ lines.on("line", (line) => {
     send({ type: "response", id: request.id, command: request.type, success: true, data: {} });
     if (String(request.message).includes("HOLD") || request.message === "BOUNDARY") return;
     setTimeout(() => {
-      send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "TURN_" + turn + ":" + request.message }] } });
+      const input = String(request.message).includes("SECOND") ? 22 : 11;
+      send({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "TURN_" + turn + ":" + request.message }], usage: { input, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: input + 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } });
       send({ type: "agent_settled" });
     }, 30);
   }
@@ -101,12 +101,11 @@ lines.on("close", () => process.exit(0));
 `, "utf8");
   const run = details(runId, cwd);
   await initializeRun(run, {
-    version: 1,
+    version: 3,
     cwd,
     command: process.execPath,
     argsPrefix: [script],
     prompt,
-    naturalOutput: true,
   }, true);
   t.after(async () => {
     await shutdownRuns(run.parentSessionId);
@@ -125,9 +124,29 @@ test("取消等待不会停止主 Pi 持有的后台子进程", async (t) => {
   }, "子进程启动");
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(waitForRun(fixture.runId, { signal: controller.signal }), /仍在后台运行/);
+  await assert.rejects(waitForRunTurn(fixture.runId, active.turnId!, { signal: controller.signal }), /仍在后台运行/);
   assert.equal((await readRun(fixture.runId))?.status, "运行中");
   assert.equal(alive(active.childPid), true);
+});
+
+test("旧轮前台等待被取消时不能停止已经开始的新轮", async (t) => {
+  const fixture = await rpcFixture(t, "FIRST");
+  await launchRunner(fixture.runId);
+  const first = await until(async () => {
+    const run = await readRun(fixture.runId);
+    return run?.status === "已完成" ? run : undefined;
+  }, "首轮完成");
+  const second = await resumeFixtureRun(fixture.runId, "HOLD");
+  assert.notEqual(second.turnId, first.turnId);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    waitForRunTurn(fixture.runId, first.turnId!, { signal: controller.signal, stopOnAbort: true }),
+    /已进入其他执行轮次/,
+  );
+  const current = await readRun(fixture.runId);
+  assert.equal(current?.turnId, second.turnId);
+  assert.equal(current?.status, "运行中");
 });
 
 test("停止任务会结束实际子进程并保留任务记录", { skip: process.platform !== "win32" }, async (t) => {
@@ -145,14 +164,13 @@ test("停止任务会结束实际子进程并保留任务记录", { skip: proces
   assert.equal(fs.existsSync(path.join(runDirectory(fixture.runId), "status.json")), true);
 });
 
-test("旧任务 request 损坏时不会先占用执行槽位", async (t) => {
+test("任务 request 损坏时不会改写原任务状态", async (t) => {
   const runId = `test-corrupt-request-${randomUUID()}`;
   const cwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agent-deck-corrupt-request-"));
   const directory = runDirectory(runId);
   await fs.promises.mkdir(directory, { recursive: true });
   await writeJsonAtomic(path.join(directory, "status.json"), details(runId, cwd, {
-    writePermission: true,
-    status: "等待决定",
+    status: "已完成",
     ownerPid: undefined,
     childPid: undefined,
     runnerPid: undefined,
@@ -164,8 +182,9 @@ test("旧任务 request 损坏时不会先占用执行槽位", async (t) => {
     await fs.promises.rm(cwd, { recursive: true, force: true });
   });
 
+  const before = await fs.promises.readFile(path.join(directory, "status.json"), "utf8");
   await assert.rejects(sendToRun(runId, "继续"), /JSON|Unexpected|position|property/i);
-  assert.equal(activeRunCount(`parent-${runId}`), 0);
+  assert.equal(await fs.promises.readFile(path.join(directory, "status.json"), "utf8"), before);
 });
 
 test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t) => {
@@ -176,6 +195,7 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
     return run?.status === "已完成" && run.resourceState === "released" ? run : undefined;
   }, "第一轮完成");
   assert.match(first.finalText ?? "", /^TURN_1:FIRST$/);
+  assert.equal(first.usage.input, 11);
   const firstTurn = first.turnId;
   const firstSession = first.childSessionId;
   const childPid = first.childPid;
@@ -183,14 +203,19 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
 
   const resumed = await resumeFixtureRun(fixture.runId, "SECOND");
   assert.equal(resumed.status, "运行中");
+  assert.equal(resumed.version, 3);
+  assert.equal(resumed.roleId, "windows-test");
+  assert.equal(resumed.legacy, undefined);
   assert.notEqual(resumed.turnId, firstTurn);
   assert.equal(resumed.finalText, undefined);
-  assert.deepEqual(resumed.reports, []);
   const second = await until(async () => {
     const run = await readRun(fixture.runId);
     return run?.status === "已完成" && run.resourceState === "released" && run.turnId !== firstTurn ? run : undefined;
   }, "第二轮完成");
   assert.match(second.finalText ?? "", /^TURN_1:SECOND$/); // A fresh process reopens the same session.
+  assert.equal(second.usage.input, 22, "每次 resume 必须重新统计当前轮，而不是累加旧轮");
+  const history = await readCompletions(runDirectory(fixture.runId));
+  assert.deepEqual(history.map((item: any) => item.usage.input), [11, 22]);
   assert.equal(second.childSessionId, firstSession);
   assert.equal(second.childPid, childPid);
 });

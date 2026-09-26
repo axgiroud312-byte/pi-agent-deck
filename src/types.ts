@@ -3,15 +3,10 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { RoutingDecision } from "./router.mjs";
 
 export type AgentSource = "内置" | "用户" | "项目";
-export type ReportProfile = "通用" | "侦察" | "执行" | "审查";
-export type RunStatus = "选配中" | "排队中" | "等待批准" | "运行中" | "等待决定" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
-export type ReportType = "进度" | "发现" | "问题" | "警告" | "最终";
+export type CurrentRunStatus = "选配中" | "运行中" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
+export type LegacyRunStatus = "排队中" | "等待批准" | "等待决定";
+export type RunStatus = CurrentRunStatus | LegacyRunStatus;
 export type ResourceState = "starting" | "running" | "releasing" | "released";
-
-/** Read-only shape for historical records; no new writer leases are created. */
-export interface WriterLease {
-  version: 1; runId: string; ownerToken: string; cwd: string; leasePath: string; createdAt: number;
-}
 
 export interface AgentDefinition {
   id: string;
@@ -23,69 +18,31 @@ export interface AgentDefinition {
   model?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
-  writePermission: boolean;
-  reportProfile: ReportProfile;
+  /** Additional local Pi extension entry files, resolved relative to the role file. */
+  extensions: string[];
   timeoutMs?: number;
   disallowedTools?: string[];
   configurationErrors?: string[];
 }
 
-export interface DelegationRequest {
-  agent: string;
-  objective: string;
-  planContext?: string;
-  batchId?: string;
-  phase?: string;
-  requiresWrite?: boolean;
-  requiredTools?: string[];
-  background?: string[];
-  dependencies?: string[];
-  inputs?: string[];
-  filesToRead?: string[];
-  scope?: string[];
-  allowedPaths?: string[];
-  forbiddenPaths?: string[];
-  exclusions?: string[];
-  constraints?: string[];
-  implementationRequirements?: string[];
-  validationPolicy?: string[];
-  acceptanceCriteria: string[];
-  expectedDeliverables?: string[];
-  expectedReport?: string[];
-  cwd?: string;
-}
-
-export interface AcceptanceCriterionResult {
-  criterion: string;
-  status: "通过" | "部分完成" | "未完成" | "未验证";
-  evidence: string[];
-  notes?: string;
-}
-
-export interface FileChangeReport {
-  path: string;
-  change: string;
-}
-
-export interface DesignDecisionReport {
-  decision: string;
-  reason: string;
-  alternatives: string[];
-}
-
-export interface AgentReport {
-  type: ReportType;
+export interface LegacyAgentReport {
+  type: "进度" | "发现" | "问题" | "警告" | "最终";
   title: string;
   summary: string;
   objectiveStatus?: "完成" | "部分完成" | "未完成" | "阻塞";
-  acceptanceCriteria: AcceptanceCriterionResult[];
+  acceptanceCriteria: Array<{
+    criterion: string;
+    status: "通过" | "部分完成" | "未完成" | "未验证";
+    evidence: string[];
+    notes?: string;
+  }>;
   evidence: string[];
   completed: string[];
   deliverables: string[];
   filesRead: string[];
   filesChanged: string[];
-  fileChanges: FileChangeReport[];
-  designDecisions: DesignDecisionReport[];
+  fileChanges: Array<{ path: string; change: string }>;
+  designDecisions: Array<{ decision: string; reason: string; alternatives: string[] }>;
   commands: string[];
   tests: string[];
   risks: string[];
@@ -99,87 +56,75 @@ export interface AgentReport {
   confidence?: "低" | "中" | "高";
 }
 
+/** Historical-only projection populated by the compatibility adapter; current execution never writes these fields. */
+export interface LegacyRunView {
+  agentId?: string;
+  pendingQuestion?: { id: string; turnId: string; question: string; options: string[] };
+  autoDeliver?: boolean;
+  planContext?: string;
+  batchId?: string;
+  phase?: string;
+  acceptanceCriteria?: string[];
+  writerLease?: Record<string, unknown>;
+  reports?: LegacyAgentReport[];
+  /** Fields written by the retired structured-report and writer-policy layers. */
+  structuredResult?: unknown;
+  resultCompleteness?: string;
+  toolEvidence?: string[];
+  writePermission?: boolean;
+}
+
 export interface RunEvent {
   at: number;
   kind: "状态" | "工具" | "报告" | "错误";
   text: string;
 }
 
-/** Child attestation; the parent independently accepts the task. */
-export interface TaskResult {
-  outcome: "完成" | "部分完成" | "阻塞";
-  summary: string;
-  completed: string[];
-  evidence: string[];
-  checks: { name: string; status: "通过" | "失败" | "未运行" | "不适用"; evidence: string }[];
-  remaining: string[];
-}
-
 export interface RunDetails {
-  /** Stable task identity is runId. This identifies only the current execution. */
+  /** runId is stable across resumes; turnId identifies only the current execution. */
   turnId?: string;
   resourceState?: ResourceState;
   /** Informational count only; messages themselves are never persisted or replayed. */
   queuedMessageCount?: number;
-  pendingQuestion?: { id: string; turnId: string; question: string; options: string[] };
-  autoDeliver?: boolean;
-  version: 1;
+  /** Versions 1 and 2 are accepted through the compatibility adapter. New records use version 3. */
+  version: 1 | 2 | 3;
   runId: string;
-  agentId: string;
+  /** Current role identity. */
+  roleId: string;
   agentName: string;
   agentSource: AgentSource;
-  /** Instance identity is runId; agentId remains the role ID for persisted compatibility. */
+  /** Instance identity is runId; roleId identifies the reusable role. */
   instanceName?: string;
   description?: string;
   objective: string;
   instruction: string;
-  planContext?: string;
-  batchId?: string;
-  phase?: string;
-  acceptanceCriteria: string[];
   status: RunStatus;
   model: string;
   thinking: ThinkingLevel;
   routing?: RoutingDecision;
   routingPending?: boolean;
-  tools: string[];
-  writePermission: boolean;
+  tools?: string[];
+  disallowedTools?: string[];
+  extensions?: string[];
+  /** Delivery mode belongs to the current turn and is reset on every resume. */
+  deliveryMode?: "foreground" | "background";
   parentSessionId: string;
   parentSessionPath?: string;
   childSessionId: string;
   childSessionPath: string;
   cwd: string;
-  writerLease?: WriterLease;
   startedAt: number;
   endedAt?: number;
   currentAction?: string;
-  reports: AgentReport[];
+  legacy?: LegacyRunView;
   events: RunEvent[];
   finalText?: string;
-  result?: TaskResult;
+  /** Caller/cause of the completion or cleanup notification; not the delivery outcome. */
+  completionSource?: "execution" | "tool-stop" | "panel-stop" | "shutdown";
   failureReason?: string;
   persistenceError?: string;
-  /** Observed tool completions are evidence of actions, not task acceptance. */
-  toolEvidence?: string[];
   stderr?: string;
   exitCode?: number;
+  /** Usage for the current execution turn; every resume resets it and completion history preserves it. */
   usage: Usage;
-}
-
-export interface RunIndexEvent {
-  version: 1;
-  event: "started" | "finished";
-  at: number;
-  runId: string;
-  agentId: string;
-  agentName: string;
-  objective: string;
-  status: RunStatus;
-  model: string;
-  thinking: ThinkingLevel;
-  parentSessionId: string;
-  parentSessionPath?: string;
-  childSessionId: string;
-  childSessionPath: string;
-  finalSummary?: string;
 }

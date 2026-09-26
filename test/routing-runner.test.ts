@@ -67,7 +67,7 @@ function plan(task: string): RoutingPlan {
       { id: "sol6_high", model: "openai-codex/gpt-6-sol", thinking: "high", criteria: "routine" },
       { id: "luna6_high", model: "openai-codex/gpt-6-luna", thinking: "high", criteria: "complex" },
     ],
-    state: { task, role: "scout", roleDescription: "调查", writePermission: false, tools: ["read"] },
+    state: { task, role: "scout", roleDescription: "调查", tools: ["read"] },
   };
 }
 
@@ -89,7 +89,7 @@ async function fixture(t: any, task: string, routing = plan(task)) {
   };
   await initializeRun(run, { version: 1, cwd: directory, command: process.execPath,
     argsPrefix: [script, "--session", session, "--model", run.model, "--thinking", run.thinking],
-    prompt: task, naturalOutput: true, routing }, true);
+    prompt: task, routing }, true);
   t.after(async () => { await shutdownRuns(id); await fs.rm(directory, { recursive: true, force: true }); });
   return { id, directory };
 }
@@ -105,10 +105,12 @@ function service(t: any, responseMode: "delayed" | "invalid" = "delayed") {
     const send = () => {
       if (responseMode === "invalid") return new Response(JSON.stringify({ invalid: true }), { status: 200 });
       const body = JSON.parse(String(options.body));
-      const keys = Object.keys(body.questions.execution_profile.criteria);
+      const criteria = body.questions.execution_profile.criteria;
+      const keys = Object.keys(criteria);
+      const choice = keys.find((key) => String(criteria[key]).includes("gpt-6-luna")) ?? "luna6_high";
       return new Response(JSON.stringify({ model: "jev-1.13.0", answers: { execution_profile: {
-        type: "choice", choice: "luna6_high", confidence: 1,
-        probabilities: Object.fromEntries(keys.map((key) => [key, key === "luna6_high" ? 1 : 0])),
+        type: "choice", choice, confidence: 1,
+        probabilities: Object.fromEntries(keys.map((key) => [key, key === choice ? 1 : 0])),
       } } }), { status: 200 });
     };
     if (responseMode === "invalid") return send();
@@ -180,7 +182,7 @@ test("取消未完成的 Jev 选配后，迟到响应不能启动子进程", asy
   await assert.rejects(fs.access(path.join(f.directory, "started.jsonl")));
 });
 
-test("Jev 无效结果使用合规回退并交付原因", async (t) => {
+test("Jev 无效结果沿用当前配置并交付原因", async (t) => {
   const svc = service(t, "invalid");
   const f = await fixture(t, "invalid selection");
   await launchRunner(f.id);
@@ -195,7 +197,7 @@ test("Jev 无效结果使用合规回退并交付原因", async (t) => {
   assert.match((await readCompletions(runDirectory(f.id)))[0].routing?.reason ?? "", /无效/);
 });
 
-test("禁止 Astra 与非审查角色使用专属审查模型，违规请求不启动 RPC", async (t) => {
+test("模型型号、角色和 thinking 不建立硬门禁，回退配置仍可启动 RPC", async (t) => {
   for (const [role, model, thinking] of [
     ["scout", "gpt-6-astra", "high"],
     ["reviewer", "gpt-6-sol", "high"],
@@ -204,14 +206,17 @@ test("禁止 Astra 与非审查角色使用专属审查模型，违规请求不�
     const p = plan("blocked route");
     p.state.role = role;
     p.fallback = { model: `openai-codex/${model}`, thinking };
+    p.immediate = { ...p.fallback, mode: "fixed", reason: "测试显式配置", elapsedMs: 0 };
     const f = await fixture(t, "blocked route", p);
     await launchRunner(f.id);
-    const failed = await finished(f.id);
-    assert.equal(failed.status, "失败");
-    assert.match(failed.stderr ?? "", /模型策略不允许/);
-    assert.equal(failed.childPid, undefined);
+    const completed = await finished(f.id);
+    assert.equal(completed.status, "已完成");
+    assert.equal(completed.model, `openai-codex/${model}`);
+    assert.equal(completed.thinking, thinking);
+    assert.match(completed.finalText ?? "", new RegExp(model));
+    assert.equal(completed.childPid, undefined);
     assert.equal(await launchRunner(f.id), 0);
-    await assert.rejects(fs.access(path.join(f.directory, "started.jsonl")));
+    assert.match(await fs.readFile(path.join(f.directory, "started.jsonl"), "utf8"), /"type":"start"/);
   }
 });
 
@@ -236,7 +241,7 @@ test("Agent 公共入口在 Jev 选配中可收补充消息，取消中的任务
   const original = process.argv[1];
   process.argv[1] = cli;
   t.after(async () => { process.argv[1] = original; await shutdownRuns(parent); await fs.rm(directory, { recursive: true, force: true }); });
-  const created = await call("Agent", { description: "复杂问题调查", prompt: "调查认证问题并给出证据", name: "routing-live", subagent_type: "Explore" });
+  const created = await call("Agent", { description: "复杂问题调查", prompt: "调查认证问题并给出证据", name: "routing-live", subagent_type: "Explore", run_in_background: true });
   await until(async () => svc.calls.length === 1 ? true : undefined, "公共入口 Jev 请求");
   assert.equal(created.status, "selecting");
   assert.equal(created.resolvedModel, undefined);
@@ -246,7 +251,7 @@ test("Agent 公共入口在 Jev 选配中可收补充消息，取消中的任务
   assert.equal(first.status, "已完成");
   assert.equal(first.model, "openai-codex/gpt-6-luna");
   assert.match(first.finalText ?? "", /保留最后的证据行/);
-  const pending = await call("Agent", { description: "待取消任务", prompt: "不应启动", subagent_type: "Explore", name: "cancel-route" });
+  const pending = await call("Agent", { description: "待取消任务", prompt: "不应启动", subagent_type: "Explore", name: "cancel-route", run_in_background: true });
   await until(async () => svc.calls.length === 2 ? true : undefined, "第二个 Jev 请求");
   assert.equal((await call("TaskStop", { task_id: "cancel-route" })).status, "stopped");
   svc.respond();

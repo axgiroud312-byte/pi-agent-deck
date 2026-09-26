@@ -123,7 +123,7 @@ export async function editJevConfig(ctx: ExtensionContext, getThinkingLevel: () 
         }
       } else if (action === "enabled") {
         const value = await selectMenu(ctx, "为新任务自动选择模型与思考强度", [
-          { value: true, label: "开启 Jev 自动选配" }, { value: false, label: "关闭 Jev，使用合规回退配置" },
+          { value: true, label: "开启 Jev 自动选配" }, { value: false, label: "关闭 Jev，沿用角色或主会话配置" },
         ], draft.enabled);
         if (value !== undefined) draft.enabled = value;
       } else if (action === "timeout") {
@@ -174,7 +174,7 @@ export async function editJevConfig(ctx: ExtensionContext, getThinkingLevel: () 
         }
         try { if (Object.keys(patch).length) await writeDeckConfig({ routing: patch }); }
         catch { throw new Error(keySaved ? "密钥已保存，其余设置未保存，请重试保存。" : "设置未保存，请检查配置文件后重试。"); }
-        ctx.ui.notify(`Jev 设置已保存，新任务立即使用。${!credential().apiKey ? "\n尚未配置密钥，实际派遣将使用合规回退。" : ""}\n${readDeckConfig().enabled ? "" : "子任务总开关当前关闭，需要派遣时使用 /agent-deck on。"}`, "info");
+        ctx.ui.notify(`Jev 设置已保存，新任务立即使用。${!credential().apiKey ? "\n尚未配置密钥，实际派遣将沿用角色或主会话配置。" : ""}\n${readDeckConfig().enabled ? "" : "子任务总开关当前关闭，需要派遣时使用 /agent-deck on。"}`, "info");
         return;
       }
     } catch (error) {

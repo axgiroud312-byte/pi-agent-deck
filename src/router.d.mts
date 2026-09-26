@@ -20,16 +20,10 @@ export interface RoutingPlan {
   timeoutMs: number;
   fallback: ExecutionChoice;
   candidates: RoutingCandidate[];
-  state: { task: string; role: string; roleDescription: string; writePermission: boolean; tools: string[]; review?: boolean };
+  state: { task: string; role: string; roleDescription: string; tools?: string[] };
   immediate?: RoutingDecision;
 }
 export const MODEL_PROFILES: ModelProfile[];
-export const EXECUTION_POLICY: { reviewModel: string; disabledModels: string[]; minimumThinking: Record<string, ThinkingLevel> };
-export function isReviewAgent(agent: { id: string; reportProfile?: string }): boolean;
-export function isReviewRequest(request: { review?: boolean; routing?: RoutingPlan }, run: { agentId: string }): boolean;
-export function executionPolicyViolation(choice: ExecutionChoice, review: boolean): string | undefined;
-export function assertExecutionPolicy(choice: ExecutionChoice, review: boolean): void;
-export function assertRequestExecutionPolicy(request: { review?: boolean; routing?: RoutingPlan; routingDecision?: RoutingDecision; argsPrefix: string[] }, run: ExecutionChoice & { agentId: string }): void;
 export function selectExecution(plan: RoutingPlan, options?: { apiKey?: string; signal?: AbortSignal; fetch?: typeof fetch }): Promise<RoutingDecision>;
 export function decisionText(decision: RoutingDecision): string;
 export function applyExecutionArgs(args: string[], choice: ExecutionChoice): string[];

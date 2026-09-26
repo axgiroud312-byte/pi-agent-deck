@@ -22,6 +22,12 @@ export function prepareChildProviders(registry: ExtensionContext["modelRegistry"
   return { version: 1, providers };
 }
 
+/** Whether this model's provider can be made available inside an isolated child Pi. */
+export function canPrepareChildProvider(registry: ExtensionContext["modelRegistry"], model: string): boolean {
+  try { prepareChildProviders(registry, [model]); return true; }
+  catch { return false; }
+}
+
 function unsupportedProvider(id: string): Error {
   return new Error(`模型提供商 ${id} 使用自定义函数或原生 Provider，暂不能传入独立子 Agent。请使用声明式 registerProvider 配置或 models.json；尚未创建任务。`);
 }

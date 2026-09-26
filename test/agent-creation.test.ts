@@ -11,8 +11,9 @@ import agentDeck from "../src/index.ts";
 import { chooseRenderedMenu } from "./menu-harness.ts";
 
 const base: AgentDraft = {
-  reportProfile: "审查", id: "login-reviewer", name: "登录审查员", description: "审查登录流程，只读并返回证据",
-  systemPrompt: "定位登录流程，检查输入和会话边界。按影响排序问题，给出文件位置和验证情况。", tools: ["read", "grep", "find", "ls"],
+  id: "login-reviewer", name: "登录审查员", description: "审查登录流程，只读并返回证据",
+  systemPrompt: "定位登录流程，检查输入和会话边界。按影响排序问题，给出文件位置和验证情况；不要修改正式交付文件。",
+  disallowedTools: ["edit", "write"], extensions: [],
 };
 const response = (value: unknown) => ({ stopReason: "stop", content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }] });
 
@@ -49,8 +50,7 @@ test("自然描述命令从真实加载组件生成、保存、发现角色，�
   assert.equal(h.messages[0].options.triggerTurn, false);
   const saved = discoverAgents(h.ctx.cwd).find((agent) => agent.id === h.messages[0].details.agentId)!;
   assert.ok(saved);
-  assert.equal(saved.writePermission, false);
-  assert.equal(saved.reportProfile, "审查");
+  assert.deepEqual(saved.disallowedTools, ["edit", "write"]);
   assert.equal(saved.model, undefined);
   assert.equal("maxConcurrent" in saved, false);
   assert.equal(saved.timeoutMs, undefined);
@@ -70,10 +70,10 @@ test("配置菜单的新建只要求一段描述，自动选择名称并保存",
 });
 
 test("写入角色和显式模型可保存，实际能力限制保留在提示词", async () => {
-  const h = harness(async () => response({ ...base, id: "frontend-builder", reportProfile: "执行", tools: ["read", "edit", "write", "bash"], model: "fixture/model", thinking: "high", timeoutMs: 0, limitations: ["不能直接操作浏览器界面"] }));
+  const h = harness(async () => response({ ...base, id: "frontend-builder", disallowedTools: [], tools: ["read", "edit", "write", "bash"], model: "fixture/model", thinking: "high", timeoutMs: 0, limitations: ["不能直接操作浏览器界面"] }));
   const draft = await generateAgentDraft("实现前端并执行测试，使用 fixture/model", h.ctx, new AbortController().signal);
   const saved = await saveGeneratedAgent(draft, h.ctx);
-  assert.equal(saved.writePermission, true);
+  assert.ok(saved.tools?.includes("write"));
   assert.equal(saved.model, "fixture/model");
   assert.equal(saved.thinking, "high");
   assert.equal(saved.timeoutMs, 0);
@@ -93,19 +93,19 @@ test("模型配置格式错误自动修正一次，连续错误不保存角色",
   assert.equal(calls, 2);
   assert.equal(h.messages[0].details.agentId, "repaired-reviewer");
   const before = await fs.readdir(path.join(getAgentDir(), "agents"));
-  const bad = harness(async () => response({ ...base, tools: ["Browser"] }));
+  const bad = harness(async () => response({ ...base, tools: [42] as any }));
   await createAgentFromDescription(bad.pi, bad.ctx, "检查登录代码");
   assert.equal(bad.messages.length, 0);
   assert.ok(bad.notices.some((text) => text.includes("未通过校验")));
   assert.deepEqual(await fs.readdir(path.join(getAgentDir(), "agents")), before);
 });
 
-test("主会话 Astra 仍可生成角色，但固定 Astra 的子角色拒绝保存", async () => {
+test("主会话和子角色都可使用当前可见 Astra，不存在型号硬禁用", async () => {
   const astra = { provider: "fixture", id: "gpt-6-astra" };
   const h = harness(async (model, context) => {
     assert.equal(model, astra);
-    assert.match(context.systemPrompt, /已停用的子 Agent 模型：gpt-6-astra/);
-    assert.doesNotMatch(context.systemPrompt.split("可指定的模型：")[1].split("。")[0], /gpt-6-astra/);
+    assert.doesNotMatch(context.systemPrompt, /已停用|禁止/);
+    assert.match(context.systemPrompt, /gpt-6-astra/);
     return response({ ...base, id: "astra-created-reviewer" });
   });
   h.ctx.model = astra;
@@ -113,15 +113,16 @@ test("主会话 Astra 仍可生成角色，但固定 Astra 的子角色拒绝保
   h.ctx.modelRegistry.find = () => ({});
   const draft = await generateAgentDraft("生成审查角色", h.ctx, new AbortController().signal);
   assert.equal(draft.id, "astra-created-reviewer");
-  await assert.rejects(saveGeneratedAgent({ ...base, id: "disabled-astra", reportProfile: "侦察", model: "fixture/gpt-6-astra", thinking: "medium" }, h.ctx), /gpt-6-astra 已停用/);
-  await assert.rejects(fs.access(path.join(getAgentDir(), "agents", "disabled-astra.md")));
+  const saved = await saveGeneratedAgent({ ...base, id: "allowed-astra", model: "fixture/gpt-6-astra", thinking: "medium" }, h.ctx);
+  assert.equal(saved.model, "fixture/gpt-6-astra");
 });
 
-test("非法路径、系统设备名、未知工具字段和不存在的模型被拒绝", () => {
+test("非法路径、系统设备名、未知字段和错误 thinking 被拒绝，模型与扩展工具只做原生配置", () => {
   const h = harness();
-  for (const change of [{ id: "../escape" }, { id: "con" }, { id: "general" }, { tools: ["mcp"] }, { hooks: {} }, { thinking: "magic" }, { reportProfile: "review" }, { reportProfile: undefined }, { thinking: "high" }, { model: "missing/model" }, { maxConcurrent: 0 }]) {
+  for (const change of [{ id: "../escape" }, { id: "con" }, { id: "general" }, { hooks: {} }, { thinking: "magic" }, { maxConcurrent: 0 }]) {
     assert.throws(() => parseAgentDraft(JSON.stringify({ ...base, ...change }), h.ctx));
   }
+  assert.deepEqual(parseAgentDraft(JSON.stringify({ ...base, id: "custom-tool", tools: ["McpTool"], model: "missing/model" }), h.ctx).tools, ["McpTool"]);
   assert.equal(parseAgentDraft("```json\n" + JSON.stringify(base) + "\n```", h.ctx).id, base.id);
 });
 
@@ -171,7 +172,5 @@ test("空输入不发模型请求，服务失败清楚显示，关闭派遣后�
   const handlers = new Map<string, any>();
   agentDeck({ ...h.pi, on: (name: string, handler: any) => handlers.set(name, handler), registerTool() {}, registerMessageRenderer() {} } as any);
   const result = await handlers.get("before_agent_start")({}, h.ctx);
-  assert.match(result.message.content, /agent-authoring.md/);
-  assert.match(result.message.content, /派遣已关闭/);
-  assert.equal(result.message.display, false);
+  assert.equal(result, undefined);
 });

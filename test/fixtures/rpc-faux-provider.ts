@@ -14,21 +14,52 @@ function record(value: unknown): void {
 
 const respond = async (context: { messages: unknown[]; tools?: { name: string }[] }, options: { signal?: AbortSignal } | undefined, state: { callCount: number }) => {
   const transcript = JSON.stringify(context.messages);
+  const lastUser = [...context.messages].reverse().find((message: any) => message?.role === "user");
+  const latestUser = JSON.stringify(lastUser ?? {});
   record({ type: "provider_call", call: state.callCount, transcript, tools: context.tools?.map((tool) => tool.name) });
-  const report = (outcome = "完成") => fauxAssistantMessage(fauxToolCall("agent_report", {
-    outcome, summary: outcome === "阻塞" ? "缺少业务决定" : "DECK_REPORT_DONE",
-    completed: ["已读取本地测试上下文"], evidence: ["本地可控模型记录"],
-    checks: [{ name: "测试检查", status: "通过", evidence: "本地测试样例" }],
-    remaining: outcome === "阻塞" ? ["主 Agent 需要处理范围决定"] : [],
-  }), { stopReason: "toolUse" });
-  if (transcript.includes("DECK_CONTINUE_CASE")) return report();
+  const done = (text = "DECK_FINAL_TEXT") => fauxAssistantMessage(text);
+  if (transcript.includes("DECK_CONTINUE_CASE")) return done("DECK_CONTINUE_DONE");
   if (transcript.includes("DECK_CAPABILITY_CASE")) return fauxAssistantMessage("CAPABILITIES_CHECKED");
+  if (transcript.includes("DECK_EMPTY_CASE")) return done("");
   if (transcript.includes("DECK_FAILURE_CASE")) return fauxAssistantMessage("已经调查入口，尚未验证", { stopReason: "error" });
   if (transcript.includes("DECK_ABORTED_CASE")) return fauxAssistantMessage("", { stopReason: "aborted" });
-  if (transcript.includes("DECK_BLOCK_CASE")) return report("阻塞");
+  if (transcript.includes("DECK_BLOCK_CASE")) return done("我做不到：缺少业务决定，主 Agent 需要处理范围决定");
+  if (latestUser.includes("DECK_WORKFLOW_WORKER_CASE")) {
+    const boundary = context.messages.reduce((found: number, message: any, index: number) => message.role === "user" ? index : found, -1);
+    const current = context.messages.slice(boundary + 1);
+    if (!current.some((message: any) => message.role === "toolResult" && message.toolName === "RoleProbe")) {
+      return fauxAssistantMessage(fauxToolCall("RoleProbe", { value: "workflow-worker" }), { stopReason: "toolUse" });
+    }
+    if (!current.some((message: any) => message.role === "toolResult" && message.toolName === "deck_pause")) {
+      return fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+    }
+    return done("WORKFLOW_WORKER_DONE");
+  }
+  if (latestUser.includes("DECK_WORKFLOW_FIX_CASE")) {
+    const boundary = context.messages.reduce((found: number, message: any, index: number) => message.role === "user" ? index : found, -1);
+    const current = context.messages.slice(boundary + 1);
+    return current.some((message: any) => message.role === "toolResult" && message.toolName === "RoleProbe")
+      ? done("WORKFLOW_RESUME_DONE")
+      : fauxAssistantMessage(fauxToolCall("RoleProbe", { value: "workflow-resume" }), { stopReason: "toolUse" });
+  }
+  if (latestUser.includes("DECK_BASH_REVIEW_CASE")) {
+    const boundary = context.messages.reduce((found: number, message: any, index: number) => message.role === "user" ? index : found, -1);
+    const current = context.messages.slice(boundary + 1);
+    if (!current.some((message: any) => message.role === "toolResult" && message.toolName === "bash")) {
+      return fauxAssistantMessage(fauxToolCall("bash", { command: "node --version" }), { stopReason: "toolUse" });
+    }
+    return current.some((message: any) => message.role === "toolResult" && message.toolName === "deck_pause")
+      ? done("BASH_REVIEW_DONE")
+      : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+  }
   if (transcript.includes("DECK_TOOL_CASE")) {
     const completed = context.messages.some((message: any) => message.role === "toolResult" && message.toolName === "deck_pause");
-    return completed ? report() : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+    return completed ? done("DECK_TOOL_DONE") : fauxAssistantMessage(fauxToolCall("deck_pause", {}), { stopReason: "toolUse" });
+  }
+  if (transcript.includes("DECK_ROLE_EXTENSION_CASE")) {
+    const lastUser = context.messages.reduce((found: number, message: any, index: number) => message.role === "user" ? index : found, -1);
+    const completed = context.messages.slice(lastUser + 1).some((message: any) => message.role === "toolResult" && message.toolName === "RoleProbe");
+    return completed ? done("ROLE_EXTENSION_DONE") : fauxAssistantMessage(fauxToolCall("RoleProbe", { value: "configured-role-extension" }), { stopReason: "toolUse" });
   }
   if (transcript.includes("DECK_STOP_CASE")) {
     await new Promise<void>((resolve) => {
@@ -38,10 +69,10 @@ const respond = async (context: { messages: unknown[]; tools?: { name: string }[
     return fauxAssistantMessage("stopped before completion", { stopReason: "aborted" });
   }
   if (state.callCount === 1) await new Promise((resolve) => setTimeout(resolve, 300));
-  return report();
+  return done();
 };
 
-provider.setResponses(Array.from({ length: 12 }, () => respond));
+provider.setResponses(Array.from({ length: 64 }, () => respond));
 
 export default function localProvider(pi: ExtensionAPI): void {
   pi.registerProvider(provider.provider);

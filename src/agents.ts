@@ -1,33 +1,47 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
-import type { AgentDefinition, AgentSource, ReportProfile } from "./types.ts";
-import { isReviewAgent, executionPolicyViolation, EXECUTION_POLICY } from "./router.mjs";
+import type { AgentDefinition, AgentSource } from "./types.ts";
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const REPORT_PROFILES = new Set<ReportProfile>(["通用", "侦察", "执行", "审查"]);
-export const READ_TOOLS = ["read", "grep", "find", "ls"];
-export const WRITE_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+export const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 const TOOL_ALIASES: Record<string, string> = { glob: "find" };
-const SUPPORTED_FIELDS = new Set(["id", "name", "description", "model", "thinking", "tools", "disallowedTools", "writePermission", "timeoutMs", "maxConcurrent", "reportProfile"]);
+const BUILTIN_TOOL_NAMES = new Set(BUILTIN_TOOLS);
+// writePermission/reportProfile are accepted only to read existing role files.
+const SUPPORTED_FIELDS = new Set(["id", "name", "description", "model", "thinking", "tools", "disallowedTools", "extensions", "writePermission", "timeoutMs", "reportProfile"]);
 
 type Frontmatter = Record<string, unknown>;
 
-function parseStringList(value: unknown): string[] | undefined {
+export function parseStringList(value: unknown): string[] | undefined {
   const values = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
   const result = values.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean);
   return value === undefined ? undefined : result;
 }
 
-function parseBoolean(value: unknown, fallback: boolean): boolean {
+export function parseLegacyWritePermission(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    if (["true", "yes", "1", "是"].includes(value.toLowerCase())) return true;
-    if (["false", "no", "0", "否"].includes(value.toLowerCase())) return false;
-  }
-  return fallback;
+  if (value === 1) return true;
+  if (value === 0) return false;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "yes", "1", "是"].includes(normalized)) return true;
+  if (["false", "no", "0", "否"].includes(normalized)) return false;
+  return undefined;
+}
+
+/** Known Pi tool names are case-insensitive; extension tool names are not. */
+export function normalizeToolName(tool: string): string {
+  const lower = tool.toLowerCase();
+  return TOOL_ALIASES[lower] ?? (BUILTIN_TOOL_NAMES.has(lower) ? lower : tool);
+}
+
+function extensionPath(value: string, roleFile: string): string {
+  const expanded = value === "~" ? os.homedir() : value.startsWith(`~${path.sep}`) || value.startsWith("~/") || value.startsWith("~\\")
+    ? path.join(os.homedir(), value.slice(2)) : value;
+  return path.resolve(path.isAbsolute(expanded) ? expanded : path.join(path.dirname(roleFile), expanded));
 }
 
 export function parseAgentDefinition(text: string, filePath: string, source: AgentSource): AgentDefinition {
@@ -40,17 +54,30 @@ export function parseAgentDefinition(text: string, filePath: string, source: Age
   const list = (key: string): string[] | undefined => {
     const raw = f[key];
     if (raw !== undefined && typeof raw !== "string" && (!Array.isArray(raw) || raw.some((item) => typeof item !== "string"))) errors.push(`${key} 必须是工具名列表`);
-    return parseStringList(raw)?.map((tool) => TOOL_ALIASES[tool.toLowerCase()] ?? tool.toLowerCase());
+    return parseStringList(raw)?.map(normalizeToolName);
   };
   const specifiedTools = list("tools");
   const disallowedTools = list("disallowedTools") ?? [];
-  for (const tool of [...(specifiedTools ?? []), ...disallowedTools]) if (![...WRITE_TOOLS, "agent_report", "agent_question"].includes(tool)) errors.push(`Pi 子 Agent 不支持工具 ${tool}`);
-  if (f.writePermission !== undefined && typeof f.writePermission !== "boolean" && !["true", "false", "yes", "no", "1", "0", "是", "否"].includes(String(f.writePermission).toLowerCase())) errors.push("writePermission 必须是布尔值");
-  const writable = (tools: string[]) => tools.some((tool) => ["bash", "write", "edit"].includes(tool));
-  const requestedWrite = parseBoolean(f.writePermission, writable(specifiedTools ?? []));
-  const tools = (specifiedTools ?? (requestedWrite ? WRITE_TOOLS : READ_TOOLS)).filter((tool) => !disallowedTools.includes(tool));
-  const writePermission = f.writePermission === undefined ? writable(tools) : requestedWrite && writable(tools);
-  if (f.writePermission !== undefined && !requestedWrite && writable(tools)) errors.push("只读 Agent 配置了 bash/edit/write，请移除这些工具或启用 writePermission");
+  // Compatibility for pre-0.13 role files: the old read-only flag becomes the
+  // two concrete Pi tool exclusions and otherwise has no runtime meaning.
+  const legacyWritePermission = f.writePermission === undefined ? undefined : parseLegacyWritePermission(f.writePermission);
+  if (f.writePermission !== undefined && legacyWritePermission === undefined) errors.push("writePermission 必须是布尔值");
+  if (legacyWritePermission === false) {
+    for (const tool of ["edit", "write"]) if (!disallowedTools.includes(tool)) disallowedTools.push(tool);
+  }
+  let extensions: string[] = [];
+  const rawExtensions = parseStringList(f.extensions);
+  if (f.extensions !== undefined && typeof f.extensions !== "string" && (!Array.isArray(f.extensions) || f.extensions.some((item) => typeof item !== "string"))) {
+    errors.push("extensions 必须是本地扩展入口路径列表");
+  } else {
+    for (const configured of rawExtensions ?? []) {
+      try {
+        const resolved = extensionPath(configured, filePath);
+        if (!extensions.some((item) => process.platform === "win32" ? item.toLowerCase() === resolved.toLowerCase() : item === resolved)) extensions.push(resolved);
+      } catch (error) { errors.push(error instanceof Error ? error.message : String(error)); }
+    }
+  }
+  const tools = specifiedTools?.filter((tool) => !disallowedTools.includes(tool));
   const integer = (key: string, minimum: number): number | undefined => {
     if (f[key] === undefined) return undefined;
     if (!Number.isSafeInteger(f[key]) || Number(f[key]) < minimum) { errors.push(`${key} 必须是至少为 ${minimum} 的整数`); return undefined; }
@@ -61,12 +88,10 @@ export function parseAgentDefinition(text: string, filePath: string, source: Age
   const model = typeof f.model === "string" && f.model.trim() && f.model.trim() !== "inherit" ? f.model.trim() : undefined;
   if (f.model !== undefined && typeof f.model !== "string") errors.push("model 必须是 inherit 或 provider/model");
   if (model && !/^[^/]+\/.+$/.test(model)) errors.push("model 必须使用 Pi 的 provider/model 格式；Claude 的 sonnet/opus 别名不能直接使用");
-  if (f.reportProfile !== undefined && !REPORT_PROFILES.has(f.reportProfile as ReportProfile)) errors.push("reportProfile 必须是 通用、侦察、执行 或 审查");
   const definition: AgentDefinition = {
     id, name, description: typeof f.description === "string" ? f.description.trim() : "自定义 Agent",
-    systemPrompt: body.trim(), source, filePath, model, thinking, tools, disallowedTools, writePermission,
+    systemPrompt: body.trim(), source, filePath, model, thinking, tools, extensions, disallowedTools,
     timeoutMs: integer("timeoutMs", 0),
-    reportProfile: REPORT_PROFILES.has(f.reportProfile as ReportProfile) ? f.reportProfile as ReportProfile : "通用",
     configurationErrors: errors,
   };
   return definition;
@@ -83,7 +108,7 @@ function loadDirectory(directory: string, source: AgentSource): AgentDefinition[
       definitions.push(parseAgentDefinition(text, filePath, source));
     } catch (error) {
       // Keep invalid overrides visible instead of silently falling back to a broader built-in role.
-      definitions.push({ id: path.basename(entry.name, ".md"), name: path.basename(entry.name, ".md"), description: "配置错误，运行前需修正", systemPrompt: "", source, filePath, tools: [], writePermission: false, reportProfile: "通用", configurationErrors: [error instanceof Error ? error.message : String(error)] });
+      definitions.push({ id: path.basename(entry.name, ".md"), name: path.basename(entry.name, ".md"), description: "配置错误，运行前需修正", systemPrompt: "", source, filePath, tools: [], extensions: [], configurationErrors: [error instanceof Error ? error.message : String(error)] });
     }
   }
   return definitions;
@@ -122,19 +147,5 @@ export function discoverAgents(cwd: string, options: { projectTrusted?: boolean 
 }
 
 export function validateAgentDefinition(agent: AgentDefinition): string[] {
-  const errors: string[] = [...(agent.configurationErrors ?? [])];
-  const review = isReviewAgent(agent);
-  if (agent.model || review) {
-    const violation = executionPolicyViolation({ model: agent.model ?? `inherit/${EXECUTION_POLICY.reviewModel}`, thinking: agent.thinking ?? "max" }, review);
-    if (violation) errors.push(violation);
-  }
-  const dangerous = new Set(["bash", "powershell", "edit", "write"]);
-  if (!agent.writePermission) {
-    const forbidden = (agent.tools ?? []).filter((tool) => dangerous.has(tool));
-    if (forbidden.length > 0) errors.push(`只读 Agent 配置了潜在写入工具：${forbidden.join("、")}`);
-  }
-  if (agent.writePermission && !(agent.tools ?? []).some((tool) => ["bash", "powershell", "edit", "write"].includes(tool))) {
-    errors.push("Agent 允许写入，但没有配置任何执行或写入工具");
-  }
-  return errors;
+  return [...(agent.configurationErrors ?? [])];
 }

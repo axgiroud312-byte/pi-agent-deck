@@ -24,11 +24,11 @@ out({type:"response",id:q.id,success:true,data:{}});
 if(q.type==="prompt"||q.type==="steer"){if(busy)queue.push(q.message);else start(q.message);}
 });`);
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-  await initializeRun({ version: 1, runId: id, agentId: "test", agentName: "review", agentSource: "内置",
-    objective: "initial", instruction: "initial", acceptanceCriteria: [], status: "运行中", model: "fake/model", thinking: "off",
-    tools: [], writePermission: false, parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
-    cwd, startedAt: Date.now(), reports: [], events: [], usage } as any,
-  { version: 1, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"], prompt: "INITIAL", naturalOutput: true }, true);
+  await initializeRun({ version: 3, runId: id, roleId: "test", agentName: "review", agentSource: "内置",
+    objective: "initial", instruction: "initial", status: "运行中", model: "fake/model", thinking: "off",
+    tools: [], disallowedTools: [], extensions: [], parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
+    cwd, startedAt: Date.now(), events: [], usage } as any,
+  { version: 3, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"], prompt: "INITIAL" }, true);
   await launchRunner(id);
   const wait = async (turn?: string) => {
     for(let i=0;i<500;i++){const r=await readRun(id);if(r?.status==="已完成" && (!turn || r.turnId!==turn))return r;
@@ -82,11 +82,11 @@ if(q.type==="prompt"){
 });`);
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-  await initializeRun({ version: 1, runId: id, agentId: "test", agentName: "review", agentSource: "内置",
-    objective: "initial", instruction: "initial", acceptanceCriteria: [], status: "运行中", model: "fake/model", thinking: "off",
-    tools: [], writePermission: false, parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
-    cwd, startedAt: Date.now(), reports: [], events: [], usage } as any,
-  { version: 1, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"], prompt: "INITIAL", naturalOutput: true }, true);
+  await initializeRun({ version: 3, runId: id, roleId: "test", agentName: "review", agentSource: "内置",
+    objective: "initial", instruction: "initial", status: "运行中", model: "fake/model", thinking: "off",
+    tools: [], disallowedTools: [], extensions: [], parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
+    cwd, startedAt: Date.now(), events: [], usage } as any,
+  { version: 3, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"], prompt: "INITIAL" }, true);
   await launchRunner(id);
   let inFlight = false;
   for(let i=0;i<500;i++){
@@ -123,12 +123,12 @@ readline.createInterface({input:process.stdin}).on("line",line=>{
 });`);
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
-  await initializeRun({ version: 1, runId: id, agentId: "test", agentName: "review", agentSource: "内置",
-    objective: "hang", instruction: "hang", acceptanceCriteria: [], status: "运行中", model: "fake/model", thinking: "off",
-    tools: [], writePermission: false, parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
-    cwd, startedAt: Date.now(), reports: [], events: [], usage } as any,
-  { version: 1, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"],
-    prompt: "INITIAL", naturalOutput: true, timeoutMs: 100 }, true);
+  await initializeRun({ version: 3, runId: id, roleId: "test", agentName: "review", agentSource: "内置",
+    objective: "hang", instruction: "hang", status: "运行中", model: "fake/model", thinking: "off",
+    tools: [], disallowedTools: [], extensions: [], parentSessionId: id, childSessionId: id, childSessionPath: path.join(cwd, "session.jsonl"),
+    cwd, startedAt: Date.now(), events: [], usage } as any,
+  { version: 3, cwd, command: process.execPath, argsPrefix: [script, "--model", "fake/model", "--thinking", "off"],
+    prompt: "INITIAL", timeoutMs: 100 }, true);
   await launchRunner(id);
   let stopping = false;
   for(let i=0;i<500;i++){

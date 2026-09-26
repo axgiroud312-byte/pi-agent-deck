@@ -40,7 +40,7 @@ test("doctor 展示当前 RPC 运行方式、任务概况和角色能力诊断",
   assert.match(output, new RegExp(`Agent Deck ${AGENT_DECK_VERSION}`));
   assert.match(output, /主 Pi 管理 RPC 子会话/);
   assert.match(output, /当前会话任务：0/);
-  assert.match(output, /数量由主 Agent 决定/);
+  assert.match(output, /并发数量由主 Agent 与实际环境决定/);
   assert.match(output, /关闭或重载主 Pi会结束|关闭或重载主 Pi 会结束/);
   assert.doesNotMatch(output, /runtime-ack|协议版本|构建指纹|Runner/);
 });

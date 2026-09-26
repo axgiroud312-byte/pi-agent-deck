@@ -63,7 +63,7 @@ lines.on("close", () => process.exit(0));
     reports: [], events: [], finalText: options.final,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
   };
-  await initializeRun(run, { version: 1, cwd: directory, command: process.execPath, argsPrefix: [script], prompt: "fixture", naturalOutput: true }, true);
+  await initializeRun(run, { version: 1, cwd: directory, command: process.execPath, argsPrefix: [script], prompt: "fixture" }, true);
   if (options.roleLimit) {
     const file = path.join(runDirectory(id), "request.json");
     const saved = JSON.parse(await fs.readFile(file, "utf8"));
@@ -95,12 +95,12 @@ function host(parent: string) {
   return { handlers, commands, messages, ctx };
 }
 
-test("角色配置支持继承、工具别名和禁用列表，0 时限生效，错误字段不静默忽略", () => {
+test("角色配置支持继承、工具别名和禁用列表，角色级旧数量字段明确报错", () => {
   const role = parseAgentDefinition("---\nname: Researcher\nmodel: inherit\nthinking: inherit\ntools: Read, Grep, Glob, Bash\ndisallowedTools: Bash\ntimeoutMs: 0\nmaxConcurrent: 2\n---\nInvestigate.", "researcher.md", "用户");
   assert.equal(role.model, undefined); assert.equal(role.thinking, undefined);
   assert.equal(role.timeoutMs, 0); assert.equal("maxConcurrent" in role, false);
-  assert.deepEqual(role.tools, ["read", "grep", "find"]); assert.equal(role.writePermission, false);
-  assert.deepEqual(validateAgentDefinition(role), []);
+  assert.deepEqual(role.tools, ["read", "grep", "find"]); assert.deepEqual(role.disallowedTools, ["bash"]);
+  assert.ok(validateAgentDefinition(role).some((error) => error.includes("maxConcurrent")));
   const bad = parseAgentDefinition("---\npermissionMode: bypassPermissions\nmodel: opus\ntimeoutMs: -1\n---\nInvestigate.", "bad.md", "用户");
   assert.ok(validateAgentDefinition(bad).some((error) => error.includes("permissionMode")));
   assert.ok(validateAgentDefinition(bad).some((error) => error.includes("provider/model")));
@@ -133,7 +133,7 @@ test("关闭后面板和兼容命令也不再启动继续任务", async (t) => {
 
 test("配置入口编辑内置角色为个人覆盖，新任务读取有效的零时限", async () => {
   const h = host("config-edit");
-  h.ctx.ui.editor = async () => "---\nid: scout\nname: 私人侦察员\nmodel: inherit\nthinking: high\ntools: Read, Grep, Glob\ntimeoutMs: 0\nmaxConcurrent: 1\n---\n只读调查。\n";
+  h.ctx.ui.editor = async () => "---\nid: scout\nname: 私人侦察员\nmodel: inherit\nthinking: high\ntools: Read, Grep, Glob\nextensions: []\nwritePermission: false\ntimeoutMs: 0\n---\n只读调查。\n";
   await h.commands.get("agent-config").handler("scout --raw", h.ctx);
   const text = await fs.readFile(path.join(getAgentDir(), "agents", "scout.md"), "utf8");
   const role = parseAgentDefinition(text, "scout.md", "用户");

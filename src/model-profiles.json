@@ -1,6 +1,6 @@
 {
-  "version": 3,
-  "note": "Hard role and minimum-effort policy. Profile descriptions are heuristics, not benchmark results. Filter by authenticated provider, actual supported levels and tool transport.",
+  "version": 4,
+  "note": "Soft Jev choices only. Profile descriptions are heuristics, not benchmark results; they never block task execution.",
   "sources": [
     "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
     "https://developers.openai.com/api/docs/models/gpt-6-sol",
@@ -11,13 +11,13 @@
       "id": "sol_xhigh",
       "modelId": "gpt-5.6-sol",
       "thinking": "xhigh",
-      "criteria": "Review only: inspect changes and evidence, find correctness or boundary issues, and deliver actionable findings with file locations. Default starting profile for review."
+      "criteria": "Evidence-heavy engineering work that benefits from extended inspection, correctness checks, boundary analysis, and actionable findings with file locations."
     },
     {
       "id": "sol_max",
       "modelId": "gpt-5.6-sol",
       "thinking": "max",
-      "criteria": "Review only: exceptionally complex interacting systems, concurrency or security boundaries needing maximum deliberation; latency is secondary."
+      "criteria": "Exceptionally complex interacting systems, concurrency, migration, or security boundaries needing maximum deliberation; latency is secondary."
     },
     {
       "id": "sol6_high",
@@ -55,16 +55,5 @@
       "thinking": "max",
       "criteria": "Maximum GPT-6 Luna deliberation for exceptional focused tasks with strong acceptance checks. Do not assume this substitutes for Sol on broad ambiguous work."
     }
-  ],
-  "policy": {
-    "reviewModel": "gpt-5.6-sol",
-    "minimumThinking": {
-      "gpt-5.6-sol": "xhigh",
-      "gpt-6-sol": "high",
-      "gpt-6-luna": "high"
-    },
-    "disabledModels": [
-      "gpt-6-astra"
-    ]
-  }
+  ]
 }

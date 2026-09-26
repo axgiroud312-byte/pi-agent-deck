@@ -11,7 +11,6 @@ import { readDeckConfig } from "./config.ts";
 import { decisionText } from "./router.mjs";
 import { conversationBlocks } from "./conversation.ts";
 import { executionLabel } from "./presentation.ts";
-import { activeRunCount } from "./run-capacity.ts";
 import { countSummary, fit, frame, panelHeight, plain, runTime, sortRuns, statusText, twoColumns } from "./presentation.ts";
 
 export type AgentPanelAction =
@@ -142,7 +141,7 @@ class AgentPanelComponent {
 
   private renderList(width: number, height: number): string[] {
     height = Math.min(height, this.runs.length ? this.runs.length * 2 + 5 : 7);
-    const lines = [countSummary(this.runs, this.theme), this.theme.fg("muted", `槽位 ${activeRunCount(this.parentSessionId)}/8 · 本会话 ${this.runs.length} 项任务 · Jev ${readDeckConfig().routing.enabled ? "开启" : "关闭"}`), ""];
+    const lines = [countSummary(this.runs, this.theme), this.theme.fg("muted", `本会话 ${this.runs.length} 项任务 · 不设固定并发上限 · Jev ${readDeckConfig().routing.enabled ? "开启" : "关闭"}`), ""];
     this.pageSize = Math.max(1, Math.floor((height - 5) / 2));
     const start = Math.max(0, Math.min(this.selected - Math.floor(this.pageSize / 2), Math.max(0, this.runs.length - this.pageSize)));
     const end = Math.min(this.runs.length, start + this.pageSize);
@@ -153,7 +152,8 @@ class AgentPanelComponent {
       let row = twoColumns(`${selected ? this.theme.fg("accent", "›") : " "} ${this.theme.bold(plain(runTitle(run)))}`, tail, width);
       if (selected && this.theme.bg) row = this.theme.bg("selectedBg", fit(row, width));
       lines.push(row);
-      const activity = run.pendingQuestion ? `待回答：${run.pendingQuestion.question}` : run.currentAction ?? (isTerminalStatus(run.status) ? taskOutput(run) : run.status === "排队中" ? "等待工作区写任务结束" : run.status === "等待决定" ? "等待答复后继续" : "等待新的活动记录");
+      const legacyQuestion = run.version < 3 && run.status === "等待决定" ? run.legacy?.pendingQuestion : undefined;
+      const activity = legacyQuestion ? `旧版待决定：${legacyQuestion.question}` : run.currentAction ?? (isTerminalStatus(run.status) ? taskOutput(run) : run.status === "排队中" ? "历史排队记录" : run.status === "等待决定" ? "旧版待决定记录" : "等待新的活动记录");
       lines.push(this.theme.fg("muted", `  ${plain(runRoleLabel(run))} · ${resourceLabel(run)} · ${plain(executionLabel(run))} · ${plain(activity)}`));
     }
     if (!this.runs.length) lines.push("还没有任务。直接告诉主 Agent 你要完成什么。", "按 N 描述并创建一个专用 Agent。");
@@ -173,7 +173,11 @@ class AgentPanelComponent {
     const resource = run.resourceState ? { starting: "进程启动中", running: "进程存活", releasing: "进程释放中", released: "进程已释放" }[run.resourceState] : "历史资源状态";
     const lines = [twoColumns(this.theme.bold(plain(runTitle(run))), `${statusText(run, this.theme)} · ${runTime(run)}`, width), this.theme.fg("muted", `${plain(runRoleLabel(run))} · ${resource} · 暂存信息 ${run.queuedMessageCount ?? 0}`), tabs, ""];
     let content = this.page === "任务说明" ? this.renderInstruction(run, width) : this.page === "报告" ? this.renderReports(run, width) : this.renderTranscript(run, width);
-    if (run.pendingQuestion) content = [...this.wrapLines(`旧版问题记录：${stripTerminalSequences(run.pendingQuestion.question)}\n由主 Agent 处理后明确 resume。`, width), ...content];
+    if (run.legacy?.pendingQuestion) {
+      const pending = run.version < 3 && run.status === "等待决定";
+      const note = pending ? "由主 Agent 补齐条件后明确 resume。" : "仅供历史参考，当前无需回答。";
+      content = [...this.wrapLines(`旧版问题记录：${stripTerminalSequences(run.legacy.pendingQuestion.question)}\n${note}`, width), ...content];
+    }
     if (!content.length) content = [this.theme.fg("muted", this.page === "实时记录" ? run.currentAction ?? "等待新的活动记录…" : "暂无结果。")];
     height = Math.min(height, content.length + 7);
     this.pageSize = Math.max(1, height - 7);
@@ -200,7 +204,7 @@ class AgentPanelComponent {
   }
 
   private renderInstruction(run: PersistedRun, width: number): string[] {
-    return this.wrapLines(`任务编号：${run.runId}\n实例名称：${run.instanceName ?? "未命名"}\n角色：${run.agentName}（${run.agentId}）\n模型：${run.routingPending ? "待选配" : run.model}\n思考强度：${run.routingPending ? "待选配" : run.thinking}\n${run.routing ? decisionText(run.routing) + "\n" : ""}权限：${run.writePermission ? "可写入 / 执行命令" : "只读"}\n\n${run.instruction}`, width);
+    return this.wrapLines(`任务编号：${run.runId}\n实例名称：${run.instanceName ?? "未命名"}\n角色：${run.agentName}（${run.roleId}）\n模型：${run.routingPending ? "待选配" : run.model}\n思考强度：${run.routingPending ? "待选配" : run.thinking}\n${run.routing ? decisionText(run.routing) + "\n" : ""}工具：${run.tools?.join(", ") || "Pi 默认工具"}\n排除工具：${run.disallowedTools?.join(", ") || "无"} · 扩展：${run.extensions?.length ?? 0} 项\n\n${run.instruction}`, width);
   }
 
   private renderTranscript(run: PersistedRun, width: number): string[] {
@@ -260,8 +264,8 @@ class AgentPanelComponent {
     const blocks: string[] = [`当前执行：${run.turnId ?? "历史任务"} · ${run.status}`, ""];
     blocks.push(isTerminalStatus(run.status) ? taskOutput(run) : "当前执行尚未返回结果。", "");
     if (!isTerminalStatus(run.status) && run.finalText) blocks.push("执行中输出（尚未作为最终结果）：", run.finalText);
-    for (const report of run.reports) {
-      blocks.push(`${report.type === "问题" && run.turnId ? "已回答的问题" : report.type}｜${report.title}`, report.summary);
+    for (const report of run.legacy?.reports ?? []) {
+      blocks.push(`历史${report.type === "问题" && run.turnId ? "已回答的问题" : report.type}｜${report.title}`, report.summary);
       if (report.objectiveStatus) blocks.push(`目标状态：${report.objectiveStatus}`);
       for (const item of report.acceptanceCriteria) {
         blocks.push(`[${item.status}] ${item.criterion}`);

@@ -38,7 +38,7 @@ async function withPanel(parent: string, callback: (component: any, terminal: { 
   await showAgentPanel(ctx);
 }
 
-test("面板准确区分运行、排队、等答复和停止，主界面计数一致", async () => {
+test("面板准确区分运行、历史状态和停止，主界面计数一致", async () => {
   const f = await runs(["运行中", "排队中", "排队中", "等待决定", "停止中", "失败"]);
   await withPanel(f.parent, (component) => {
     const output = component.render(110).join("\n");
@@ -193,7 +193,7 @@ function settingsContext(steps: Array<string | undefined>, inputs: Array<string 
 }
 async function role() {
   const file = path.join(getAgentDir(), "agents", `${randomUUID()}.md`);
-  const text = '---\nname: 审查员\ndescription: 仔细审查\ntools: [read, grep]\ndisallowedTools: [bash]\nwritePermission: false\nmodel: inherit\ntimeoutMs: 0\nmaxConcurrent: 2\n---\n保留这段提示词。\n';
+  const text = '---\nname: 审查员\ndescription: 仔细审查\ntools: [read, grep]\ndisallowedTools: Bash\nextensions: []\nwritePermission: "false"\nmodel: inherit\ntimeoutMs: 0\n---\n保留这段提示词。\n';
   await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, text);
   return { file, text, agent: parseAgentDefinition(text, file, "用户") };
 }
@@ -224,7 +224,7 @@ test("角色菜单选择模型和思考强度，保留其他权限、时限和�
     if (rendered.includes("选择 fixture 模型")) {
       checkedModelMenu = true;
       assert.match(rendered, /模型 B/);
-      assert.doesNotMatch(rendered, /Astra|gpt-6-astra/);
+       assert.match(rendered, /Astra/);
     }
     return component;
   });
@@ -232,30 +232,45 @@ test("角色菜单选择模型和思考强度，保留其他权限、时限和�
   assert.equal(checkedModelMenu, true);
   const saved = parseAgentDefinition(await fs.readFile(f.file, "utf8"), f.file, "用户");
   assert.equal(saved.model, "fixture/model-b"); assert.equal(saved.thinking, "high");
-  assert.equal(saved.writePermission, false); assert.deepEqual(saved.disallowedTools, ["bash"]);
+  assert.deepEqual(saved.disallowedTools, ["bash", "edit", "write"]);
+  assert.doesNotMatch(await fs.readFile(f.file, "utf8"), /writePermission/);
   assert.equal(saved.timeoutMs, 0); assert.equal("maxConcurrent" in saved, false); assert.equal(saved.systemPrompt, "保留这段提示词。");
 });
 
-test("工具勾选真实按键交互，确认后权限与选择一致，Esc 取消不写文件", async () => {
+test("工具、排除项与扩展独立保存，Esc 取消不写文件", async () => {
   const f = await role();
-  const h = settingsContext(["工具", "保存并返回"]);
+  const h = settingsContext(["工具 2", "保存并返回"]);
   const menu = h.ctx.ui.custom;
   h.ctx.ui.custom = async (factory: any) => {
     let result: string[] | undefined;
     const component = factory({ terminal: { rows: 24 }, requestRender() {} }, theme, undefined, (value: any) => { result = value; });
     if (!component.render(80).join("\n").includes("选择工具")) return menu(factory);
     assert.match(component.render(80).join("\n"), /\[✓\] 读取文件/);
-    for (let i = 0; i < 4; i++) component.handleInput("\u001b[B");
+    for (let i = 0; i < 3; i++) component.handleInput("\u001b[B");
     component.handleInput(" "); component.handleInput("\r");
     assert.ok(component.render(40).every((line: string) => visibleWidth(line) <= 40));
     return result;
   };
   await editAgentConfig(h.ctx, f.agent);
   const saved = parseAgentDefinition(await fs.readFile(f.file, "utf8"), f.file, "用户");
-  assert.equal(saved.writePermission, true); assert.ok(saved.tools?.includes("edit"));
-  assert.deepEqual(saved.disallowedTools, []);
+  assert.ok(saved.tools?.includes("ls"));
+  assert.deepEqual(saved.disallowedTools, ["bash", "edit", "write"]);
+  assert.deepEqual(saved.extensions, []);
   h.ctx.ui.custom = async (factory: any) => { let result: any = "pending"; const component = factory({ requestRender() {} }, theme, undefined, (value: any) => { result = value; }); component.handleInput(" "); component.handleInput("\u001b"); return result; };
   assert.equal(await selectAgentTools(h.ctx, ["read"]), undefined);
+});
+
+test("配置编辑器分别保存工具、排除工具和扩展", async () => {
+  const f = await role();
+  const extension = path.resolve("test/fixtures/role-probe-extension.ts");
+  const h = settingsContext(["扩展", "工具名称", "排除工具", "保存并返回"]);
+  const edits = [extension, "read\nRoleProbe\nHiddenProbe", "bash\nHiddenProbe"];
+  h.ctx.ui.editor = async () => edits.shift();
+  await editAgentConfig(h.ctx, f.agent);
+  const saved = parseAgentDefinition(await fs.readFile(f.file, "utf8"), f.file, "用户");
+  assert.deepEqual(saved.tools, ["read", "RoleProbe"], "排除名单优先于允许名单");
+  assert.deepEqual(saved.disallowedTools, ["bash", "HiddenProbe"]);
+  assert.deepEqual(saved.extensions, [extension]);
 });
 
 test("角色配置在别处被修改时不会覆盖；原始编辑入口仍可保存", async () => {

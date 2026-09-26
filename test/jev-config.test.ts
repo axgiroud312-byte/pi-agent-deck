@@ -154,21 +154,23 @@ test("设置页连接检查真实调用元数据接口，成功仅代表读到�
   await editJevConfig(cancelled.ctx); cancelled.assertDone(); assert.match(cancelled.screens.join("\n"), /已取消检查/);
 });
 
-test("草稿试选遵守审查专用策略，不创建子任务或打开已关闭的自动选配", async (t) => {
+test("草稿试选只选择当前 Pi 可用模型与思考组合，不创建子任务或打开开关", async (t) => {
   await writeDeckConfig({ routing: { enabled: false } });
   const before = (await listRuns()).length;
   let count = 0;
   t.mock.method(globalThis, "fetch", async (url: string, options: any) => {
     count++; assert.equal(url, "https://api.typesafe.ai/v1/systemone"); assert.equal(options.headers.Authorization, `Bearer ${secret}`);
     const body = JSON.parse(options.body); assert.equal(body.model, "jev-1.13.0");
-    const keys = Object.keys(body.questions.execution_profile.criteria);
-    assert.deepEqual(keys.sort(), ["no_match", "sol_max", "sol_xhigh"]);
+    const criteria = body.questions.execution_profile.criteria;
+    const keys = Object.keys(criteria);
+    const selected = Object.entries(criteria).find(([id, text]) => id !== "no_match" && String(text).includes("openai-codex/gpt-6-astra with max thinking"))?.[0];
+    assert.ok(selected);
     assert.ok(!options.body.includes(secret));
-    return Response.json({ model: "jev-1.13.0", answers: { execution_profile: { type: "choice", choice: "sol_max", confidence: 1, probabilities: Object.fromEntries(keys.map((id) => [id, id === "sol_max" ? 1 : 0])) } } });
+    return Response.json({ model: "jev-1.13.0", answers: { execution_profile: { type: "choice", choice: selected, confidence: 1, probabilities: Object.fromEntries(keys.map((id) => [id, id === selected ? 1 : 0])) } } });
   });
   const h = harness(["① API 密钥", paste(secret), "试选一次", "代码审查员", waitForOperation, "返回，不保存"], ["审查登录模块的边界条件"]);
   await editJevConfig(h.ctx, () => "high"); h.assertDone();
-  assert.equal(count, 1); assert.match(h.notices.join("\n"), /gpt-5.6-sol/); assert.match(h.notices.join("\n"), /max/);
+  assert.equal(count, 1); assert.match(h.notices.join("\n"), /gpt-6-astra/); assert.match(h.notices.join("\n"), /max/);
   assert.equal(readDeckConfig().routing.enabled, false); assert.equal((await listRuns()).length, before); assert.equal(readSavedJevKey(jevCredentialPath()), undefined);
 });
 
