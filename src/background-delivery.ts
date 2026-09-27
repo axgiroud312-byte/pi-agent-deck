@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PersistedRun } from "./types.ts";
 import { readRun, isTerminalStatus } from "./runtime.ts";
-import { PARENT_MESSAGE, resultMessage, taskOutput } from "./delivery.ts";
+import { PARENT_MESSAGE, resultMessage, taskResultMessage, taskOutput } from "./delivery.ts";
 import { taskMessage } from "./tool-contract.ts";
 import {
   consumeMessages, inputMessageIds, messagesPath, readMessages, reconcileMessages,
@@ -10,7 +10,8 @@ import {
 
 /** Durable transport evidence with process-local arbitration between tool and background delivery. */
 export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, getContext: () => ExtensionContext | undefined) {
-  const delivered = new Set<string>();
+  // Claimed for a foreground result or submitted to Pi; consumption lives in the ledger.
+  const claimed = new Set<string>();
   const delivering = new Map<string, Promise<void>>();
   type DeliveryGate = { holders: number; pending?: PersistedRun };
   const deliveryGates = new Map<string, DeliveryGate>();
@@ -18,10 +19,8 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
   const isActiveParent = (run: PersistedRun, ctx: ExtensionContext | undefined): ctx is ExtensionContext =>
     !!ctx && ctx === getContext() && run.parentSessionId === ctx.sessionManager.getSessionId();
 
-  // Foreground and background transports share the same identity and unformatted body.
-  const outputMessage = (run: PersistedRun) => resultMessage({ ...run, deliveryMode: "background" }, run.parentSessionId);
   const recordOutput = async (run: PersistedRun) => {
-    const message = outputMessage(run);
+    const message = taskResultMessage(run);
     if (!message) return;
     const record = await recordMessage(run, "to-parent", run.pendingQuestion?.message ?? taskOutput(run), message.details.deliveryId);
     return { message, record };
@@ -45,7 +44,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
   };
 
   const retryBackgroundResult = (run: PersistedRun): void => {
-    const id = outputMessage(run)?.details.deliveryId;
+    const id = taskResultMessage(run)?.details.deliveryId;
     const pending = id && delivering.get(`${run.runId}/${id}`);
     // Gate release can race an in-flight attempt rolling back its submission.
     // Wait for that attempt to leave sendOnce, then recheck durable state afresh.
@@ -61,14 +60,14 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
   };
 
   const deliverBackgroundResult = async (run: PersistedRun): Promise<void> => {
-    const output = outputMessage(run);
+    const output = taskResultMessage(run);
     if (!output) return;
     await sendOnce(run, output.details.deliveryId, async () => {
       const saved = await recordOutput(run);
       if (!saved) return;
       const { message, record } = saved;
       const key = message.details.deliveryId;
-      if (delivered.has(key) || record.state !== "pending" || record.submittedAt) return;
+      if (claimed.has(key) || record.state !== "pending" || record.submittedAt) return;
       const ctx = getContext();
       if (!isActiveParent(run, ctx)) return;
       const current = await readRun(run.runId);
@@ -77,7 +76,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
       const gate = deliveryGates.get(run.runId);
       if (gate) { gate.pending = run; return; }
       await submitMessages(run.runId, [key]);
-      if (delivered.has(key)) return; // A foreground tool claimed this result while its record was being written.
+      if (claimed.has(key)) return; // A foreground tool claimed this result while its record was being written.
       const currentGate = deliveryGates.get(run.runId);
       if (!isActiveParent(run, ctx) || currentGate) {
         if (currentGate) currentGate.pending = run;
@@ -86,7 +85,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
       }
       try {
         pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
-        delivered.add(key);
+        claimed.add(key);
       } catch (error) {
         await settleMessages(run.runId, "to-parent", "unknown", `发送接口未确认：${String(error)}`, [key]);
         throw error;
@@ -103,7 +102,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
     deliveryGates.delete(run.runId);
     if (isTerminalStatus(run.status) || run.status === "停止未确认" || run.pendingQuestion) {
       const message = resultMessage(run, run.parentSessionId);
-      if (message) delivered.add(message.details.deliveryId); // the Agent tool result owns this delivery
+      if (message) claimed.add(message.details.deliveryId); // the Agent tool result owns this delivery
       return;
     }
     if (gate.pending) retryBackgroundResult(gate.pending);
@@ -112,7 +111,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
   const deliverProgress = async (run: PersistedRun, input: { id: string; message: string }): Promise<void> => {
     await sendOnce(run, input.id, async () => {
       const record = await recordMessage(run, "to-parent", input.message, input.id);
-      if (record.state !== "pending" || record.submittedAt || delivered.has(input.id)) return;
+      if (record.state !== "pending" || record.submittedAt || claimed.has(input.id)) return;
       const ctx = getContext();
       if (!isActiveParent(run, ctx)) return;
       await submitMessages(run.runId, [input.id]);
@@ -126,7 +125,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
           content: taskMessage(run, `子 Agent 消息：\n${input.message}`), display: true,
           details: { taskId: run.runId, turnId: run.turnId, messageId: input.id },
         }, { deliverAs: "followUp", triggerTurn: true });
-        delivered.add(input.id);
+        claimed.add(input.id);
       } catch (error) {
         await settleMessages(run.runId, "to-parent", "unknown", `发送接口未确认：${String(error)}`, [input.id]);
         throw error;
@@ -135,9 +134,19 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
   };
 
   return {
-    acquire: acquireDeliveryGate,
-    release: releaseDeliveryGate,
-    discard: discardDeliveryGate,
+    /** Pair notification ownership with the operation, including failure cleanup. */
+    async withToolDelivery<T extends { run: PersistedRun }>(runId: string, operation: () => Promise<T>, enabled = true): Promise<T> {
+      if (!enabled) return operation();
+      const gate = acquireDeliveryGate(runId);
+      try {
+        const result = await operation();
+        releaseDeliveryGate(result.run, gate);
+        return result;
+      } catch (error) {
+        discardDeliveryGate(runId, gate);
+        throw error;
+      }
+    },
     async notify(run: PersistedRun): Promise<void> {
       if (run.deliveryMode !== "background") return;
       const gate = deliveryGates.get(run.runId);
@@ -154,14 +163,19 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
     async recordToolResult(run: PersistedRun): Promise<string | undefined> {
       const saved = await recordOutput(run);
       if (!saved) return;
-      delivered.add(saved.record.id);
+      claimed.add(saved.record.id);
       await submitMessages(run.runId, [saved.record.id]);
       return saved.record.id;
     },
-    async consume(message: any, parent: string): Promise<void> {
+    async consume(message: unknown, parent: string): Promise<void> {
       const ids = inputMessageIds(message);
       if (!ids.length) return;
-      const runId = message.details?.taskId ?? message.details?.run?.runId;
+      if (!message || typeof message !== "object" || !("details" in message)) return;
+      const details = message.details;
+      if (!details || typeof details !== "object") return;
+      const runDetails = "run" in details ? details.run : undefined;
+      const taskId = "taskId" in details ? details.taskId : undefined;
+      const runId = taskId ?? (runDetails && typeof runDetails === "object" && "runId" in runDetails ? runDetails.runId : undefined);
       if (typeof runId !== "string") return;
       const run = await readRun(runId);
       if (run?.parentSessionId === parent) await consumeMessages(runId, "to-parent", ids);
@@ -171,7 +185,7 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
       for (const run of runs) {
         await reconcileMessages(run, "to-parent");
         const records = await readMessages(run.runId);
-        const output = outputMessage(run);
+        const output = taskResultMessage(run);
         const pending = records.filter(record => record.direction === "to-parent" && record.state === "pending" && !record.submittedAt);
         if (output && pending.some(record => record.id === output.details.deliveryId)) await deliverBackgroundResult(run);
         if (!isTerminalStatus(run.status)) for (const record of pending) {
@@ -182,6 +196,6 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
       }
       return warnings;
     },
-    reset(): void { delivered.clear(); deliveryGates.clear(); },
+    reset(): void { claimed.clear(); deliveryGates.clear(); },
   };
 }

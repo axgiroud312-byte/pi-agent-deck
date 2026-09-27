@@ -29,12 +29,22 @@ export interface RunnerRequest {
 export type RunNotification = { kind: "state" | "result"; run: PersistedRun }
   | { kind: "message"; run: PersistedRun; message: ParentMessage };
 type ManagedRun = {
-  run: PersistedRun; request: RunnerRequest; rpc?: RpcConnection; ready: boolean;
-  busy: boolean; starting?: Promise<void>; abort: AbortController;
-  messages: string[]; serial: number; error?: string; extensionError?: string; interrupted?: boolean;
+  run: PersistedRun;
+  request: RunnerRequest;
+  rpc?: RpcConnection;
+  ready: boolean;
+  busy: boolean;
+  starting?: Promise<void>;
+  abort: AbortController;
+  messages: string[];
+  serial: number;
+  error?: string;
+  extensionError?: string;
+  interrupted?: boolean;
   liveMessages: any[];
   replies: string[];
-  writes: Promise<void>; timer?: NodeJS.Timeout;
+  writes: Promise<void>;
+  timer?: NodeJS.Timeout;
   pendingCompletion?: { status: CurrentRunStatus; endedAt: number };
   /** Loaded for control access; shutdown preserves untouched historical records. */
   loadedIdle?: boolean;
@@ -85,7 +95,17 @@ function save(entry: ManagedRun): Promise<void> {
   return write;
 }
 function manage(run: PersistedRun, request: RunnerRequest, loadedIdle = false): ManagedRun {
-  const entry: ManagedRun = { run, request, ready: false, busy: false, abort: new AbortController(), messages: [], serial: 0, liveMessages: [], replies: [], writes: Promise.resolve(), loadedIdle };
+  const entry: ManagedRun = {
+    run, request, loadedIdle,
+    ready: false,
+    busy: false,
+    abort: new AbortController(),
+    messages: [],
+    serial: 0,
+    liveMessages: [],
+    replies: [],
+    writes: Promise.resolve(),
+  };
   owned.set(run.runId, entry);
   return entry;
 }
@@ -131,49 +151,35 @@ function rpcArgs(args: string[]): string[] {
   return [...output, "--mode", "rpc"];
 }
 
-async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: string, notifyResult = true): Promise<void> {
-  if (!entry.busy) return;
-  // A steer may be accepted just after Pi settled. Drain it while the same
-  // session is still owned, before publishing completion or closing its process.
-  if (status === "已完成" && entry.rpc && !entry.abort.signal.aborted && !entry.run.stopRequested) {
-    const serial = entry.serial;
-    const queued = await entry.rpc.request("clear_queue");
-    const pending = [...entry.messages, ...(queued?.steering ?? []), ...(queued?.followUp ?? [])];
-    entry.messages = [];
-    const state = await entry.rpc.request("get_state");
-    if (entry.serial !== serial || state?.isStreaming || state?.isCompacting) {
-      entry.messages.push(...pending);
-      return; // Pi consumed input during the check; its next settled event owns completion.
-    }
-    if (pending.length) {
-      const records = await readMessages(entry.run.runId);
-      const consumed = new Set(records.filter(record => record.state === "consumed").map(record => record.id));
-      const remaining = pending.filter(text => !messageIds(text).length || !messageIds(text).every(id => consumed.has(id)));
-      if (remaining.length) {
-        entry.run.currentAction = "继续处理已接受的补充消息";
-        await save(entry);
-        await submitMessages(entry.run.runId, remaining.flatMap(messageIds), entry.run.turnId);
-        await entry.rpc.request("prompt", { message: remaining.join("\n\n") });
-        return;
-      }
-    }
+/** Called under the task lock before committing a successful settled turn. */
+async function continuePendingInput(entry: ManagedRun): Promise<boolean> {
+  if (!entry.rpc || entry.abort.signal.aborted || entry.run.stopRequested) return false;
+  const serial = entry.serial;
+  const queued = await entry.rpc.request("clear_queue");
+  const pending = [...entry.messages, ...(queued?.steering ?? []), ...(queued?.followUp ?? [])];
+  entry.messages = [];
+  const state = await entry.rpc.request("get_state");
+  if (entry.serial !== serial || state?.isStreaming || state?.isCompacting) {
+    entry.messages.push(...pending);
+    return true; // The next settled event owns completion after this activity.
   }
-  entry.busy = false;
-  entry.ready = false;
-  if (entry.run.pendingQuestion) await settleMessages(entry.run.runId, "to-parent", "closed", "本轮执行已结束，澄清问题停止等待。",
-    [`${entry.run.runId}:${entry.run.turnId}:question:${entry.run.pendingQuestion.id}`]).catch(failure => {
-      entry.run.persistenceError = `问题状态保存失败：${String(failure)}`;
-    });
-  entry.run.pendingQuestion = undefined;
-  clearTimeout(entry.timer);
-  const completion = entry.pendingCompletion ?? { status, endedAt: Date.now() };
-  entry.pendingCompletion = completion;
-  entry.run.completionSource ??= "execution";
-  entry.run.currentAction = "正在保存结果并释放进程";
-  if (error) { entry.run.failureReason = error; entry.run.stderr = error; event(entry, "错误", error); }
-  entry.run.resourceState = entry.rpc ? "releasing" : "released";
-  try { await save(entry); }
-  catch (failure) { entry.run.persistenceError = [entry.run.persistenceError, `结果保存失败：${String(failure)}`].filter(Boolean).join("；"); event(entry, "错误", entry.run.persistenceError); }
+  if (!pending.length) return false;
+  const records = await readMessages(entry.run.runId);
+  const consumed = new Set(records.filter(record => record.state === "consumed").map(record => record.id));
+  const remaining = pending.filter(text => {
+    const ids = messageIds(text);
+    return !ids.length || !ids.every(id => consumed.has(id));
+  });
+  if (!remaining.length) return false;
+  entry.run.currentAction = "继续处理已接受的补充消息";
+  await save(entry);
+  await submitMessages(entry.run.runId, remaining.flatMap(messageIds), entry.run.turnId);
+  await entry.rpc.request("prompt", { message: remaining.join("\n\n") });
+  return true;
+}
+
+/** Keep the owned RPC and PID when cleanup needs a TaskStop retry. */
+async function releaseProcess(entry: ManagedRun): Promise<boolean> {
   const rpc = entry.rpc;
   let closeError: unknown;
   if (rpc) {
@@ -190,12 +196,87 @@ async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: strin
     // Keep the owned RPC and child PID until close confirms exit.
     try { await save(entry); }
     catch (failure) { entry.run.persistenceError = [entry.run.persistenceError, `状态保存失败：${String(failure)}`].filter(Boolean).join("；"); event(entry, "错误", entry.run.persistenceError); }
-  } else {
-    if (entry.rpc === rpc) entry.rpc = undefined;
+    return false;
+  }
+  if (entry.rpc === rpc) entry.rpc = undefined;
+  return true;
+}
+
+/** The controller invalidates an old path before attempting a durable replacement. */
+async function saveCompletion(run: PersistedRun, overwrite = false): Promise<void> {
+  run.reportPath = undefined;
+  run.reportPath = await persistCompletion(runDirectory(run.runId), run, { overwrite });
+}
+
+/** Publish only after history and status have recorded the final outcome. */
+async function publishCompletion(entry: ManagedRun, completed: PersistedRun): Promise<void> {
+  const persistenceFailure = (reason: string): void => {
+    completed.persistenceError = [completed.persistenceError, reason].filter(Boolean).join("；");
+    completed.failureReason = [completed.failureReason, `持久化失败：${reason}`].filter(Boolean).join("；");
+    completed.status = "失败";
+    completed.events = [...completed.events, { at: Date.now(), kind: "错误" as const, text: reason }].slice(-200);
+  };
+  // Completion history is attempted before the released terminal state becomes
+  // observable through readRun or result events. Foreground and background share
+  // this exact path; delivery mode only controls the later notification.
+  try { await saveCompletion(completed); }
+  catch (failure) {
+    persistenceFailure(`结果保存失败：${String(failure)}`);
+    await saveCompletion(completed, true).catch((retryFailure) => {
+      persistenceFailure(`结果保存重试失败：${String(retryFailure)}`);
+    });
+  }
+  // Do not mutate the live object until this write finishes. Foreground
+  // waiters read the live object and must receive any persistence failure.
+  try { await queueSnapshot(entry, completed); }
+  catch (failure) {
+    persistenceFailure(`状态保存失败：${String(failure)}`);
+    await queueSnapshot(entry, completed).catch((retryFailure) => {
+      persistenceFailure(`状态保存重试失败：${String(retryFailure)}`);
+    });
+    // The first completion snapshot predates this status-write error. Refresh
+    // the same turn record so a later resume cannot erase the only evidence.
+    try { await saveCompletion(completed, true); }
+    catch (historyFailure) {
+      persistenceFailure(`完成记录更新失败：${String(historyFailure)}`);
+      await queueSnapshot(entry, completed).catch(() => {});
+    }
+  }
+  Object.assign(entry.run, completed);
+  entry.pendingCompletion = undefined;
+  emit(entry, "state");
+}
+
+/** Finish only; successful settled events drain accepted input first. */
+async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: string, notifyResult = true): Promise<void> {
+  if (!entry.busy) return;
+  entry.busy = false;
+  entry.ready = false;
+  if (entry.run.pendingQuestion) await settleMessages(entry.run.runId, "to-parent", "closed", "本轮执行已结束，澄清问题停止等待。",
+    [`${entry.run.runId}:${entry.run.turnId}:question:${entry.run.pendingQuestion.id}`]).catch(failure => {
+      entry.run.persistenceError = `问题状态保存失败：${String(failure)}`;
+    });
+  entry.run.pendingQuestion = undefined;
+  clearTimeout(entry.timer);
+  const completion = entry.pendingCompletion ?? { status, endedAt: Date.now() };
+  entry.pendingCompletion = completion;
+  entry.run.completionSource ??= "execution";
+  entry.run.currentAction = "正在保存结果并释放进程";
+  if (error) {
+    entry.run.failureReason = error;
+    entry.run.stderr = error;
+    event(entry, "错误", error);
+  }
+  entry.run.resourceState = entry.rpc ? "releasing" : "released";
+  try { await save(entry); }
+  catch (failure) { entry.run.persistenceError = [entry.run.persistenceError, `结果保存失败：${String(failure)}`].filter(Boolean).join("；"); event(entry, "错误", entry.run.persistenceError); }
+  if (await releaseProcess(entry)) {
     try {
       await reconcileMessages(entry.run, "to-child");
       if (status !== "已完成") {
-        const unsent = (await readMessages(entry.run.runId)).filter(record => record.direction === "to-child" && record.state === "pending" && !record.submittedAt).map(record => record.id);
+        const unsent = (await readMessages(entry.run.runId))
+          .filter(record => record.direction === "to-child" && record.state === "pending" && !record.submittedAt)
+          .map(record => record.id);
         if (unsent.length) await settleMessages(entry.run.runId, "to-child", "closed", error ?? `本轮执行${status}`, unsent);
       }
     } catch (failure) { entry.run.persistenceError = `消息消费核对失败：${String(failure)}`; }
@@ -218,41 +299,7 @@ async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: strin
     if (completed.persistenceError) {
       completed.failureReason = [completed.failureReason, `持久化失败：${completed.persistenceError}`].filter(Boolean).join("；");
     }
-    const persistenceFailure = (reason: string): void => {
-      completed.persistenceError = [completed.persistenceError, reason].filter(Boolean).join("；");
-      completed.failureReason = [completed.failureReason, `持久化失败：${reason}`].filter(Boolean).join("；");
-      completed.status = "失败";
-      completed.events = [...completed.events, { at: Date.now(), kind: "错误" as const, text: reason }].slice(-200);
-    };
-    // Completion history is attempted before the released terminal state becomes
-    // observable through readRun or result events. Foreground and background share
-    // this exact path; delivery mode only controls the later notification.
-    try { await persistCompletion(runDirectory(entry.run.runId), completed); }
-    catch (failure) {
-      persistenceFailure(`结果保存失败：${String(failure)}`);
-      await persistCompletion(runDirectory(entry.run.runId), completed, { overwrite: true }).catch((retryFailure) => {
-        persistenceFailure(`结果保存重试失败：${String(retryFailure)}`);
-      });
-    }
-    // Do not mutate the live object until this write finishes. Foreground
-    // waiters read the live object and must receive any persistence failure.
-    try { await queueSnapshot(entry, completed); }
-    catch (failure) {
-      persistenceFailure(`状态保存失败：${String(failure)}`);
-      await queueSnapshot(entry, completed).catch((retryFailure) => {
-        persistenceFailure(`状态保存重试失败：${String(retryFailure)}`);
-      });
-      // The first completion snapshot predates this status-write error. Refresh
-      // the same turn record so a later resume cannot erase the only evidence.
-      try { await persistCompletion(runDirectory(entry.run.runId), completed, { overwrite: true }); }
-      catch (historyFailure) {
-        persistenceFailure(`完成记录更新失败：${String(historyFailure)}`);
-        await queueSnapshot(entry, completed).catch(() => {});
-      }
-    }
-    Object.assign(entry.run, completed);
-    entry.pendingCompletion = undefined;
-    emit(entry, "state");
+    await publishCompletion(entry, completed);
   }
   if (notifyResult) notify(entry.run, "result");
 }
@@ -345,6 +392,7 @@ function handleEvent(entry: ExecutingRun, data: any): void {
       const state = await rpc.request("get_state");
       if (!entry.busy || entry.abort.signal.aborted || entry.run.turnId !== turnId || entry.serial !== serial || state?.isStreaming || state?.isCompacting) return;
       const error = entry.extensionError ?? entry.error;
+      if (!entry.interrupted && !error && await continuePendingInput(entry)) return;
       await finish(entry, entry.interrupted ? "已停止" : error ? "失败" : "已完成", error);
     }).catch((error) => failExecution(entry, turnId, error));
   }
@@ -369,11 +417,24 @@ function beginTurn(entry: ManagedRun): asserts entry is ExecutingRun {
   entry.replies = [];
   entry.pendingCompletion = undefined;
   Object.assign(entry.run, {
-    turnId: randomUUID(), ownerPid: process.pid,
+    turnId: randomUUID(),
+    ownerPid: process.pid,
     resourceState: "starting",
     status: entry.request.routing && !entry.request.routingDecision && !entry.request.routing.immediate ? "选配中" : "运行中",
-    attemptStartedAt: Date.now(), endedAt: undefined, exitCode: undefined, stderr: undefined,
-    finalText: undefined, reportPath: undefined, pendingQuestion: undefined, completionSource: undefined, failureReason: undefined, persistenceError: undefined, events: [], stopRequested: false, currentAction: "正在启动", usage: emptyUsage(),
+    attemptStartedAt: Date.now(),
+    endedAt: undefined,
+    exitCode: undefined,
+    stderr: undefined,
+    finalText: undefined,
+    reportPath: undefined,
+    pendingQuestion: undefined,
+    completionSource: undefined,
+    failureReason: undefined,
+    persistenceError: undefined,
+    events: [],
+    stopRequested: false,
+    currentAction: "正在启动",
+    usage: emptyUsage(),
   });
   requireCurrentExecution(entry);
 }
@@ -574,6 +635,27 @@ export async function resumeRun(runId: string, prompt: string, description?: str
   });
 }
 
+/** Refresh the saved child configuration when an existing session is explicitly resumed. */
+async function refreshSavedRuntimeConfig(run: PersistedRun, request: RunnerRequest): Promise<void> {
+  const toolsAt = request.argsPrefix.indexOf("--tools");
+  if (toolsAt >= 0) {
+    const oldTools = request.argsPrefix[toolsAt + 1].split(",").filter(Boolean);
+    const tools = oldTools.filter((tool) => !["agent_question", "agent_report"].includes(tool));
+    request.argsPrefix[toolsAt + 1] = tools.join(",");
+    run.tools = tools;
+  }
+  // Old records migrate only when explicitly resumed. Preserve the saved
+  // Pi execution arguments while removing retired internal tools.
+  const systemAt = request.argsPrefix.indexOf("--append-system-prompt");
+  let systemUpdate: { file: string; content: string } | undefined;
+  if (systemAt >= 0 && path.resolve(request.argsPrefix[systemAt + 1]) === path.join(runDirectory(run.runId), "SYSTEM.md")) {
+    const file = request.argsPrefix[systemAt + 1];
+    const old = await fs.promises.readFile(file, "utf8");
+    systemUpdate = { file, content: old.split("# 统一运行规则")[0] + childRuntimeRules() };
+  }
+  if (systemUpdate) await fs.promises.writeFile(systemUpdate.file, systemUpdate.content);
+}
+
 async function resumeOwned(entry: ManagedRun, prompt: string, description?: string, background = false, instruction = prompt): Promise<PersistedRun> {
   const runId = entry.run.runId;
   const resumable = isTerminalStatus(entry.run.status) || entry.run.status === "等待决定";
@@ -581,35 +663,21 @@ async function resumeOwned(entry: ManagedRun, prompt: string, description?: stri
   try {
     await entry.starting;
     await fs.promises.access(entry.run.childSessionPath).catch(() => { throw new Error("保存的子会话不存在，无法 resume；请明确新建任务。"); });
-    let header: any;
+    let header: unknown;
     try { header = JSON.parse((await fs.promises.readFile(entry.run.childSessionPath, "utf8")).split(/\r?\n/, 1)[0]); }
     catch { throw new Error("保存的子会话无法读取，不能创建空白替代；请修复会话或明确新建任务。"); }
-    if (header?.type !== "session" || typeof header.id !== "string") throw new Error("保存的子会话缺少有效会话头，无法 resume。");
+    if (!header || typeof header !== "object" || !("type" in header) || header.type !== "session" || !("id" in header) || typeof header.id !== "string") throw new Error("保存的子会话缺少有效会话头，无法 resume。");
     const nextRequest = structuredClone(entry.request);
     const nextRun = structuredClone(entry.run);
     nextRun.childSessionId = header.id;
-    await persistCompletion(runDirectory(runId), entry.run);
-    const toolsAt = nextRequest.argsPrefix.indexOf("--tools");
-    if (toolsAt >= 0) {
-      const oldTools = nextRequest.argsPrefix[toolsAt + 1].split(",").filter(Boolean);
-      const tools = oldTools.filter((tool) => !["agent_question", "agent_report"].includes(tool));
-      nextRequest.argsPrefix[toolsAt + 1] = tools.join(",");
-      nextRun.tools = tools;
-    }
-    // Old records migrate only when explicitly resumed. Preserve the saved
-    // Pi execution arguments while removing retired internal tools.
-    const systemAt = nextRequest.argsPrefix.indexOf("--append-system-prompt");
-    let systemUpdate: { file: string; content: string } | undefined;
-    if (systemAt >= 0 && path.resolve(nextRequest.argsPrefix[systemAt + 1]) === path.join(runDirectory(runId), "SYSTEM.md")) {
-      const file = nextRequest.argsPrefix[systemAt + 1];
-      const old = await fs.promises.readFile(file, "utf8");
-      systemUpdate = { file, content: old.split("# 统一运行规则")[0] + childRuntimeRules() };
-    }
+    // A failed final rewrite can leave history older than the current failure.
+    // Repair that turn before the new turn replaces the only current snapshot.
+    await saveCompletion(entry.run, Boolean(entry.run.persistenceError));
     nextRequest.prompt = [...entry.messages, prompt].join("\n\n");
     nextRequest.version = 3;
     nextRun.version = 3;
     nextRun.deliveryMode = background ? "background" : "foreground";
-    if (systemUpdate) await fs.promises.writeFile(systemUpdate.file, systemUpdate.content);
+    await refreshSavedRuntimeConfig(nextRun, nextRequest);
     entry.request = nextRequest;
     Object.assign(entry.run, nextRun);
     entry.messages = [];
@@ -697,7 +765,7 @@ export async function stopRun(runId: string, source: "tool-stop" | "panel-stop" 
       pendingQuestion: undefined,
       endedAt: run.endedAt ?? Date.now(), updatedAt: Date.now(), queuedMessageCount: 0,
     };
-    await persistCompletion(runDirectory(runId), stopped);
+    await saveCompletion(stopped);
     await writeJsonAtomic(statusPath(runId), stopped);
     return stopped;
   });
@@ -748,7 +816,7 @@ export async function reconcileRun(runId: string): Promise<PersistedRun | undefi
       currentAction: undefined, updatedAt: Date.now(), endedAt: run.endedAt ?? Date.now(), queuedMessageCount: 0,
       pendingQuestion: undefined,
     };
-    await persistCompletion(runDirectory(runId), lost);
+    await saveCompletion(lost);
     await writeJsonAtomic(statusPath(runId), lost);
     return lost;
   });

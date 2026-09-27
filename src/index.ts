@@ -1,17 +1,13 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
-import type { Usage } from "@earendil-works/pi-ai";
+import { createHash } from "node:crypto";
 import {
-  SessionManager,
   type ExtensionAPI,
+  type ExtensionContext,
   type Theme,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import { discoverAgentCandidates, discoverAgents, validateAgentDefinition } from "./agents.ts";
-import { buildChildSystemPrompt, buildTaskText, taskSummary } from "./instruction.ts";
+import { taskSummary } from "./instruction.ts";
 import { imageSettingsDiagnostic } from "./image-settings.ts";
 import {
   sendToRun,
@@ -19,17 +15,13 @@ import {
   reconcileRun,
   subscribeRunEvents,
   shutdownRuns,
-  initializeRun,
-  discardUninitializedRun,
   isTerminalStatus,
   launchRunner,
   listRuns,
   readRun,
   reconcileRuns,
-  runDirectory,
   stopRun,
   waitForRunTurn,
-  type RunnerRequest,
 } from "./runtime.ts";
 import { showAgentPanel, type AgentPanelAction } from "./ui.ts";
 import { RESULT_MESSAGE, statusLabel, taskOutput } from "./delivery.ts";
@@ -39,46 +31,19 @@ import { registerConfiguration } from "./configuration-ui.ts";
 import { createAgentFromDescription } from "./agent-creation.ts";
 import { renderFleet } from "./presentation.ts";
 import { prepareRouting } from "./routing.ts";
-import { canPrepareChildProvider, prepareChildProviders, saveChildProviders } from "./child-providers.ts";
+import { canPrepareChildProvider, prepareChildProviders } from "./child-providers.ts";
 import { registerRouting } from "./routing-ui.ts";
 import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, taskToolResult, runTitle, runRoleLabel } from "./tool-contract.ts";
-import { resolveTaskTarget, withTaskCreation } from "./task-identity.ts";
+import { resolveTaskTarget } from "./task-identity.ts";
+import { createTask } from "./task-creation.ts";
 import { AGENT_DECK_VERSION } from "./version.ts";
 import type {
   AgentDefinition,
   RunDetails,
   PersistedRun,
-  RunStatus,
 } from "./types.ts";
 
-const MAX_EVENTS = 200;
 const DECK_STATUS_KEY = "agent-deck";
-
-function emptyUsage(): Usage {
-  return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-  };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript, ...args] };
-  }
-  const executable = path.basename(process.execPath).toLowerCase();
-  if (!/^(node|bun)(\.exe)?$/.test(executable)) return { command: process.execPath, args };
-  return { command: "pi", args };
-}
-
-function childRuntimePath(): string {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "child-runtime.ts");
-}
 
 const BACKGROUND_WAIT = "结果会自动通知并唤醒主 Agent。可以继续独立工作；当前只需等待时，结束本轮回复即可，收到通知后继续验收。";
 
@@ -102,19 +67,14 @@ export function agentToolDescription(agents: AgentDefinition[], environmentWarni
   ].join("\n");
 }
 
-function pushEvent(details: RunDetails, kind: RunDetails["events"][number]["kind"], text: string): void {
-  details.events.push({ at: Date.now(), kind, text });
-  if (details.events.length > MAX_EVENTS) details.events.splice(0, details.events.length - MAX_EVENTS);
-}
-
 export default function agentDeck(pi: ExtensionAPI) {
   let deckEnabled = readDeckConfig().enabled;
   let agentTool: ToolDefinition<typeof AgentParameters, unknown>;
-  let refreshAgentTool = (_ctx: any): void => {};
-  const contextCwd = (ctx: any): string => typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
-  const isProjectTrusted = (ctx: any): boolean => typeof ctx?.isProjectTrusted === "function" ? ctx.isProjectTrusted() : false;
+  let refreshAgentTool = (_ctx: ExtensionContext): void => {};
+  const contextCwd = (ctx: ExtensionContext): string => typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
+  const isProjectTrusted = (ctx: ExtensionContext): boolean => typeof ctx?.isProjectTrusted === "function" ? ctx.isProjectTrusted() : false;
 
-  const applyDeckState = (ctx: any): void => {
+  const applyDeckState = (ctx: ExtensionContext): void => {
     const active = pi.getActiveTools().filter((name) => !["Agent", "SendMessage", "TaskStop", "agent_task", "agent_cancel", "delegate_agent", "wait_for_agents", "get_agent_results"].includes(name));
     pi.setActiveTools([...new Set([...active, "TaskStop", ...(deckEnabled ? ["Agent", "SendMessage"] : [])])]);
     ctx.ui.setStatus(
@@ -125,7 +85,7 @@ export default function agentDeck(pi: ExtensionAPI) {
     );
   };
 
-  const setDeckEnabled = async (enabled: boolean, ctx: any): Promise<void> => {
+  const setDeckEnabled = async (enabled: boolean, ctx: ExtensionContext): Promise<void> => {
     deckEnabled = enabled;
     await writeDeckConfig({ enabled });
     applyDeckState(ctx);
@@ -140,14 +100,14 @@ export default function agentDeck(pi: ExtensionAPI) {
   const openConfiguration = registerConfiguration(pi, (ctx) => { deckEnabled = readDeckConfig().enabled; refreshAgentTool(ctx); applyDeckState(ctx); });
   registerRouting(pi);
 
-  let activeContext: any;
+  let activeContext: ExtensionContext | undefined;
   let unsubscribe: (() => void) | undefined;
   let refreshScheduled = false;
   let fleetRefresh = 0;
   let recoveryNotice: string | undefined;
   const backgroundDelivery = createBackgroundDelivery(pi, () => activeContext);
 
-  const refreshFleet = async (ctx: any): Promise<void> => {
+  const refreshFleet = async (ctx: ExtensionContext): Promise<void> => {
     const refreshId = ++fleetRefresh;
     const parent = ctx.sessionManager.getSessionId();
     const runs = await listRuns(Number.MAX_SAFE_INTEGER, parent);
@@ -174,7 +134,7 @@ export default function agentDeck(pi: ExtensionAPI) {
         refreshScheduled = true;
         queueMicrotask(() => {
           refreshScheduled = false;
-          void refreshFleet(activeContext).catch((error) => activeContext?.ui.setStatus("agent-deck-error", String(error)));
+          if (activeContext) void refreshFleet(activeContext).catch((error) => activeContext?.ui.setStatus("agent-deck-error", String(error)));
         });
       }
     });
@@ -241,21 +201,19 @@ export default function agentDeck(pi: ExtensionAPI) {
       const params = parseMessageInput(raw);
       const run = await resolveTaskTarget(params.to, ctx.sessionManager.getSessionId());
       await reconcileRun(run.runId);
-      const gate = backgroundDelivery.acquire(run.runId);
-      try {
+      const sent = await backgroundDelivery.withToolDelivery(run.runId, async () => {
         const messageId = `m-${createHash("sha256").update(`${ctx.sessionManager.getSessionId()}:${_id}`).digest("hex")}`;
         const sent = await sendToRun(run.runId, params.message, params.summary, params.reply_to, messageId);
-        const current = (await readRun(run.runId)) ?? sent.run;
-        backgroundDelivery.release(current, gate);
-        const receipt = sent.delivery === "existing" ? `消息已有记录，状态：${sent.messageState}。`
-          : sent.delivery === "resumed" ? "已恢复原 Pi 子会话，在后台继续执行。"
-          : sent.delivery === "answered" ? "回答已提交，子 Agent 在原会话继续处理。" : "消息已保存并排队，将在 Pi 消息边界送入。";
-        return taskToolResult(current, current.pendingQuestion || isTerminalStatus(current.status) || current.status === "停止未确认"
-          ? `${receipt}\n\n${taskOutput(current)}` : `${receipt} 摘要：${params.summary}${current.deliveryMode === "background" ? `\n${BACKGROUND_WAIT}` : ""}`, sent.delivery, sent.messageId);
-      } catch (error) {
-        backgroundDelivery.discard(run.runId, gate);
-        throw error;
-      }
+        return { ...sent, run: (await readRun(run.runId)) ?? sent.run };
+      });
+      const current = sent.run;
+      const receipt = sent.delivery === "existing" ? `消息已有记录，状态：${sent.messageState}。`
+        : sent.delivery === "resumed" ? "已恢复原 Pi 子会话，在后台继续执行。"
+        : sent.delivery === "answered" ? "回答已提交，子 Agent 在原会话继续处理。" : "消息已保存并排队，将在 Pi 消息边界送入。";
+      const output = current.pendingQuestion || isTerminalStatus(current.status) || current.status === "停止未确认"
+        ? `${receipt}\n\n${taskOutput(current)}`
+        : `${receipt} 摘要：${params.summary}${current.deliveryMode === "background" ? `\n${BACKGROUND_WAIT}` : ""}`;
+      return taskToolResult(current, output, sent.delivery, sent.messageId);
     },
   });
 
@@ -272,16 +230,10 @@ export default function agentDeck(pi: ExtensionAPI) {
       const params = parseAgentInput(raw);
       if (params.resume !== undefined) {
         const original = await resolveTaskTarget(params.resume, ctx.sessionManager.getSessionId());
-        const deliveryGate = params.run_in_background ? backgroundDelivery.acquire(original.runId) : undefined;
-        let resumed: PersistedRun;
-        try {
+        const { run: resumed } = await backgroundDelivery.withToolDelivery(original.runId, async () => {
           const started = await resumeRun(original.runId, params.prompt, params.description, params.run_in_background, original.turnId ?? null);
-          resumed = (await readRun(original.runId)) ?? started;
-          if (deliveryGate) backgroundDelivery.release(resumed, deliveryGate);
-        } catch (error) {
-          if (deliveryGate) backgroundDelivery.discard(original.runId, deliveryGate);
-          throw error;
-        }
+          return { run: (await readRun(original.runId)) ?? started };
+        }, params.run_in_background);
         if (isTerminalStatus(resumed.status) || resumed.status === "停止未确认" || (params.run_in_background && resumed.pendingQuestion)) {
           return taskToolResult(resumed, taskOutput(resumed), "resumed");
         }
@@ -302,7 +254,7 @@ export default function agentDeck(pi: ExtensionAPI) {
       // A native/function provider from an unrelated parent extension must not
       // block every child task. Jev sees only models that an isolated child Pi
       // can actually load; an unavailable preference therefore soft-falls back.
-      const compatibleModels = (ctx.modelRegistry.getAvailable?.() ?? []).filter((candidate: any) =>
+      const compatibleModels = (ctx.modelRegistry.getAvailable?.() ?? []).filter((candidate) =>
         canPrepareChildProvider(ctx.modelRegistry, `${candidate.provider}/${candidate.id}`));
       const currentModel = ctx.model && canPrepareChildProvider(ctx.modelRegistry, `${ctx.model.provider}/${ctx.model.id}`)
         ? ctx.model : compatibleModels[0];
@@ -310,7 +262,7 @@ export default function agentDeck(pi: ExtensionAPI) {
         model: currentModel,
         modelRegistry: {
           getAvailable: () => compatibleModels,
-          find: (provider: string, id: string) => compatibleModels.find((candidate: any) => candidate.provider === provider && candidate.id === id),
+          find: (provider: string, id: string) => compatibleModels.find((candidate) => candidate.provider === provider && candidate.id === id),
         },
       };
       const routing = prepareRouting(agent, params.prompt, routingContext, config, pi.getThinkingLevel?.() ?? "off", { model });
@@ -319,118 +271,15 @@ export default function agentDeck(pi: ExtensionAPI) {
 
       const parent = ctx.sessionManager.getSessionId();
       const cwd = contextCwd(ctx);
-      const created = await withTaskCreation(parent, params.name, async () => {
-        const runId = `A-${randomUUID().slice(0, 8)}`;
-        const directory = runDirectory(runId);
-        let directoryCreated = false;
-        let providerSnapshot: string | undefined;
-        let childSessionPath: string | undefined;
-        let childSessionCreated = false;
-        let committed = false;
-        try {
-          await fs.promises.mkdir(path.dirname(directory), { recursive: true });
-          await fs.promises.mkdir(directory);
-          directoryCreated = true;
-          providerSnapshot = await saveChildProviders(runId, providers);
-          const childSessionId = randomUUID();
-          const parentSessionPath = ctx.sessionManager.getSessionFile();
-          const childManager = SessionManager.create(cwd, undefined, {
-            id: childSessionId,
-            parentSession: parentSessionPath,
-          });
-          childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${taskSummary(params.description, 36)}`);
-          childSessionPath = childManager.getSessionFile();
-          if (!childSessionPath) throw new Error("无法创建持久化子 Session");
-          // Pi defers the first disk write until an assistant message. Materialize
-          // its native header before another process opens this new session.
-          await fs.promises.writeFile(childSessionPath, [childManager.getHeader(), ...childManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "wx" });
-          childSessionCreated = true;
-          const details: RunDetails = {
-            version: 3,
-            runId,
-            roleId: agent.id,
-            agentName: agent.name,
-            agentSource: agent.source,
-            instanceName: params.name,
-            ...buildTaskText(params.prompt, params.description),
-            status: routing.immediate ? "运行中" : "选配中",
-            model: resolved.model,
-            thinking: resolved.thinking,
-            routing: routing.immediate,
-            routingPending: !routing.immediate,
-            tools: agent.tools,
-            disallowedTools: agent.disallowedTools ?? [],
-            extensions: agent.extensions,
-            deliveryMode: params.run_in_background ? "background" : "foreground",
-            parentSessionId: parent,
-            parentSessionPath,
-            childSessionId,
-            childSessionPath,
-            cwd,
-            startedAt: Date.now(),
-            events: [],
-            usage: emptyUsage(),
-          };
-          const background = params.run_in_background;
-          pushEvent(details, "状态", "已创建独立子 Session");
-          const systemPath = path.join(directory, "SYSTEM.md");
-          await fs.promises.writeFile(systemPath, buildChildSystemPrompt(agent), { encoding: "utf8", mode: 0o600 });
-          const childArgs = [
-            "--mode", "rpc",
-            "--session", childSessionPath,
-            "--name", `子Agent｜${params.name ?? agent.name}｜${taskSummary(params.description, 36)}`,
-            "--model", details.model,
-            "--thinking", details.thinking,
-            "--no-extensions",
-            ...agent.extensions.flatMap((extension) => ["--extension", extension]),
-            "--extension", childRuntimePath(),
-            ...(agent.tools ? ["--tools", agent.tools.join(",")] : []),
-            ...(agent.disallowedTools?.length ? ["--exclude-tools", agent.disallowedTools.join(",")] : []),
-            "--append-system-prompt", systemPath,
-          ];
-          const invocation = getPiInvocation(childArgs);
-          const runnerRequest: RunnerRequest = {
-            version: 3,
-            cwd,
-            command: invocation.command,
-            argsPrefix: invocation.args,
-            prompt: details.instruction,
-            timeoutMs: agent.timeoutMs ?? config.timeoutMs,
-            routing,
-            env: {
-              ...(providerSnapshot ? { PI_AGENT_DECK_PROVIDERS: providerSnapshot } : {}),
-              PI_AGENT_DECK_RUN_ID: runId,
-            },
-          };
-          const initialized = await initializeRun(details, runnerRequest, background);
-          committed = true;
-          return initialized;
-        } catch (error) {
-          if (committed) throw error;
-          const cleanup = await Promise.allSettled([
-            ...(directoryCreated ? [discardUninitializedRun(runId, parent)] : []),
-            ...(providerSnapshot ? [fs.promises.unlink(providerSnapshot).catch((failure: NodeJS.ErrnoException) => {
-              if (failure.code !== "ENOENT") throw failure;
-            })] : []),
-            ...(childSessionCreated && childSessionPath ? [fs.promises.unlink(childSessionPath).catch((failure: NodeJS.ErrnoException) => {
-              if (failure.code !== "ENOENT") throw failure;
-            })] : []),
-          ]);
-          const failures = cleanup.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-          if (failures.length) throw new AggregateError([error, ...failures.map((failure) => failure.reason)], `任务初始化失败，且部分临时文件未能清理：${String(error)}`);
-          throw error;
-        }
+      const created = await createTask({
+        agent, params, cwd, parentSessionId: parent,
+        parentSessionPath: ctx.sessionManager.getSessionFile(),
+        routing, providers, timeoutMs: agent.timeoutMs ?? config.timeoutMs,
       });
-      const deliveryGate = params.run_in_background ? backgroundDelivery.acquire(created.runId) : undefined;
-      let current: PersistedRun;
-      try {
+      const { run: current } = await backgroundDelivery.withToolDelivery(created.runId, async () => {
         await launchRunner(created.runId);
-        current = (await readRun(created.runId)) ?? created;
-        if (deliveryGate) backgroundDelivery.release(current, deliveryGate);
-      } catch (error) {
-        if (deliveryGate) backgroundDelivery.discard(created.runId, deliveryGate);
-        throw error;
-      }
+        return { run: (await readRun(created.runId)) ?? created };
+      }, params.run_in_background);
       if (isTerminalStatus(current.status) || current.status === "停止未确认" || (params.run_in_background && current.pendingQuestion)) {
         return taskToolResult(current, taskOutput(current));
       }
@@ -469,14 +318,14 @@ export default function agentDeck(pi: ExtensionAPI) {
     },
   };
   pi.registerTool(agentTool);
-  refreshAgentTool = (ctx: any) => {
+  refreshAgentTool = (ctx: ExtensionContext) => {
     const cwd = contextCwd(ctx), projectTrusted = isProjectTrusted(ctx);
     const images = imageSettingsDiagnostic(cwd, projectTrusted);
     agentTool.description = agentToolDescription(discoverAgents(cwd, { projectTrusted }), images.warning ? images.text : undefined);
     pi.registerTool(agentTool);
   };
 
-  const handlePanelAction = async (action: AgentPanelAction, ctx: any): Promise<void> => {
+  const handlePanelAction = async (action: AgentPanelAction, ctx: ExtensionContext): Promise<void> => {
     if (action.action === "关闭") return;
     if (action.action === "创建") { await createAgentFromDescription(pi, ctx); refreshAgentTool(ctx); return; }
     if (action.action === "配置") return openConfiguration("", ctx);
@@ -496,7 +345,7 @@ export default function agentDeck(pi: ExtensionAPI) {
 
   };
 
-  const openAgentPanel = async (ctx: any): Promise<void> => {
+  const openAgentPanel = async (ctx: ExtensionContext): Promise<void> => {
     while (true) {
       const action = await showAgentPanel(ctx);
       await handlePanelAction(action, ctx);

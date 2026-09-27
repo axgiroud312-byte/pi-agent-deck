@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import test from "node:test";
-import { getAgentDir, DefaultResourceLoader, SettingsManager, ModelRuntime, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, DefaultResourceLoader, SettingsManager, ModelRuntime, ModelRegistry, SessionManager } from "@earendil-works/pi-coding-agent";
 import agentDeck from "../src/index.ts";
 import { DEFAULT_CONFIG, parseDeckConfig, readDeckConfig, writeDeckConfig } from "../src/config.ts";
 import { discoverAgents } from "../src/agents.ts";
@@ -285,12 +285,13 @@ test("持久化记录损坏时不把已绑定名称当作可用，也不创建�
   const original = await fs.readFile(file, "utf8");
   await fs.writeFile(file, "{broken");
   let created = false;
-  h.ctx.sessionManager.getSessionFile = () => { created = true; return undefined; };
+  const createSession = SessionManager.create;
+  SessionManager.create = (...args) => { created = true; return createSession(...args); };
   try {
     await assert.rejects(h.call("Agent", { ...input, name: "durable-name" }), /无法读取任务记录/);
     await assert.rejects(h.call("SendMessage", { to: "durable-name", message: "不应发错对象" }), /无法读取任务记录/);
     assert.equal(created, false);
-  } finally { await fs.writeFile(file, original); }
+  } finally { SessionManager.create = createSession; await fs.writeFile(file, original); }
 });
 
 test("其他父会话的损坏记录不阻止新会话创建；当前会话仍严格检查名称", async (t) => {

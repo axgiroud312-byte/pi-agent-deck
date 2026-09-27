@@ -1,4 +1,4 @@
-import type { PersistedRun } from "./types.ts";
+import type { PersistedRun, RunDetails } from "./types.ts";
 import * as fs from "node:fs";
 import { runTitle, runRoleLabel } from "./tool-contract.ts";
 import * as path from "node:path";
@@ -39,7 +39,7 @@ class AgentPanelComponent {
   private timer: NodeJS.Timeout;
   private refreshing = false;
   private refreshError?: string;
-  private history?: { runId: string; results: PersistedRun[] };
+  private history?: { runId: string; results: Readonly<RunDetails>[] };
 
   constructor(
     initialRuns: PersistedRun[],

@@ -20,9 +20,17 @@ export interface MessageRecord {
 }
 
 export const messagesPath = (runId: string): string => path.join(runDirectory(runId), "messages.json");
-export function messageText(message: any): string {
-  return typeof message?.content === "string" ? message.content
-    : (message?.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
+function object(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+}
+export function messageText(message: unknown): string {
+  const content = object(message)?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap(value => {
+    const part = object(value);
+    return part?.type === "text" && typeof part.text === "string" ? [part.text] : [];
+  }).join("\n");
 }
 export function messageIds(text: string): string[] {
   return [...text.matchAll(/\[agent-deck-message:([a-zA-Z0-9_-]+)\]/g)].map(match => match[1]);
@@ -100,10 +108,11 @@ export async function settleMessages(runId: string, direction: MessageRecord["di
 }
 
 /** Only input messages are evidence; an assistant quoting an ID is not an acknowledgement. */
-export function inputMessageIds(message: any): string[] {
-  if (!["user", "toolResult", "custom"].includes(message?.role)) return [];
+export function inputMessageIds(message: unknown): string[] {
+  const input = object(message);
+  if (!input || typeof input.role !== "string" || !["user", "toolResult", "custom"].includes(input.role)) return [];
   const ids = messageIds(messageText(message));
-  const details = message.details;
+  const details = object(input.details);
   if (typeof details?.deliveryId === "string") ids.push(details.deliveryId);
   if (typeof details?.messageId === "string") ids.push(details.messageId);
   return ids;
@@ -121,9 +130,9 @@ export async function reconcileMessages(run: PersistedRun, direction: MessageRec
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; text = ""; }
     for (const line of text.split(/\r?\n/)) {
       if (!line.trim()) continue;
-      let entry: any;
-      try { entry = JSON.parse(line); } catch { continue; /* Interrupted final append carries no evidence. */ }
-      const message = entry.type === "message" ? entry.message : entry.type === "custom_message" ? { ...entry, role: "custom" } : undefined;
+      let entry: Record<string, unknown> | undefined;
+      try { entry = object(JSON.parse(line)); } catch { continue; /* Interrupted final append carries no evidence. */ }
+      const message = entry?.type === "message" ? entry.message : entry?.type === "custom_message" ? { ...entry, role: "custom" } : undefined;
       for (const id of inputMessageIds(message)) consumed.add(id);
     }
   }

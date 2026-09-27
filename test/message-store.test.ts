@@ -81,7 +81,7 @@ test("恢复原生 user 和 toolResult 消费证据，未找到证据的已提�
   child.appendMessage({ role: "user", content: [{ type: "text", text: addressedMessage(input.id, input.text) }], timestamp: Date.now() });
   child.appendMessage({ role: "toolResult", toolCallId: "question-call", toolName: "SendMessage", content: [{ type: "text", text: `主 Agent 回答：\n${addressedMessage(answer.id, answer.text)}` }], isError: false, timestamp: Date.now() });
   child.appendMessage(fauxAssistantMessage(addressedMessage(quoted.id, "我提到了这个编号")));
-  await fs.appendFile(child.getSessionFile()!, '\n{"type":"message","message":');
+  await fs.appendFile(child.getSessionFile()!, '\nnull\n42\n{"type":"message","message":{"role":"user","content":{}}}\n{"type":"message","message":');
   const run = { ...taskId, childSessionPath: child.getSessionFile()! } as PersistedRun;
   await reconcileMessages(run, "to-child");
   const records = new Map((await readMessages(taskId.runId)).map(record => [record.id, record]));

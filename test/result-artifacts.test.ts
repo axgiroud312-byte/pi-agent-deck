@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { persistCompletion, readCompletions } from "../src/persistence.mjs";
+import { completionId, persistCompletion, readCompletions } from "../src/persistence.mjs";
 import { resultMessage } from "../src/delivery.ts";
 import type { PersistedRun } from "../src/types.ts";
 
@@ -33,68 +33,73 @@ function resultPath(directory: string, run: PersistedRun): string {
 test("完整报告原文保存长文本尾部，通知截断预览后仍带绝对文件路径", async (t) => {
   const directory = await fixture(t);
   const run = completed({ finalText: "正文\n".repeat(10000) + "最后修正：TAIL_EVIDENCE" });
-  await persistCompletion(directory, run);
-  assert.ok(run.reportPath && path.isAbsolute(run.reportPath));
-  assert.equal(run.reportPath, resultPath(directory, run).replace(/\.json$/, ".md"));
-  const report = await fs.readFile(run.reportPath, "utf8");
+  const before = structuredClone(run);
+  const reportPath = await persistCompletion(directory, Object.freeze(run));
+  assert.deepEqual(run, before);
+  const published = { ...run, reportPath };
+  assert.ok(published.reportPath && path.isAbsolute(published.reportPath));
+  assert.equal(published.reportPath, resultPath(directory, run).replace(/\.json$/, ".md"));
+  const report = await fs.readFile(published.reportPath, "utf8");
   assert.ok(report.includes(run.finalText!));
   assert.match(report, /最后修正：TAIL_EVIDENCE\n$/);
-  const notice = resultMessage(run, "parent")!;
+  const notice = resultMessage(published, "parent")!;
   assert.ok(notice.content.length < 26000);
-  assert.ok(notice.content.endsWith(`完整结果文件：${run.reportPath}`));
-  assert.equal(notice.details.reportPath, run.reportPath);
+  assert.ok(notice.content.endsWith(`完整结果文件：${published.reportPath}`));
+  assert.equal(notice.details.reportPath, published.reportPath);
   assert.match(notice.details.evidence, /TAIL_EVIDENCE$/);
-  assert.equal((await readCompletions(directory))[0].reportPath, run.reportPath);
+  assert.equal((await readCompletions(directory))[0].reportPath, published.reportPath);
 });
 
 test("短报告通知也含路径，同任务续接的新轮次保留两份独立报告", async (t) => {
   const directory = await fixture(t);
   const first = completed({ finalText: "第一轮验收" });
-  await persistCompletion(directory, first);
+  first.reportPath = await persistCompletion(directory, first);
   const firstReport = await fs.readFile(first.reportPath!, "utf8");
   const next = completed({ turnId: "turn-2", finalText: "第二轮修正", endedAt: 3, reportPath: first.reportPath });
-  await persistCompletion(directory, next);
+  next.reportPath = await persistCompletion(directory, next);
   assert.notEqual(next.reportPath, first.reportPath);
   assert.equal(await fs.readFile(first.reportPath!, "utf8"), firstReport);
   assert.match(await fs.readFile(next.reportPath!, "utf8"), /第二轮修正/);
   assert.equal((await readCompletions(directory)).length, 2);
   assert.ok(resultMessage(next, "parent")!.content.includes(`完整结果文件：${next.reportPath}`));
-  const repeat = { ...first, finalText: "之后变化的内存文本", reportPath: undefined };
-  await persistCompletion(directory, repeat);
-  assert.equal(repeat.reportPath, first.reportPath);
+  const repeat: PersistedRun = { ...first, finalText: "之后变化的内存文本", reportPath: undefined };
+  const beforeRepeat = structuredClone(repeat);
+  const repeatedPath = await persistCompletion(directory, Object.freeze(repeat));
+  assert.deepEqual(repeat, beforeRepeat);
+  assert.equal(repeatedPath, first.reportPath);
+  assert.equal(repeat.reportPath, undefined);
   assert.equal(await fs.readFile(first.reportPath!, "utf8"), firstReport, "已保存的同轮报告不因重复持久化变化");
 });
 
 test("失败报告保存完整失败原因、持久化原因和已完成的交付文本", async (t) => {
   const directory = await fixture(t);
   const run = completed({ status: "失败", failureReason: "失败原因\n".repeat(7000) + "TAIL_FAILURE", persistenceError: "之前的状态写入失败", finalText: "已验证的部分结果" });
-  await persistCompletion(directory, run);
+  run.reportPath = await persistCompletion(directory, run);
   const report = await fs.readFile(run.reportPath!, "utf8");
   for (const text of ["运行状态：失败", "TAIL_FAILURE", "之前的状态写入失败", "已验证的部分结果"]) assert.ok(report.includes(text));
 });
 
-test("报告保存失败时不保存结果快照或发布旧轮次路径", async (t) => {
+test("报告保存失败不修改输入，也不保存结果快照", async (t) => {
   const directory = await fixture(t);
   const run = completed({ reportPath: path.join(directory, "previous-turn.md") });
   const file = resultPath(directory, run);
   await fs.mkdir(file.replace(/\.json$/, ".md"), { recursive: true });
-  await assert.rejects(persistCompletion(directory, run));
-  assert.equal(run.reportPath, undefined);
+  const before = structuredClone(run);
+  await assert.rejects(persistCompletion(directory, Object.freeze(run)));
+  assert.deepEqual(run, before);
   await assert.rejects(fs.access(file));
-  assert.equal(resultMessage(run, "parent")!.details.reportPath, undefined);
-  assert.doesNotMatch(resultMessage(run, "parent")!.content, /完整结果文件：/);
   assert.ok((await fs.readdir(path.dirname(file))).every((name) => !name.endsWith(".tmp")));
 });
 
 test("结果 JSON 保存失败时已写的报告不被宣称为已持久化交付", async (t) => {
   const directory = await fixture(t);
-  const run = completed();
+  const run = completed({ reportPath: path.join(directory, "previous-turn.md") });
   const file = resultPath(directory, run);
   await fs.mkdir(file, { recursive: true });
-  await assert.rejects(persistCompletion(directory, run, { overwrite: true }));
-  assert.equal(run.reportPath, undefined);
+  const before = structuredClone(run);
+  await assert.rejects(persistCompletion(directory, Object.freeze(run), { overwrite: true }));
+  assert.deepEqual(run, before);
   assert.match(await fs.readFile(file.replace(/\.json$/, ".md"), "utf8"), /完整交付/);
-  assert.equal(resultMessage(run, "parent")!.details.reportPath, undefined);
 });
 
 test("旧 JSON 结果可以读取，显式持久化补齐报告时使用历史原文", async (t) => {
@@ -105,9 +110,39 @@ test("旧 JSON 结果可以读取，显式持久化补齐报告时使用历史�
   await fs.writeFile(file, JSON.stringify(run));
   assert.equal((await readCompletions(directory))[0].reportPath, undefined);
   run.finalText = "后来的内存文本";
-  await persistCompletion(directory, run);
-  const report = await fs.readFile(run.reportPath!, "utf8");
+  const before = structuredClone(run);
+  const reportPath = await persistCompletion(directory, Object.freeze(run));
+  assert.deepEqual(run, before);
+  const published = { ...run, reportPath };
+  const report = await fs.readFile(published.reportPath!, "utf8");
   assert.match(report, /历史原文/);
   assert.doesNotMatch(report, /后来的内存文本/);
-  assert.equal((await readCompletions(directory))[0].reportPath, run.reportPath);
+  assert.equal((await readCompletions(directory))[0].reportPath, published.reportPath);
+});
+
+
+test("运行中的快照不生成完成报告，也不修改调用方对象", async (t) => {
+  const directory = await fixture(t);
+  const run = Object.freeze(completed({ status: "运行中", reportPath: "previous-turn.md" }));
+  const before = structuredClone(run);
+  assert.equal(await persistCompletion(directory, run), undefined);
+  assert.deepEqual(run, before);
+  assert.deepEqual(await fs.readdir(directory), []);
+});
+
+test("刷新旧状态命名的报告时按轮次原位更新，不因状态改变创建第二份历史", async (t) => {
+  const directory = await fixture(t);
+  const original = completed();
+  const file = path.join(directory, "results", `${createHash("sha256").update(completionId(original)).digest("hex")}.json`);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify(original));
+  const repaired = Object.freeze(completed({ status: "失败", persistenceError: "REPORT_REFRESH_FAILED" }));
+  const reportPath = await persistCompletion(directory, repaired, { overwrite: true });
+  assert.equal(reportPath, file.replace(/\.json$/, ".md"));
+  assert.equal(await persistCompletion(directory, repaired), reportPath);
+  const histories = await readCompletions(directory);
+  assert.equal(histories.length, 1);
+  assert.equal(histories[0].status, "失败");
+  assert.match(histories[0].persistenceError ?? "", /REPORT_REFRESH_FAILED/);
+  assert.match(await fs.readFile(reportPath!, "utf8"), /REPORT_REFRESH_FAILED/);
 });

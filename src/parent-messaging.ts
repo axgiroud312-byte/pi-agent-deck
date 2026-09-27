@@ -6,10 +6,13 @@ import { Type } from "typebox";
 export const PARENT_MESSAGE_TITLE = "agent-deck:parent-message";
 export interface ParentMessage { id: string; message: string; waitForReply: boolean }
 
-export function parseParentMessage(event: any): ParentMessage | undefined {
+export function parseParentMessage(value: unknown): ParentMessage | undefined {
+  if (!value || typeof value !== "object") return;
+  const event = value as Record<string, unknown>;
   if (event.type !== "extension_ui_request" || event.method !== "input" || event.title !== PARENT_MESSAGE_TITLE) return;
-  const body = JSON.parse(event.placeholder);
-  if (typeof event.id !== "string" || typeof body.message !== "string" || !body.message.trim() || typeof body.waitForReply !== "boolean") {
+  const body: unknown = typeof event.placeholder === "string" ? JSON.parse(event.placeholder) : undefined;
+  if (!body || typeof body !== "object" || !("message" in body) || !("waitForReply" in body)
+    || typeof event.id !== "string" || typeof body.message !== "string" || !body.message.trim() || typeof body.waitForReply !== "boolean") {
     throw new Error("子 Agent 消息需要请求编号、正文和等待回答标记。");
   }
   return { id: event.id, message: body.message, waitForReply: body.waitForReply };

@@ -27,11 +27,13 @@ Agent Deck 是 Pi 原生子会话的薄编排层，不是第二套 Agent runtime
 
 `taskMessage()` 是工具回执和后台通知的共同正文格式。每条正文包含 `agentId`、`turnId`、可选名称、角色、状态和消息记录路径，必要时带资源状态、已确定模型、消息编号、投递状态、完整报告路径及错误；内部 `run` 和兼容 `publicResult` 留在 `details`。Pi 的模型消息只消费 `content`，控制任务所需信息必须出现在正文，测试也必须跨过这个边界。消息头提供寻址和核对信息，不承载角色限制。
 
-`taskOutput()` 只生成结果与错误正文，身份头由外层添加一次。它与 Markdown 报告共用存储层的 `completionOutput()`，避免两套结果格式。前台保留完整最终文本；后台通知预览最多 24,000 字符，完整报告路径在截断之后追加，`details.evidence` 保留全文。
+`taskOutput()` 只生成结果与错误正文，身份头由外层添加一次。`taskResultMessage()` 生成前后台共用的结果身份和正文；`resultMessage()` 单独判断后台模式与父会话归属。它与 Markdown 报告共用存储层的 `completionOutput()`，避免两套结果格式。前台保留完整最终文本；后台通知预览最多 24,000 字符，完整报告路径在截断之后追加，`details.evidence` 保留全文。
+
+工具入口通过 `backgroundDelivery.withToolDelivery()` 执行需要协调通知的操作。交付模块在内部成对取得、释放或撤销结果认领；新建和显式续接仅在后台模式使用这项协调，SendMessage 始终使用。等待前台结果继续在包装器之外。`tool_result` 登记结果、`message_end` 确认实际消费，两个事件各自保持原生职责。
 
 回执分别表达执行 `status` 和消息 `delivery: queued | answered | resumed | existing`。`existing` 表示同一个工具调用已有持久化消息记录，返回该消息 ID 与当前状态，不再次提交。`index.ts` 用父会话 ID 和 Pi 的 `toolCallId` 派生稳定消息 ID；新调用即使正文相同也拥有独立 ID。业务完成与否由主 Agent 阅读交付判断；操作条件不合法时抛出工具错误。父 `SendMessage` 接受可选 `reply_to`，防止迟到或重复回答作用于其他问题。三个父工具名称保持不变。
 
-`Agent` 省略 `run_in_background` 或传 `false` 时前台等待；传 `true` 时通常立即回执并在完成后通知。若任务在初始工具调用返回前已经终态，工具直接返回最终结果，不再发送第二次通知；工具结果进入原生上下文后才记录消费。前后台使用同一套 `initializeRun → startExecution → finish` 流程；`finish` 先处理正常收尾的剩余输入，再确认进程退出、保存完整报告与结果、发布终态。
+`Agent` 省略 `run_in_background` 或传 `false` 时前台等待；传 `true` 时通常立即回执并在完成后通知。若任务在初始工具调用返回前已经终态，工具直接返回最终结果，不再发送第二次通知；工具结果进入原生上下文后才记录消费。前后台使用同一套运行流程。正常 `agent_settled` 先调用 `continuePendingInput` 处理已接受的剩余输入；可以结束后，`finish` 通过 `releaseProcess` 确认进程退出，再由 `publishCompletion` 保存历史与当前状态并发布终态。错误与主动停止直接进入结束流程。
 
 `SendMessage` 在同一任务控制队列内根据当前状态执行：
 
@@ -123,6 +125,8 @@ roleId（角色定义）
 
 `persistCompletion()` 先原子写入 Markdown，再原子保存结果 JSON，两者成功后才向运行记录发布绝对 `reportPath`。新轮次清空当前报告路径；按 turn 派生的文件名保证续接不会覆盖上一轮结果。重复保存同轮已存在结果时复用已保存文本；收尾期间明确 `overwrite` 可更新同轮运行错误。旧 JSON-only 结果保持可读，在显式持久化时使用历史快照原文补齐报告。
 
+当前轮次带有 `persistenceError` 时，续接先覆盖修复该轮历史，再开始新轮，避免旧成功快照掩盖后续保存失败。此类修复按轮次查找旧文件并原位更新，兼容文件名包含旧状态的历史记录；修复仍失败时保留当前轮次和错误。
+
 任务记录直接保存 `tools / disallowedTools / extensions`，不再复制成第二套“生效配置”对象。resume 使用保存的请求、这些直接字段和 Session，不重新读取角色文件。
 
 `adaptStoredRun()` 是 v1/v2/v3 的集中读取边界。v3 的当前问题保留在 `pendingQuestion`；旧问答、报告、租约、结构化结果、工具证据和写权限进入 `legacy`。启动扫描按旧版本读取历史运行快照，消息恢复另行更新插件账本。`SendMessage` 或显式 resume 续接时写为 v3，移除旧工具并刷新公共运行说明，原角色正文和 Pi Session 保留。
@@ -171,7 +175,8 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 | `types.ts` / `legacy-types.ts` | 稳定身份、兼容读取快照、严格当前执行与历史只读类型 |
 | `agents.ts` | 角色发现、frontmatter 解析、旧字段迁移 |
 | `instruction.ts` / `agents/*.md` | 本轮任务文本与摘要生成、子 Agent 行为提示和内置角色职责 |
-| `runtime.ts` | 当前主 Pi 持有的任务控制器、steer、resume、停止和收口 |
+| `task-creation.ts` | 新任务子会话、启动配置、私有 provider 快照与创建失败清理 |
+| `runtime.ts` | 当前主 Pi 持有的任务控制器、steer、resume、剩余输入处理、进程释放与结果发布 |
 | `run-store.ts` | 记录路径、父会话索引、磁盘读取缓存、原子写入及未完成创建的清理 |
 | `message-store.ts` | 双向消息账本、投递/消费证据、原生 Session 恢复核对 |
 | `rpc-connection.ts` | Pi JSONL RPC、子进程退出确认和可重试 close |
@@ -186,7 +191,7 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 | `agent-creation.ts` / `agent-authoring.md` | 自然语言创建角色及格式说明 |
 | `scripts/check-docs.mjs` | 当前文档链接和退役合同检查 |
 
-记录类型由 `types.ts` 提供，存储层不反向依赖运行控制器。`runtime.ts` 为现有内部调用保留存储辅助函数和 `PersistedRun` 的导出兼容。列表通过读取回调叠加当前进程的实时状态，控制动作使用绕过显示缓存的磁盘读取。
+记录类型由 `types.ts` 提供，存储层不反向依赖运行控制器。 历史结果读取返回只读 `RunDetails`，活动状态使用含 `updatedAt` 和进程归属的 `PersistedRun`。`persistCompletion()` 只返回已保存的报告路径，保持传入对象不变；运行控制器的 `saveCompletion()` 明确失效旧路径并接收新路径，保存失败时保留可追查的错误。`runtime.ts` 为现有内部调用保留存储辅助函数和 `PersistedRun` 的导出兼容。列表通过读取回调叠加当前进程的实时状态，控制动作使用绕过显示缓存的磁盘读取。
 
 ## 测试分层
 
@@ -199,7 +204,7 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 
 `parent-messaging.test.ts` 在真实父子 Pi 和 HTTP 模型输入边界验证前后台问答、回答后写入文件、完成后消息续接及历史原文。`rpc-integration.test.ts` 覆盖连续提问、过期回答、等待中停止/续接、进度通道、显式工具白名单与完整报告后追加摘要。
 
-`message-store.test.ts` 验证提交与消费的区别、同正文独立编号、原生 user/toolResult/custom_message 的恢复证据、assistant 引用排除、损坏账本和并发更新。`result-artifacts.test.ts` 验证长报告尾部、每轮独立文件、完整错误、写入失败不发布路径及旧记录补报告。收尾边界还应覆盖先送达后 settled、收尾期间输入、完成后续接以及明确停止后的消息去向；本地受控 provider 的结果与在线模型自主调度实验分开记录。
+`message-store.test.ts` 验证提交与消费的区别、同正文独立编号、原生 user/toolResult/custom_message 的恢复证据、assistant 引用排除、损坏账本和并发更新。`result-artifacts.test.ts` 验证长报告尾部、每轮独立文件、完整错误、保存成功或失败均不修改输入及旧记录补报告。`runtime-boundaries.test.ts` 继续验证运行层在报告刷新失败后撤销路径并保存错误；`delivery.test.ts` 验证并发工具操作成功认领或全部失败后只补送一次。收尾边界还应覆盖先送达后 settled、收尾期间输入、完成后续接以及明确停止后的消息去向；本地受控 provider 的结果与在线模型自主调度实验分开记录。
 
 验收命令必须在项目目录执行：
 

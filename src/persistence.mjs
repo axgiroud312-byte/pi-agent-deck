@@ -180,39 +180,58 @@ export function completionOutput(run) {
     text ?? "（子 Agent 正常结束，但没有输出文本。）",
   ].filter((item) => item !== undefined).join("\n\n");
 }
-async function writeCompletionArtifacts(file, snapshot, run) {
+async function writeCompletionArtifacts(file, snapshot) {
   const reportPath = path.resolve(file.replace(/\.json$/, ".md"));
   const title = snapshot.description || snapshot.objective || snapshot.runId;
   const report = `# ${title}\n\n任务：${snapshot.runId}\n\n执行轮次：${snapshot.turnId ?? snapshot.attemptStartedAt ?? snapshot.startedAt}\n\n运行状态：${snapshot.status}\n\n${completionOutput(snapshot)}\n`;
   // The notification path is published only after both durable artifacts succeed.
   await atomicText(reportPath, report);
   await atomicJson(file, { ...snapshot, reportPath });
-  run.reportPath = reportPath;
   completionCache.delete(path.dirname(file));
+  return reportPath;
+}
+/** Reuse a turn's original filename, including records named by an older status. */
+async function findCompletionRecord(root, run, file, overwrite) {
+  const legacyFile = path.join(root, `${createHash("sha256").update(completionId(run)).digest("hex")}.json`);
+  const candidates = [...new Set([file, legacyFile])];
+  for (const candidate of candidates) {
+    try {
+      if (overwrite) { await fs.access(candidate); return { file: candidate }; }
+      return { file: candidate, snapshot: await readJson(candidate) };
+    }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  // A failed rewrite may have changed the status used in an old filename.
+  // Normal new turns need no history scan.
+  if (!run.persistenceError) return;
+  let names;
+  try { names = await fs.readdir(root); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  for (const name of names.filter(name => name.endsWith(".json"))) {
+    const candidate = path.join(root, name);
+    if (candidates.includes(candidate)) continue;
+    const snapshot = await readJson(candidate);
+    if (completionRecordId(snapshot) === completionRecordId(run)) return { file: candidate, snapshot };
+  }
 }
 export async function persistCompletion(directory, run, options = {}) {
   if (!["已完成", "失败", "已取消", "已停止", "失联", "等待决定"].includes(run.status)) return;
-  delete run.reportPath;
   const root = path.join(directory, "results");
   // A turn has one durable result record even if cleanup changes its final
   // operational status. Notification identity remains status-specific above.
-  const file = path.join(root, `${createHash("sha256").update(completionRecordId(run)).digest("hex")}.json`);
-  if (!options.overwrite) {
-    const legacyFile = path.join(root, `${createHash("sha256").update(completionId(run)).digest("hex")}.json`);
-    for (const existing of [file, legacyFile]) {
-      let snapshot;
-      try { snapshot = await readJson(existing); } catch (error) { if (error.code === "ENOENT") continue; throw error; }
-      const reportPath = path.resolve(existing.replace(/\.json$/, ".md"));
-      if (snapshot.reportPath === reportPath) {
-        try {
-          if ((await fs.stat(reportPath)).isFile()) { run.reportPath = reportPath; return; }
-        } catch (error) { if (error.code !== "ENOENT") throw error; }
-      }
-      // Old JSON-only results gain a readable copy on explicit persistence;
-      // the saved turn's text remains authoritative over a later caller snapshot.
-      await writeCompletionArtifacts(existing, snapshot, run);
-      return;
+  const preferred = path.join(root, `${createHash("sha256").update(completionRecordId(run)).digest("hex")}.json`);
+  const existing = await findCompletionRecord(root, run, preferred, options.overwrite);
+  const file = existing?.file ?? preferred;
+  if (existing && !options.overwrite) {
+    const reportPath = path.resolve(file.replace(/\.json$/, ".md"));
+    if (existing.snapshot.reportPath === reportPath) {
+      try {
+        if ((await fs.stat(reportPath)).isFile()) return reportPath;
+      } catch (error) { if (error.code !== "ENOENT") throw error; }
     }
+    // Old JSON-only results gain a readable copy on explicit persistence;
+    // the saved turn's text remains authoritative over a later caller snapshot.
+    return writeCompletionArtifacts(file, existing.snapshot);
   }
   const snapshot = {
     version: run.version ?? 1, runId: run.runId, parentSessionId: run.parentSessionId, turnId: run.turnId,
@@ -230,7 +249,7 @@ export async function persistCompletion(directory, run, options = {}) {
     usage: structuredClone(run.usage),
     events: (run.events ?? []).filter((event) => event.kind === "错误"),
   };
-  await writeCompletionArtifacts(file, snapshot, run);
+  return writeCompletionArtifacts(file, snapshot);
 }
 const completionCache = new Map();
 export async function readCompletions(directory) {

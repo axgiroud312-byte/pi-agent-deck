@@ -446,6 +446,51 @@ test("最终 status 写失败时保留文本与 persistenceError，并明确记�
   assert.equal((await readCompletions(runDirectory(id))).filter((item: any) => item.turnId === firstTurn).length, 1, "同一执行轮次只能有一个最终结果记录");
 });
 
+test("完成报告刷新失败时撤销旧路径，故障解除后的续接保留旧轮错误", async t => {
+  const { id } = await fixture(t);
+  const original = fs.rename;
+  let statusFailed = false;
+  let firstReport: string | undefined;
+  let firstTurn: string | undefined;
+  fs.rename = async (from, to) => {
+    if (String(to) === statusPath(id) && !statusFailed) {
+      const candidate = JSON.parse(await fs.readFile(from, "utf8"));
+      if (candidate.status === "已完成" && candidate.resourceState === "released") {
+        statusFailed = true;
+        throw Object.assign(new Error("STATUS_BEFORE_REPORT_REFRESH"), { code: "EIO" });
+      }
+    }
+    if (String(to).includes(id) && String(to).endsWith(".md")) {
+      if (statusFailed) throw Object.assign(new Error("REPORT_REFRESH_FAILED"), { code: "EIO" });
+      firstReport = String(to);
+    }
+    return original(from, to);
+  };
+  try {
+    await launchRunner(id);
+    const current = (await readRun(id))!;
+    const result = await waitForRunTurn(id, current.turnId!, { pollMs: 5 });
+    firstTurn = result.turnId;
+    assert.equal(result.status, "失败");
+    assert.equal(result.resourceState, "released");
+    assert.equal(result.reportPath, undefined);
+    assert.match(result.persistenceError ?? "", /REPORT_REFRESH_FAILED/);
+    const stored = JSON.parse(await fs.readFile(statusPath(id), "utf8"));
+    assert.equal(stored.reportPath, undefined);
+    assert.match(stored.persistenceError, /REPORT_REFRESH_FAILED/);
+    assert.ok(firstReport);
+    assert.match(await fs.readFile(firstReport, "utf8"), /PARTIAL_TEXT/);
+  } finally { fs.rename = original; }
+  const resumed = await resumeRun(id, "continue after storage recovery");
+  await waitForRunTurn(id, resumed.turnId!, { pollMs: 5 });
+  const histories = await readCompletions(runDirectory(id));
+  const previous = histories.filter(item => item.turnId === firstTurn);
+  assert.equal(previous.length, 1);
+  assert.equal(previous[0].status, "失败");
+  assert.match(previous[0].persistenceError ?? "", /REPORT_REFRESH_FAILED/);
+  assert.match(await fs.readFile(previous[0].reportPath!, "utf8"), /REPORT_REFRESH_FAILED/);
+});
+
 test("RpcConnection 强制结束后确认有界；未确认时明确失败而非永久等待", async t => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-close-timeout-"));
   const script = path.join(cwd, "stubborn.mjs");

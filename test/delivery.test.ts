@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { resultMessage, taskOutput } from "../src/delivery.ts";
+import { resultMessage, taskResultMessage, taskOutput } from "../src/delivery.ts";
 import agentDeck from "../src/index.ts";
 import { initializeRun, runDirectory, shutdownRuns } from "../src/runtime.ts";
 import { createBackgroundDelivery } from "../src/background-delivery.ts";
@@ -19,6 +19,55 @@ const run: any = {
   childSessionId: "child", childSessionPath: "child.jsonl", startedAt: 1, endedAt: 2, events: [], finalText: "找到原因",
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 };
+
+test("前后台共用结果正文和身份，后台资格判断独立保留", () => {
+  const foreground = Object.freeze({ ...run, deliveryMode: "foreground" });
+  const background = Object.freeze({ ...run, deliveryMode: "background" });
+  assert.deepEqual(taskResultMessage(foreground), taskResultMessage(background));
+  assert.equal(resultMessage(foreground, "parent"), undefined);
+  assert.equal(resultMessage(background, "other-parent"), undefined);
+  assert.deepEqual(resultMessage(background, "parent"), taskResultMessage(background));
+});
+
+for (const outcome of ["success", "failure"] as const) {
+  test(`并发工具交付：首个失败后，最后的 ${outcome} 决定结果归属`, { timeout: 3000 }, async () => {
+    const current = await initializeRun({ ...run, version: 3, runId: `delivery-overlap-${outcome}`, resourceState: "released" },
+      { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+    const messages: unknown[] = [];
+    let received!: () => void;
+    const sent = new Promise<void>(resolve => { received = resolve; });
+    const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+    const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); received(); } }, () => ctx);
+    let rejectFirst!: (error: Error) => void;
+    let rejectLast!: (error: Error) => void;
+    let resolveLast!: (value: { run: typeof current }) => void;
+    const first = delivery.withToolDelivery(current.runId, () => new Promise<{ run: typeof current }>((_resolve, reject) => { rejectFirst = reject; }));
+    const last = delivery.withToolDelivery(current.runId, () => new Promise<{ run: typeof current }>((resolve, reject) => {
+      resolveLast = resolve;
+      rejectLast = reject;
+    }));
+    const firstFailed = assert.rejects(first, /first failed/);
+    const lastFailed = outcome === "failure" ? assert.rejects(last, /last failed/) : undefined;
+    await delivery.notify(current);
+    rejectFirst(new Error("first failed"));
+    await firstFailed;
+    assert.equal(messages.length, 0, "剩余工具尚在执行时继续保留结果");
+    if (outcome === "success") {
+      resolveLast({ run: current });
+      await last;
+      await delivery.recordToolResult(current);
+    } else {
+      rejectLast(new Error("last failed"));
+      await lastFailed;
+      await sent;
+    }
+    await delivery.notify(current);
+    assert.equal(messages.length, outcome === "success" ? 0 : 1);
+    const [record] = await readMessages(current.runId);
+    assert.equal(record.state, "pending", "分配交付渠道仍不等于接收方已经消费");
+    assert.ok(record.submittedAt);
+  });
+}
 
 test("模型可见回执保留任务身份、状态和操作信息，选配中不报告未确定模型", () => {
   for (const status of ["选配中", "运行中", "已完成", "失败", "停止未确认", "已停止"]) {
@@ -160,9 +209,11 @@ test("工具与后台争用同一问题交付，登记后只由真实工具输�
   const messages: any[] = [];
   const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
   const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
-  const gate = delivery.acquire(current.runId);
+  let complete!: (value: { run: typeof current }) => void;
+  const operation = delivery.withToolDelivery(current.runId, () => new Promise<{ run: typeof current }>(resolve => { complete = resolve; }));
   const pending = delivery.notify(current);
-  delivery.release(current, gate);
+  complete({ run: current });
+  await operation;
   await pending;
   const deliveryId = await delivery.recordToolResult(current);
   await delivery.notify(current);
@@ -237,18 +288,23 @@ test("gate 释放发生在提交回退期间，重投等待旧尝试结束后继
   let received!: () => void;
   const sent = new Promise<void>(resolve => { received = resolve; });
   let checks = 0;
-  let gate: ReturnType<ReturnType<typeof createBackgroundDelivery>["acquire"]>;
+  let rejectOperation!: (error: Error) => void;
+  let operationFailed: Promise<void> | undefined;
   const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
   const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); received(); } }, () => {
     checks++;
     // Acquire after the pre-submit context check, then release while its
     // rollback yields. This models a failed competing resume returning control.
-    if (checks === 3) queueMicrotask(() => { gate = delivery.acquire(current.runId); });
-    if (checks === 4) queueMicrotask(() => delivery.discard(current.runId, gate));
+    if (checks === 3) queueMicrotask(() => {
+      const operation = delivery.withToolDelivery(current.runId, () => new Promise<{ run: typeof current }>((_resolve, reject) => { rejectOperation = reject; }));
+      operationFailed = assert.rejects(operation, /competing resume failed/);
+    });
+    if (checks === 4) queueMicrotask(() => rejectOperation(new Error("competing resume failed")));
     return ctx;
   });
   await delivery.notify(current);
   await sent;
+  await operationFailed;
   assert.equal(messages.length, 1);
   const [record] = await readMessages(current.runId);
   assert.equal(record.state, "pending");
