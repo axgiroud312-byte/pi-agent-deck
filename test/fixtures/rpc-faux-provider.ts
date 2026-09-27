@@ -18,6 +18,22 @@ const respond = async (context: { messages: unknown[]; tools?: { name: string }[
   const latestUser = JSON.stringify(lastUser ?? {});
   record({ type: "provider_call", call: state.callCount, transcript, tools: context.tools?.map((tool) => tool.name) });
   const done = (text = "DECK_FINAL_TEXT") => fauxAssistantMessage(text);
+  if (latestUser.includes("DECK_QUESTION_RESUME")) return done("RESUMED_WITH_QUESTION_CONTEXT");
+  if (transcript.includes("DECK_QUESTION_CASE")) {
+    const answers = context.messages.filter((message: any) => message.role === "toolResult" && message.toolName === "SendMessage" && JSON.stringify(message.content).includes("主 Agent 回答"));
+    if (answers.length === 2) return done(`QUESTION_DONE:${JSON.stringify(answers)}`);
+    return fauxAssistantMessage(fauxToolCall("SendMessage", { to: "main", message: answers.length ? "目标路径是什么？" : "使用哪种格式？", wait_for_reply: true }), { stopReason: "toolUse" });
+  }
+  if (transcript.includes("DECK_PROGRESS_CASE")) {
+    return context.messages.some((message: any) => message.role === "toolResult" && message.toolName === "SendMessage")
+      ? done("PROGRESS_DONE") : fauxAssistantMessage(fauxToolCall("SendMessage", { to: "main", message: "已找到入口，正在验证" }), { stopReason: "toolUse" });
+  }
+  if (latestUser.includes("DECK_LATE_WRAP_UP")) return done("LATE_SUMMARY");
+  if (transcript.includes("DECK_FULL_REPORT_CASE")) {
+    record({ type: "full_report_started" });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return done("FULL_REPORT:" + "evidence ".repeat(800) + "END_OF_FULL_REPORT");
+  }
   if (transcript.includes("DECK_CONTINUE_CASE")) return done("DECK_CONTINUE_DONE");
   if (transcript.includes("DECK_CAPABILITY_CASE")) return fauxAssistantMessage("CAPABILITIES_CHECKED");
   if (transcript.includes("DECK_EMPTY_CASE")) return done("");

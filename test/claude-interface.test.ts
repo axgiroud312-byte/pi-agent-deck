@@ -38,7 +38,8 @@ let queued = [];
 function reply(command, data = {}) { emit({ type: "response", id: command.id, command: command.type, success: true, data }); }
 function complete(text) {
   streaming = false;
-  emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] } });
+  const failed = text.includes("FIXTURE_MODEL_ERROR");
+  emit({ type: "message_end", message: { role: "assistant", stopReason: failed ? "error" : "stop", errorMessage: failed ? "受控执行失败" : undefined, content: [{ type: "text", text }] } });
   emit({ type: "agent_settled" });
 }
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
@@ -77,7 +78,12 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     sessionManager: { getSessionId: () => parent, getSessionFile: () => undefined, getBranch: () => entries },
     ui: { setStatus() {}, setWidget() {}, notify: (text: string) => notices.push(text), theme: { fg: (_: string, text: string) => text } },
   };
-  const call = (tool: string, args: any, context = ctx) => tools.get(tool).execute(randomUUID(), args, undefined, undefined, context);
+  const call = async (tool: string, args: any, context = ctx) => {
+    const result = await tools.get(tool).execute(randomUUID(), args, undefined, undefined, context);
+    const text = result.content.map((block: any) => block.text ?? "").join("\n");
+    assert.ok(text.split("\n").includes(`agentId: ${result.details.publicResult.agentId}`), `${tool} 的正文必须能寻址当前任务`);
+    return result;
+  };
   t.after(async () => {
     await handlers.get("session_shutdown")(); process.argv[1] = originalCli;
     for (const run of await listRuns(Number.MAX_SAFE_INTEGER)) if (run.cwd === cwd) await stopRun(run.runId);
@@ -88,6 +94,25 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
 const input = { description: "检查入口", prompt: "阅读入口并报告证据。", subagent_type: "Explore", run_in_background: true };
 const receipt = (result: any) => result.details.publicResult;
 
+test("回执只表达执行和投递状态，失败、停止和业务未完成不使用通用 success", async (t) => {
+  const h = await harness(t, 5);
+  const failed = receipt(await h.call("Agent", { description: "失败回执", prompt: "FIXTURE_MODEL_ERROR" }));
+  assert.equal(failed.status, "failed");
+  assert.ok(!("success" in failed), "执行失败不能同时带通用 success 标记");
+  const message = receipt(await h.call("SendMessage", { to: failed.agentId, message: "补充证据" }));
+  assert.equal(message.delivery, "resumed");
+  await settled(failed.agentId);
+  assert.ok(!("success" in message));
+  const stopped = receipt(await h.call("TaskStop", { task_id: failed.agentId }));
+  assert.equal(stopped.status, "completed");
+  assert.ok(!("success" in stopped));
+  const resumed = receipt(await h.call("Agent", { resume: failed.agentId, prompt: "业务尚未完成，需要主 Agent 决定下一步" }));
+  assert.equal(resumed.status, "completed", "正常结束不代表业务验收通过");
+  assert.equal(resumed.delivery, "resumed");
+  assert.ok(!("success" in resumed));
+  assert.match(resumed.message, /业务尚未完成/);
+});
+
 test("第 9 个公开 Agent 调用不受固定产品容量限制，Agent 描述承载角色与并行指导", async (t) => {
   const h = await harness(t, 60_000);
   const created = await Promise.all(Array.from({ length: 9 }, (_, i) => h.call("Agent", { ...input, name: `slot-${i}` })));
@@ -95,9 +120,9 @@ test("第 9 个公开 Agent 调用不受固定产品容量限制，Agent 描述�
   assert.equal((await resolveTaskTarget("slot-8", h.parent)).runId, receipt(created[8]).agentId);
   assert.equal(await h.handlers.get("before_agent_start")({}, h.ctx), undefined);
   assert.equal(h.tools.get("Agent").executionMode, "parallel");
-  assert.match(h.tools.get("Agent").description, /同一模型轮次.*多个.*Agent/);
-  assert.match(h.tools.get("Agent").description, /同一工作目录.*一个.*实施者/);
-  assert.match(h.tools.get("Agent").description, /reviewer.*Bash.*只读/);
+  assert.match(h.tools.get("Agent").description, /独立任务可并行派发/);
+  assert.match(h.tools.get("Agent").description, /同目录.*修改按实施者顺序/);
+  assert.match(h.tools.get("Agent").description, /审查和调查可使用 Bash/);
   assert.match(h.tools.get("Agent").description, /reviewer/);
   assert.doesNotMatch(h.tools.get("Agent").description, /8\/8|最多 8|writePermission/);
   await Promise.all(created.map((result) => h.call("TaskStop", { task_id: receipt(result).agentId })));
@@ -183,6 +208,34 @@ test("中文标题、完整说明、角色和实例名称独立；消息正文�
   const record = (await readCompletions(runDirectory(run.runId)))[0];
   assert.equal(record.instanceName, run.instanceName); assert.equal(record.description, run.description); assert.equal(record.roleId, "scout");
   assert.equal("outputFile" in r, false);
+});
+
+test("新建与消息续接保留完整要求，历史标题与本轮标题分别保存", async (t) => {
+  const h = await harness(t, 10);
+  const prompt = "调查入口\n" + "保留完整要求与多行上下文。".repeat(20) + "\nEND_OF_ASSIGNMENT";
+  const result = await h.call("Agent", { description: "调用方标题", prompt, run_in_background: false });
+  const id = result.content[0].text.match(/^agentId: (A-[A-Za-z0-9_-]+)$/m)?.[1];
+  assert.ok(id);
+  const first = (await readRun(id))!;
+  assert.equal(first.description, "调用方标题");
+  assert.equal(first.instruction, prompt);
+  assert.equal(first.objective.length, 80);
+  assert.ok(first.objective.endsWith("…"));
+  assert.ok(!first.objective.includes("\n"));
+  const sent = await h.call("SendMessage", { to: id, message: prompt, summary: "续接标题" });
+  assert.match(sent.content[0].text, /delivery: resumed/);
+  const resumed = await settled(id);
+  assert.equal(resumed.objective, first.objective);
+  assert.equal(resumed.description, "续接标题");
+  assert.equal(resumed.instruction, prompt);
+  assert.equal(resumed.finalText, prompt);
+  assert.equal(resumed.childSessionPath, first.childSessionPath);
+  assert.notEqual(resumed.turnId, first.turnId);
+  const request = JSON.parse(await fs.readFile(path.join(runDirectory(id), "request.json"), "utf8"));
+  assert.equal(request.prompt, prompt);
+  const history = await readCompletions(runDirectory(id));
+  assert.equal(history.find((turn) => turn.turnId === first.turnId)?.description, "调用方标题");
+  assert.equal(history.find((turn) => turn.turnId === resumed.turnId)?.instruction, prompt);
 });
 
 test("同名并发只创建一次；结束、重载后仍绑定；不同主会话可复用名称", async (t) => {
@@ -347,7 +400,8 @@ test("声明式扩展模型传入真实 Pi 子进程且隔离父扩展工具和�
     assert.equal(request.body.model, "review-model");
     const tools = request.body.tools.map((tool: any) => tool.function.name);
     assert.ok(tools.includes("read")); assert.ok(tools.includes("bash")); assert.ok(!tools.includes("agent_report"));
-    for (const name of ["Agent", "SendMessage", "TaskStop", "parent_only_tool", "edit", "write"]) assert.ok(!tools.includes(name));
+    assert.ok(tools.includes("SendMessage"));
+    for (const name of ["Agent", "TaskStop", "parent_only_tool", "edit", "write"]) assert.ok(!tools.includes(name));
   }
 });
 
@@ -388,7 +442,7 @@ test("运行中的普通补充通过 RPC 送达，正文和顺序保留；结束
   const first = "  /not-a-command @not-a-file\n" + "完整内容".repeat(100) + "\nFIRST_END  ";
   const a = receipt(await h.call("SendMessage", { to: "ordered", message: first, summary: "摘要".repeat(130) }));
   const b = receipt(await h.call("SendMessage", { to: id, message: "SECOND_MESSAGE\n第二行" }));
-  assert.equal(a.delivery, "queued"); assert.equal(a.success, true); assert.equal(b.delivery, "queued");
+  assert.equal(a.delivery, "queued"); assert.ok(!("success" in a)); assert.equal(b.delivery, "queued");
   assert.ok(a.message.includes("摘要"));
   const done = await settled(id);
   assert.equal(done.status, "已完成", done.stderr);
@@ -454,21 +508,21 @@ test("并发后台 resume 只有一方取得新轮且不会重复交付快速结
   assert.equal(completed.turnId === original.turnId, false);
 });
 
-test("旧问答参数拒绝；空闲消息不启动，明确 resume 才开始", async (t) => {
+test("消息续接原会话，失效问题回答保持当前轮次", async (t) => {
   const h = await harness(t, 80);
   const id = receipt(await h.call("Agent", { ...input, name: "old-task" })).agentId;
   await assert.rejects(h.call("Agent", { resume: id, prompt: "过早续接" }), /运行/);
   const original = await settled(id);
-  await assert.rejects(h.call("SendMessage", { to: id, message: "旧答复", reply_to: "old" }), /不再接受/);
-  const deferred = receipt(await h.call("SendMessage", { to: id, message: "仅供参考" }));
-  assert.equal(deferred.delivery, "deferred");
+  await assert.rejects(h.call("SendMessage", { to: id, message: "旧答复", reply_to: "old" }), /该问题已结束/);
   assert.equal((await readRun(id))?.turnId, original.turnId);
-  assert.equal((await executions(h.cwd)).filter((item) => item.type === "prompt").length, 1);
-  const resumed = receipt(await h.call("Agent", { resume: "old-task", prompt: "明确继续" }));
+  const resumed = receipt(await h.call("SendMessage", { to: "old-task", message: "继续补充证据" }));
+  assert.equal(resumed.delivery, "resumed");
   assert.equal(resumed.agentId, id);
   const done = await settled(id);
   assert.notEqual(done.turnId, original.turnId);
-  assert.match(done.finalText ?? "", /仅供参考/);
+  assert.equal(done.childSessionId, original.childSessionId);
+  assert.match(done.finalText ?? "", /继续补充证据/);
+  assert.equal((await executions(h.cwd)).filter((item) => item.type === "prompt").length, 2);
 });
 
 test("同工作区不做实施者硬锁，Bash 审查与多个 worker 都可并行；TaskStop 清理真实终态", async (t) => {

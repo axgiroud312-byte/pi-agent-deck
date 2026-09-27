@@ -134,7 +134,7 @@ export function adaptStoredRun(raw) {
   const legacy = {
     ...(stored.legacy ?? {}),
     ...(stored.agentId === undefined ? {} : { agentId: stored.agentId }),
-    ...(stored.pendingQuestion === undefined ? {} : { pendingQuestion: stored.pendingQuestion }),
+    ...(version >= 3 || stored.pendingQuestion === undefined ? {} : { pendingQuestion: stored.pendingQuestion }),
     ...(stored.autoDeliver === undefined ? {} : { autoDeliver: stored.autoDeliver }),
     ...(stored.planContext === undefined ? {} : { planContext: stored.planContext }),
     ...(stored.batchId === undefined ? {} : { batchId: stored.batchId }),
@@ -148,7 +148,8 @@ export function adaptStoredRun(raw) {
     ...(stored.writePermission === undefined ? {} : { writePermission: stored.writePermission === true }),
   };
   if (Object.keys(legacy).length) stored.legacy = legacy;
-  for (const key of ["agentId", "pendingQuestion", "autoDeliver", "planContext", "batchId", "phase", "acceptanceCriteria", "writerLease", "reports", "background", "result", "resultCompleteness", "toolEvidence", "writePermission", "effectiveConfig"]) delete stored[key];
+  if (version < 3) delete stored.pendingQuestion;
+  for (const key of ["agentId", "autoDeliver", "planContext", "batchId", "phase", "acceptanceCriteria", "writerLease", "reports", "background", "result", "resultCompleteness", "toolEvidence", "writePermission", "effectiveConfig"]) delete stored[key];
   return stored;
 }
 

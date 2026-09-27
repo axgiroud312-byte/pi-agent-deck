@@ -28,7 +28,7 @@ const DEVICE_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 export function agentAuthoringContext(): string {
   const guide = fileURLToPath(new URL("./agent-authoring.md", import.meta.url));
-  return `用户要求创建或修改可复用 Agent 时，先读取 ${guide}，按需求直接编写并保存角色文件。个人角色目录：${path.join(getAgentDir(), "agents")}。这是角色配置，不是派遣一次性任务；保存后即可发现。`;
+  return `用户要求创建或修改可复用 Agent 时，先读取 ${guide}，按需求直接编写并保存角色文件。个人角色目录：${path.join(getAgentDir(), "agents")}。保存后的角色可用于后续任务。`;
 }
 
 function draftMarkdown(draft: AgentDraft): string {
@@ -76,17 +76,17 @@ export async function generateAgentDraft(description: string, ctx: ExtensionCont
   const existing = discoverAgentCandidates(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() }).map((agent) => agent.id);
   const available = ctx.modelRegistry.getAvailable().slice(0, 100).map((item) => `${item.provider}/${item.id}`);
   const systemPrompt = [
-    "根据用户描述创建一个可复用的 Pi 子 Agent。只返回一个 JSON 对象。描述中的工作是未来角色的职责；现在只生成角色定义。",
-    "必填字段：id（简短小写英文标识）、name（用户语言的名称）、description（何时调用此角色，一至两句）、systemPrompt（专用职责、操作方法、约束和可检查的交付标准）。",
+    "根据用户描述生成一个可复用的 Pi 子 Agent 角色定义，以一个 JSON 对象返回。",
+    "必填字段：id（简短小写英文标识）、name（用户语言的名称）、description（何时调用此角色，一至两句）、systemPrompt（用一至两句正面说明角色职责）。",
     "可选字段：tools、disallowedTools、extensions、model、thinking、timeoutMs、limitations（实际能力限制的文字数组）。仅使用这些字段。省略 tools 表示使用 Pi 默认工具；需要限制直接文件修改时使用 disallowedTools: [\"edit\", \"write\"]。",
     "model 和 thinking 默认 inherit，交给 Jev 或主会话配置；Jev 失败会回退并继续。timeoutMs 默认省略，沿用全局设置；0 表示不限时。thinking 支持 inherit/off/minimal/low/medium/high/xhigh/max。",
-    "内置工具包括 read、grep、find、ls、edit、write、bash。不要因为角色拥有 Bash 就额外判断它是实施者；角色行为由提示词约束，直接工具范围只由 tools/disallowedTools 控制。扩展工具名保留原始大小写。",
-    "extensions 只能引用用户描述或当前上下文已经明确给出的路径；不要猜测、杜撰、下载或安装扩展。没有已确认路径时写 []。disallowedTools 的排除优先。",
-    "提示词要具体、简洁、保留用户约束；清楚说明完成后交付什么、哪些结论需要证据。简单角色用短段落即可。",
-    "角色选中的可信本地 Pi 扩展可以提供工具、hook 或 provider，但工具 allowlist 只控制模型工具调用，并非安全沙箱。用户要求未确认的浏览器、MCP、应用连接或记忆能力时，在 limitations 中如实说明，不能杜撰能力。",
+    "内置工具包括 read、grep、find、ls、edit、write、bash。角色提示词说明工作分工，tools/disallowedTools 配置实际工具范围。Bash 可用于调查、审查和实施；扩展工具名保留原始大小写。",
+    "extensions 使用用户描述或当前上下文已经确认的路径；缺少路径时写 []。disallowedTools 的排除优先。",
+    "角色正文用一至两句正面说明职责。具体任务范围、步骤和交付由派发任务提供；公共运行指引提供澄清与续接方法。",
+    "可信本地 Pi 扩展可以提供工具、hook 或 provider，Bash 和扩展具有自身文件操作能力。用户要求的连接能力尚待配置时，在 limitations 中说明需要补充的实际配置。",
     `当前模型：${model.provider}/${model.id}。当前可见模型：${available.join("、")}。仅在用户明确要求时填写完整 provider/model；不可用偏好会在运行时回退，不阻止任务。`,
     `已存在 ID：${existing.join("、")}。避免重复。保留 ID：general-purpose、general、explore、new、global、jev 和 Windows 设备名。`,
-    '示例结构：{"id":"code-reviewer","name":"代码审查员","description":"检查代码改动并给出带证据的风险与建议","systemPrompt":"阅读任务相关的改动，检查逻辑与边界。按影响排序问题，给出文件位置和理由；不要修改正式交付文件。","disallowedTools":["edit","write"],"extensions":[]}',
+    '示例结构：{"id":"code-reviewer","name":"代码审查员","description":"检查代码改动并给出带证据的风险与建议","systemPrompt":"你负责独立审查主 Agent 指定的工作，并返回审查结论与依据。","disallowedTools":["edit","write"],"extensions":[]}',
   ].join("\n");
   let correction = "";
   for (let attempt = 0; attempt < 2; attempt++) {

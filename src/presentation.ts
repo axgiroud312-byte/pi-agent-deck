@@ -1,6 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
-import type { PersistedRun } from "./runtime.ts";
+import type { PersistedRun } from "./types.ts";
 import type { RunStatus } from "./types.ts";
 import { runTitle, runRoleLabel } from "./tool-contract.ts";
 
@@ -9,7 +9,7 @@ export const STATUS_VIEW: Record<RunStatus, { icon: string; label: string; color
   "运行中": { icon: "●", label: "运行中", color: "accent", order: 1 },
   "排队中": { icon: "○", label: "排队中", color: "muted", order: 3 },
   "等待批准": { icon: "◐", label: "等待批准", color: "warning", order: 0 },
-  "等待决定": { icon: "◐", label: "旧版待决定", color: "warning", order: 0 },
+  "等待决定": { icon: "◐", label: "等待主 Agent", color: "warning", order: 0 },
   "停止中": { icon: "◒", label: "停止中", color: "warning", order: 2 },
   "停止未确认": { icon: "!", label: "停止未确认", color: "error", order: 0 },
   "已完成": { icon: "✓", label: "已返回结果", color: "accent", order: 5 },

@@ -19,15 +19,16 @@ test("发现三个内置 Agent，worker 使用 Pi 默认工具，调查与审查
   assert.deepEqual(agents.find((item) => item.id === "reviewer")?.disallowedTools, ["edit", "write"]);
 });
 
-test("子 Agent 提示词依赖角色行为约束，阻塞时直接返回普通最终文本", () => {
+test("角色正文保持简短，公共说明提供澄清与交付方式", () => {
   const agents = discoverAgents(process.cwd());
   const scout = buildChildSystemPrompt(agents.find((agent) => agent.id === "scout")!);
   const worker = buildChildSystemPrompt(agents.find((agent) => agent.id === "worker")!);
-  assert.match(scout, /不(?:要)?修改、创建或删除任何文件/);
-  assert.match(worker, /谨慎的实现工程师/);
-  assert.match(scout, /最终文本中说明阻塞原因/);
-  assert.doesNotMatch(scout, /agent_report/);
-  assert.doesNotMatch(scout, /agent_question|等待答复/);
+  for (const role of agents) assert.equal(role.systemPrompt.split(/\r?\n/).filter(Boolean).length, 1);
+  assert.match(scout, /调查主 Agent 指定的问题/);
+  assert.match(worker, /实现任务并验证结果/);
+  assert.match(scout, /SendMessage.*wait_for_reply: true/);
+  assert.match(scout, /最终文本交付完整结果/);
+  assert.doesNotMatch(scout, /agent_report|agent_question|你的定位：/);
 });
 
 test("未信任项目不会加载项目级 Agent", async (t) => {

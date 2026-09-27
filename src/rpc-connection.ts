@@ -80,6 +80,10 @@ export class RpcConnection {
     return this.write({ type: "extension_ui_response", id, cancelled: true });
   }
 
+  answerUiRequest(id: string, value: string): Promise<void> {
+    return this.write({ type: "extension_ui_response", id, value });
+  }
+
   private write(value: unknown): Promise<void> {
     if (this.failure) return Promise.reject(this.failure);
     return new Promise((resolve, reject) => this.child.stdin.write(`${JSON.stringify(value)}\n`, (error) => error ? reject(error) : resolve()));

@@ -1,6 +1,6 @@
 # Pi Agent Deck
 
-Pi Agent Deck 是一个面向 Pi 的轻量多 Agent 扩展，当前版本 **0.13.0**，MIT 许可证。
+Pi Agent Deck 是一个面向 Pi 的轻量多 Agent 扩展，最近发布版本 **0.13.0**，MIT 许可证。当前源码包含后续的通信与续接修复，见 [修复记录](docs/communication-fix-2026-09-27.md)。
 
 它不在 Pi 之外再造一套 Agent 框架。主模型从 `Agent` 工具描述中看到可用角色、职责、工具范围和扩展数量，自行判断是否委派、派给谁、是否并行以及前台还是后台；运行时只负责建立独立 Pi 子会话、转发消息、保存结果和清理进程。
 
@@ -8,10 +8,14 @@ Pi Agent Deck 是一个面向 Pi 的轻量多 Agent 扩展，当前版本 **0.13
 
 - 所有 Agent 使用调用者的同一工作目录。不创建 worktree，不自动合并，不实现任务 DAG、复杂队列或常驻调度服务。
 - 主 Agent 负责拆分任务、判断输入是否充分、选择角色和数量、安排顺序并最终验收。简单工作可以直接完成，不强制经过探索、实施、审查流水线。
-- “同一时间只让一个实施者修改正式交付文件”是给模型的协作约定，不是程序写锁。程序不解析 Bash，不拦截文件系统，也不根据模型或角色名称强制判定谁是实施者。
-- reviewer 和 scout 默认只排除 `edit`、`write`。它们可以使用 Bash、读取差异、运行合适的检查和测试；Bash 不等于实施权限。
-- 子 Agent 有独立 Pi 上下文。任务结束后进程释放，但任务记录和 Pi Session 保留；只有显式 `resume` 才继续原任务。
+- “同一时间只让一个实施者修改正式交付文件”是给模型的协作约定，主 Agent 自己也计入实施者。程序不解析 Bash，不拦截文件系统，也不根据模型或角色名称强制判定谁是实施者。
+- reviewer 和 scout 默认只排除 `edit`、`write`。它们可以使用 Bash、读取差异、运行相关检查，并生成必要的临时文件、缓存或报告；自动修复源码、更新测试快照或改写锁文件交由主 Agent 安排给实施者。需要稳定版本的检查由主 Agent 安排时机。
+- 子 Agent 有独立 Pi 上下文。关键疑问可以向主 Agent 提问，回答后继续。任务结束后进程释放，记录和 Pi Session 保留；`SendMessage` 或显式 `resume` 都可续接原任务。
 - Jev 只选择模型和思考强度。角色、模型型号和 thinking 不构成任务硬门禁；Jev 无密钥、超时、返回无效或偏好模型不可用时，会在隔离子 Pi 能加载的兼容模型中回退。若一个兼容模型都没有，任务会在创建前明确失败。
+
+派发只交代本次目标、范围、当前有效背景、必要资料入口和期望结果，避免重复整段项目历史。主 Agent 收到结果后，在用户授权范围内决定接受、续接、补充验证或等待依赖。审查深度跟随改动风险，修复后优先检查原问题和受影响部分；用户指定的审查范围优先。这些是模型的工作建议，不增加工具参数、报告格式或业务状态。
+
+`/agent-doctor` 会按当前会话的项目信任状态，通过 Pi 原生设置解析器检查磁盘上的 `images.blockImages` 并显示全局、项目或默认来源。禁止传图或读取失败时，同一提示也会进入主模型可见的 `Agent` 工具说明；正常配置不额外增加模型提示。该检查不会更改配置，也不代表正在运行的 Pi 会话已加载磁盘修改。需要视觉验收时，先用一张实际图片验证；`read` 成功不等于模型收到了图片。
 
 ## 安装与启用
 
@@ -31,6 +35,10 @@ pi install git:github.com/axgiroud312-byte/pi-agent-deck
 
 本项目只注册三个公开任务工具：`Agent`、`SendMessage`、`TaskStop`。
 
+三个工具的返回正文都包含 `agentId`、`turnId`、可选实例名称和当前状态。主模型可直接用正文里的 `agentId` 联系或停止任务，即使创建时没有设置 `name`。消息回执说明 `queued`（送入运行）、`answered`（回答问题）或 `resumed`（续接原任务）。后台通知使用相同的身份格式，内部记录留在界面和日志使用的 `details` 中。
+
+回执分别表达执行状态和投递状态。例如，向失败任务发送补充会开始新一轮，上一轮失败证据保留；正常结束也不代表业务已经验收通过。
+
 ## 主模型怎样编排
 
 `Agent` 的工具描述动态列出当前可用角色，例如：
@@ -46,7 +54,7 @@ reviewer：独立审查和运行检查；tools=Pi 默认工具；排除=edit, wr
 - 只委派适合独立处理的工作，任务提示应包含目标、范围和期望结果；
 - 同一模型轮次可以发起多个互不依赖的 `Agent` 调用；
 - 省略 `run_in_background` 时等待结果，传 `true` 时通常先返回任务 ID；若任务在初始工具调用返回前已经结束，则直接返回最终结果；
-- 运行中用 `SendMessage` 补充信息，结束后用 `Agent({ resume, prompt })` 明确续接；
+- `SendMessage` 根据任务当前状态补充、回答或续接；`Agent({ resume, prompt })` 保留为显式续接入口；
 - `completed` 只表示子运行正常结束，不表示任务要求已经通过验收。
 
 项目不会给主 system prompt 注入一整篇编排 Skill，也不会要求模型维护额外的计划状态机。
@@ -58,7 +66,7 @@ reviewer：独立审查和运行检查；tools=Pi 默认工具；排除=edit, wr
 ```ts
 Agent({
   description: "调查登录失败",
-  prompt: "定位登录失败原因，给出文件位置、日志证据和仍不确定的部分。不要修改文件。",
+  prompt: "定位登录失败原因，给出文件位置、日志证据和仍不确定的部分；正式交付文件的修改交回主 Agent 安排。",
   subagent_type: "Explore",
   name: "login-investigation"
 })
@@ -66,11 +74,13 @@ Agent({
 
 新建时必填 `description`、`prompt`。可选字段为 `subagent_type`、`model`、`name`、`run_in_background`。
 
-- 省略 `run_in_background` 或传 `false`：前台等待当前轮正常结束、结果保存和进程清理，然后直接返回最终文本。
+- 省略 `run_in_background` 或传 `false`：前台等待完整结果；子 Agent 提出关键问题时先返回问题，让主 Agent 回答。回答后原子会话继续，最终结果通过后台通知交付。
 - 传 `true`：通常立即返回任务 ID；同一条运行流程在后台执行。若任务极快结束，初始工具调用会直接返回最终结果且不再重复通知；否则完成后会尝试唤醒当前进程中仍处于活动状态的所属父会话。
 - 同一模型轮次的多个独立 `Agent` 工具调用可以并行。项目没有固定的 8 任务上限或内置排队器，实际并发由主模型和运行环境决定。
 
 后台结果始终落盘并可从 `/agents` 查看。切换到其他父会话或重载 Pi 后，旧会话不会补收内存中的完成通知。
+
+后台执行时，主 Agent 可以继续独立工作；当前只需等待时，结束本轮回复即可。结果到达后会自动唤醒主 Agent，再继续验收。`resume` 表示开始新的执行轮次。
 
 明确续接原任务：
 
@@ -84,7 +94,7 @@ Agent({
 
 `resume` 接受当前父会话中的任务 ID 或实例名称。续接复用原任务 ID、Pi Session、模型以及创建任务时保存的 `tools / disallowedTools / extensions`；角色文件之后的修改只影响新任务。会话文件丢失或损坏时会明确失败，不会偷偷创建空白上下文。
 
-## SendMessage：只补充，不暗中执行
+## SendMessage：补充、回答与续接
 
 ```ts
 SendMessage({
@@ -94,12 +104,24 @@ SendMessage({
 })
 ```
 
-- 子任务正在运行：消息通过 Pi RPC steer 送入当前执行。
-- 子任务正在选配或启动：消息在当前进程内暂存，启动后送入。
-- 子任务已经结束：消息只暂存，不启动新一轮；主 Agent 必须显式 resume。
-- 暂存消息不承诺跨 Pi 重载恢复；回执“已排队”也不等于模型已经读到。
+- 运行或启动中：消息进入当前执行，回执为 `queued`。
+- 等待主 Agent：消息作为回答交给正在等待的工具调用，回执为 `answered`。
+- 已结束：使用原任务 ID、Pi Session 和配置启动下一轮，回执为 `resumed`，本轮结果后台通知。
+- 运行中的排队消息保存在当前进程；“已排队”表示接收成功，模型消费情况以 Pi Session 为准。
 
-旧 `reply_to`、子 Agent 提问工具和挂起等待答复流程已经移除。关键输入不足时，子 Agent 应在最终文本中说明阻塞原因、已经完成的部分和需要主 Agent 决定的事项，然后结束本轮。
+子 Agent 使用同名工具联系主 Agent：
+
+```ts
+SendMessage({ to: "main", message: "输出应使用哪种格式？", wait_for_reply: true })
+```
+
+主 Agent 收到问题后回答：
+
+```ts
+SendMessage({ to: "A-12345678", reply_to: "通知中的问题编号", message: "使用 JSON。" })
+```
+
+`reply_to` 可选；带编号的回答只用于该问题，过期或重复回答会明确报错。省略编号时按目标当前状态处理。普通进度消息省略 `wait_for_reply`，发送后继续工作；最终文本交付完整结果。问答复用 Pi 原生 RPC 请求编号和响应，等待期间保留原子进程、调用栈和会话，无需创建新任务。
 
 ## TaskStop：停止当前执行
 
@@ -111,7 +133,7 @@ TaskStop({ task_id: "login-investigation" })
 
 ## 正常结束与 `completed`
 
-子 Agent 继续执行 Pi 原生的模型—工具循环，直到模型不再发出可执行工具调用且 Pi 报告本轮 settled。运行时拿到最后一段 assistant 文本后保存；只要没有模型、RPC、进程、扩展、持久化、超时、取消或停止错误，本轮就是 `completed`。
+子 Agent 继续执行 Pi 原生的模型—工具循环，直到 Pi 报告本轮 settled。同一轮中用于交付的 assistant 文本按顺序保留：完整报告后若又消费一条补充，后续摘要会追加，原报告仍在。工具调用旁的过程说明保留在 Pi Session。没有模型、RPC、进程、扩展、持久化、超时、取消或停止错误时，本轮为 `completed`。
 
 运行时不会再次判断“任务要求是否全部做到了”。以下都可能是正常的 `completed`：
 
@@ -131,7 +153,7 @@ TaskStop({ task_id: "login-investigation" })
 ---
 id: security-reviewer
 name: 安全审查员
-description: 检查安全边界并给出文件和命令证据，不直接修改项目
+description: 检查安全边界并返回审查结论
 tools: [read, bash, grep, find, ls, SecurityProbe]
 disallowedTools: [edit, write]
 extensions:
@@ -141,7 +163,7 @@ thinking: inherit
 timeoutMs: 0
 ---
 
-独立检查任务相关改动。优先给出可定位的证据；不要修改、创建或删除正式交付文件。
+你负责审查主 Agent 指定工作的安全性，并返回结论与依据。
 ```
 
 字段含义：
@@ -151,9 +173,9 @@ timeoutMs: 0
 - `extensions`：该角色明确加载的可信本地 Pi 扩展入口。相对路径以角色文件目录解析。
 - `model / thinking`：偏好值；省略或 `inherit` 时交给当前会话/Jev。不可用偏好会在兼容模型中软回退；若隔离子 Pi 没有任何可加载模型，则在创建任务前失败。
 - `timeoutMs`：任务时限；`0` 表示不限时。
-- 正文：角色职责和行为约束。是否修改项目主要由任务分工、角色提示词和主模型协调；程序不建立第二套实施者字段或写锁。
+- 正文：用一两句话说明角色负责什么。具体目标和交付要求写在本次任务中，问答和交付方式由公共运行说明提供。
 
-子进程以 `--no-extensions` 启动，只加载角色选择的扩展和 Agent Deck 必需的 provider bridge，不继承主 Pi 的全部扩展。工具选择直接交给 Pi 的 `--tools / --exclude-tools`。项目不解析扩展源码，也不建立 `capabilities.json` 来源握手；真实扩展加载或执行错误会作为运行错误保存并返回。
+子进程以 `--no-extensions` 启动，加载角色选择的扩展及内部 provider/通信桥。角色工作工具交给 Pi 的 `--tools / --exclude-tools`；显式 `tools` 自动附加通信工具 `SendMessage`。主、子进程的 `SendMessage` 参数分别服务任务控制和联系主 Agent。真实扩展加载或执行错误会作为运行错误保存并返回。
 
 内置 provider 和 `models.json` 可直接供子 Pi 使用；扩展注册的 provider 只有在配置可完整序列化时才能桥接。原生 provider 或含函数、`symbol`、`bigint` 的配置当前不能传入隔离子进程，这是一项技术兼容限制，不是模型或角色白名单。
 
@@ -179,8 +201,10 @@ Jev 接收已经确定的任务、角色说明、可选工具范围以及隔离�
 ```text
 角色定义 roleId
   └─ 任务 runId（保存角色工具/扩展快照和一个 Pi childSession）
-       └─ 执行轮次 turnId（前台或后台、状态、最终文本、错误和用量）
+       └─ 执行轮次 turnId（前后台、状态、最终文本、错误、用量和可选当前问题）
 ```
+
+内部 `runId` 是稳定任务身份；公开回执的 `agentId` 与控制工具的目标都对应它。每轮完整任务要求保存在 `instruction`；`description` 是短标题，`objective` 是统一派生的展示摘要。实际执行请求还可能包含暂存补充消息；这些消息不混入任务要求的展示字段，真实发送内容可从 Pi Session 查看。
 
 - `request.json` 保存可明确 resume 的 Pi 启动配置；
 - `status.json` 保存当前任务和轮次状态；
@@ -189,7 +213,7 @@ Jev 接收已经确定的任务、角色说明、可选工具范围以及隔离�
 
 扩展注册的声明式 provider 配置会按任务保存到 Pi 个人目录 `agent-deck/providers/<runId>.json`，供隔离子进程和以后 resume 复用。任务记录只保存该快照路径，但快照本身可能含 API key 或自定义 header；它属于私密认证状态，不进入项目或 npm 包，也不应提交、分享或复制到公开位置。
 
-v1/v2 旧问答、报告、租约、`writePermission`、结构化结果和工具证据只投影到 `legacy` 供读取，不会恢复旧协议。启动时不批量改写历史；只有显式 resume 才把当前任务迁移到 v3，并移除已退役的 `agent_question / agent_report` 工具。
+当前问题只存 `pendingQuestion: { id, message }`；完整问答沿用 Pi Session。v1/v2 旧问答、报告、租约、`writePermission`、结构化结果和工具证据投影到 `legacy`。启动时只读历史；通过 `SendMessage` 或显式 resume 续接时迁移到 v3，移除已退役的 `agent_question / agent_report` 并更新公共运行说明。历史通知保留原文，轮次由 `turnId` 标明。
 
 ## 查看与命令
 

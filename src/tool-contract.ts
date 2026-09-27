@@ -14,8 +14,9 @@ export const AgentParameters = Type.Object({
 
 export const SendMessageParameters = Type.Object({
   to: Type.String({ minLength: 1, description: "当前主会话内的任务 ID 或实例名称。" }),
-  message: Type.String({ minLength: 1, description: "完整补充信息，按纯文本处理，不启动新执行。" }),
+  message: Type.String({ minLength: 1, description: "补充要求、澄清回答或继续原任务的新要求。已结束的任务在原会话续接。" }),
   summary: Type.Optional(Type.String({ minLength: 1, description: "可选消息摘要，只用于预览和记录；不会替换完整 message。" })),
+  reply_to: Type.Optional(Type.String({ minLength: 1, description: "回答澄清问题时使用通知中的问题编号。" })),
 }, { additionalProperties: false });
 
 export const TaskStopParameters = Type.Object({
@@ -23,7 +24,7 @@ export const TaskStopParameters = Type.Object({
 }, { additionalProperties: false });
 
 export type AgentInput = { resume: string; prompt: string; description?: string; run_in_background: boolean } | { resume?: undefined; description: string; prompt: string; subagent_type?: string; model?: string; name?: string; run_in_background: boolean };
-export interface MessageInput { to: string; message: string; summary: string }
+export interface MessageInput { to: string; message: string; summary: string; reply_to?: string }
 
 function fields(value: unknown, allowed: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("参数必须是对象。");
@@ -54,11 +55,10 @@ export function parseAgentInput(value: unknown): AgentInput {
 }
 export function messagePreview(message: string): string { return message.trim().split(/\r?\n/, 1)[0].slice(0, 200); }
 export function parseMessageInput(value: unknown): MessageInput {
-  if (value && typeof value === "object" && ("delivery" in value || "reply_to" in value)) throw new Error("0.12.0 的 SendMessage 只传递补充信息，不再接受 delivery / reply_to；开始下一次执行请使用 Agent({resume, prompt})。需求澄清由主 Agent 处理。");
-  const input = fields(value, ["to", "message", "summary"]);
+  const input = fields(value, ["to", "message", "summary", "reply_to"]);
   textField(input, "message");
   const message = input.message as string;
-  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message) };
+  return { to: textField(input, "to")!, message, summary: messagePreview(textField(input, "summary", true) ?? message), ...(input.reply_to === undefined ? {} : { reply_to: textField(input, "reply_to")! }) };
 }
 export function parseStopInput(value: unknown): { task_id: string } { return { task_id: textField(fields(value, ["task_id"]), "task_id")! }; }
 
@@ -79,9 +79,11 @@ export function resolveModelOverride(input: string | undefined, config: DeckConf
 }
 export function runTitle(run: Pick<RunDetails, "description" | "objective">): string { return run.description || run.objective; }
 export function runRoleLabel(run: Pick<RunDetails, "instanceName" | "agentName">): string { return run.instanceName ? `${run.instanceName} · 角色：${run.agentName}` : run.agentName; }
+export function statusLabel(status: string): string { return status === "已完成" ? "已返回结果" : status; }
 const STATUSES: Record<RunStatus, string> = { "选配中": "selecting", "排队中": "queued", "运行中": "async_launched", "等待批准": "awaiting_approval", "等待决定": "awaiting_input", "停止中": "stopping", "停止未确认": "stop_unconfirmed", "已停止": "stopped", "已完成": "completed", "失败": "failed", "已取消": "cancelled", "失联": "lost" };
-export function publicTaskResult(run: RunDetails, message: string, delivery?: "queued" | "resumed" | "deferred") {
-  const pendingQuestion = run.version < 3 && run.status === "等待决定" ? run.legacy?.pendingQuestion : undefined;
+export type MessageDelivery = "queued" | "answered" | "resumed";
+export function publicTaskResult(run: RunDetails, message: string, delivery?: MessageDelivery) {
+  const pendingQuestion = run.pendingQuestion ?? (run.version < 3 && run.status === "等待决定" ? run.legacy?.pendingQuestion : undefined);
   return {
     agentId: run.runId, name: run.instanceName, description: runTitle(run), agentType: run.roleId,
     status: STATUSES[run.status], statusText: run.status,
@@ -92,7 +94,23 @@ export function publicTaskResult(run: RunDetails, message: string, delivery?: "q
     delivery, message,
   };
 }
-export function taskToolResult(run: RunDetails, message: string, delivery?: "queued" | "resumed" | "deferred", success?: boolean) {
-  const publicResult = { ...publicTaskResult(run, message, delivery), ...(success === undefined ? {} : { success }) };
-  return { content: [{ type: "text" as const, text: message }], details: { publicResult, run } };
+/** The model receives content, not details. Keep control addresses in every receipt. */
+export function taskMessage(run: RunDetails, message: string, delivery?: MessageDelivery): string {
+  const header = [
+    `agentId: ${run.runId}`,
+    run.instanceName ? `name: ${run.instanceName}` : undefined,
+    `agentType: ${run.roleId}`,
+    run.turnId ? `turnId: ${run.turnId}` : undefined,
+    `状态：${statusLabel(run.status)}`,
+    run.resourceState ? `resourceState: ${run.resourceState}` : undefined,
+    run.routingPending ? undefined : `model: ${run.model} · thinking: ${run.thinking}`,
+    delivery ? `delivery: ${delivery}` : undefined,
+    run.failureReason && !message.includes(run.failureReason) ? `运行原因：${run.failureReason}` : undefined,
+    run.persistenceError && !message.includes(run.persistenceError) ? `保存记录：${run.persistenceError}` : undefined,
+  ].filter((line) => line !== undefined).join("\n");
+  return `${header}\n\n${message}`;
+}
+export function taskToolResult(run: RunDetails, message: string, delivery?: MessageDelivery) {
+  const publicResult = publicTaskResult(run, message, delivery);
+  return { content: [{ type: "text" as const, text: taskMessage(run, message, delivery) }], details: { publicResult, run } };
 }

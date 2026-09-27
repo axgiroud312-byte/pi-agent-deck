@@ -1,10 +1,11 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { RoutingDecision } from "./router.mjs";
+import type { LegacyRunStatus, LegacyRunView } from "./legacy-types.ts";
+export type { LegacyAgentReport, LegacyRunStatus, LegacyRunView } from "./legacy-types.ts";
 
 export type AgentSource = "内置" | "用户" | "项目";
-export type CurrentRunStatus = "选配中" | "运行中" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
-export type LegacyRunStatus = "排队中" | "等待批准" | "等待决定";
+export type CurrentRunStatus = "选配中" | "运行中" | "等待决定" | "停止中" | "停止未确认" | "已停止" | "已完成" | "失败" | "已取消" | "失联";
 export type RunStatus = CurrentRunStatus | LegacyRunStatus;
 export type ResourceState = "starting" | "running" | "releasing" | "released";
 
@@ -25,69 +26,15 @@ export interface AgentDefinition {
   configurationErrors?: string[];
 }
 
-export interface LegacyAgentReport {
-  type: "进度" | "发现" | "问题" | "警告" | "最终";
-  title: string;
-  summary: string;
-  objectiveStatus?: "完成" | "部分完成" | "未完成" | "阻塞";
-  acceptanceCriteria: Array<{
-    criterion: string;
-    status: "通过" | "部分完成" | "未完成" | "未验证";
-    evidence: string[];
-    notes?: string;
-  }>;
-  evidence: string[];
-  completed: string[];
-  deliverables: string[];
-  filesRead: string[];
-  filesChanged: string[];
-  fileChanges: Array<{ path: string; change: string }>;
-  designDecisions: Array<{ decision: string; reason: string; alternatives: string[] }>;
-  commands: string[];
-  tests: string[];
-  risks: string[];
-  unknowns: string[];
-  downstreamNotes: string[];
-  recommendations: string[];
-  question?: string;
-  options: string[];
-  recommendation?: string;
-  blocking: boolean;
-  confidence?: "低" | "中" | "高";
-}
-
-/** Historical-only projection populated by the compatibility adapter; current execution never writes these fields. */
-export interface LegacyRunView {
-  agentId?: string;
-  pendingQuestion?: { id: string; turnId: string; question: string; options: string[] };
-  autoDeliver?: boolean;
-  planContext?: string;
-  batchId?: string;
-  phase?: string;
-  acceptanceCriteria?: string[];
-  writerLease?: Record<string, unknown>;
-  reports?: LegacyAgentReport[];
-  /** Fields written by the retired structured-report and writer-policy layers. */
-  structuredResult?: unknown;
-  resultCompleteness?: string;
-  toolEvidence?: string[];
-  writePermission?: boolean;
-}
-
 export interface RunEvent {
   at: number;
   kind: "状态" | "工具" | "报告" | "错误";
   text: string;
 }
 
-export interface RunDetails {
-  /** runId is stable across resumes; turnId identifies only the current execution. */
-  turnId?: string;
-  resourceState?: ResourceState;
-  /** Informational count only; messages themselves are never persisted or replayed. */
-  queuedMessageCount?: number;
-  /** Versions 1 and 2 are accepted through the compatibility adapter. New records use version 3. */
-  version: 1 | 2 | 3;
+/** Stable task and session identity, retained across execution turns. */
+export interface TaskIdentity {
+  /** Stable task identity; public agentId and tool control addresses resolve to this ID. */
   runId: string;
   /** Current role identity. */
   roleId: string;
@@ -95,8 +42,27 @@ export interface RunDetails {
   agentSource: AgentSource;
   /** Instance identity is runId; roleId identifies the reusable role. */
   instanceName?: string;
+  parentSessionId: string;
+  parentSessionPath?: string;
+  childSessionId: string;
+  childSessionPath: string;
+  cwd: string;
+  startedAt: number;
+}
+
+/** Read/display snapshot shared by current and historical records; not execution admission. */
+export interface RunDetails extends TaskIdentity {
+  /** Historical records may have no turn or process metadata. */
+  version: 1 | 2 | 3;
+  turnId?: string;
+  resourceState?: ResourceState;
+  /** Informational count only; messages themselves are never persisted or replayed. */
+  queuedMessageCount?: number;
+  /** Current turn's caller-supplied title, or a derived summary. */
   description?: string;
+  /** Derived display summary retained for v3 compatibility. Never the execution input. */
   objective: string;
+  /** Full assignment for this turn, without separately queued supplements. */
   instruction: string;
   status: RunStatus;
   model: string;
@@ -108,17 +74,13 @@ export interface RunDetails {
   extensions?: string[];
   /** Delivery mode belongs to the current turn and is reset on every resume. */
   deliveryMode?: "foreground" | "background";
-  parentSessionId: string;
-  parentSessionPath?: string;
-  childSessionId: string;
-  childSessionPath: string;
-  cwd: string;
-  startedAt: number;
   endedAt?: number;
   currentAction?: string;
   legacy?: LegacyRunView;
   events: RunEvent[];
   finalText?: string;
+  /** One live Pi RPC question; the answer is recorded by Pi as a tool result. */
+  pendingQuestion?: { id: string; message: string };
   /** Caller/cause of the completion or cleanup notification; not the delivery outcome. */
   completionSource?: "execution" | "tool-stop" | "panel-stop" | "shutdown";
   failureReason?: string;
@@ -127,4 +89,23 @@ export interface RunDetails {
   exitCode?: number;
   /** Usage for the current execution turn; every resume resets it and completion history preserves it. */
   usage: Usage;
+}
+
+export interface PersistedRun extends RunDetails {
+  updatedAt: number;
+  ownerPid?: number;
+  /** Read-only compatibility with old detached task records. */
+  runnerPid?: number;
+  childPid?: number;
+  stopRequested?: boolean;
+  attemptStartedAt?: number;
+}
+
+/** Only this shape can enter the Pi execution loop; history is converted on explicit resume. */
+export interface CurrentExecution extends PersistedRun {
+  version: 3;
+  status: CurrentRunStatus;
+  turnId: string;
+  resourceState: ResourceState;
+  deliveryMode: "foreground" | "background";
 }

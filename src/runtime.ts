@@ -1,45 +1,52 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { RunDetails, RunStatus } from "./types.ts";
+import type { RunDetails, RunStatus, CurrentRunStatus, CurrentExecution, PersistedRun } from "./types.ts";
 import { selectExecution, applyExecutionArgs, type RoutingPlan, type RoutingDecision } from "./router.mjs";
-import { adaptStoredRun, atomicJson, persistCompletion, withDiskLock } from "./persistence.mjs";
+import { adaptStoredRun, persistCompletion, withDiskLock } from "./persistence.mjs";
 export { adaptStoredRun } from "./persistence.mjs";
-import { childRuntimeRules } from "./instruction.ts";
+import { buildTaskText, childRuntimeRules } from "./instruction.ts";
+import { runDirectory, statusPath, writeJsonAtomic, registerParentIdentity, discardStoredRun, readStoredRun, readRunFresh, listStoredRuns } from "./run-store.ts";
+export { runsRoot, runDirectory, statusPath, writeJsonAtomic } from "./run-store.ts";
+export type { PersistedRun } from "./types.ts";
 import { RpcConnection } from "./rpc-connection.ts";
+import { parseParentMessage, type ParentMessage } from "./parent-messaging.ts";
 
 export interface RunnerRequest {
   version: 1 | 2 | 3;
   cwd: string;
   command: string;
   argsPrefix: string[];
+  /** Execution input may include queued supplements; RunDetails.instruction is the assignment alone. */
   prompt: string;
   env?: Record<string, string>;
   timeoutMs?: number;
   routing?: RoutingPlan;
   routingDecision?: RoutingDecision;
 }
-export interface PersistedRun extends RunDetails {
-  updatedAt: number;
-  ownerPid?: number;
-  /** Read-only compatibility with old detached task records. */
-  runnerPid?: number;
-  childPid?: number;
-  stopRequested?: boolean;
-  attemptStartedAt?: number;
-}
-export interface RunNotification { kind: "state" | "result"; run: PersistedRun }
+export type RunNotification = { kind: "state" | "result"; run: PersistedRun }
+  | { kind: "message"; run: PersistedRun; message: ParentMessage };
 type ManagedRun = {
   run: PersistedRun; request: RunnerRequest; rpc?: RpcConnection; ready: boolean;
   busy: boolean; starting?: Promise<void>; abort: AbortController;
   messages: string[]; serial: number; error?: string; extensionError?: string; interrupted?: boolean;
   liveMessages: any[];
+  replies: string[];
   writes: Promise<void>; timer?: NodeJS.Timeout;
-  pendingCompletion?: { status: RunStatus; endedAt: number };
-  /** Loaded only to hold process-local idle mail; shutdown must not rewrite it. */
+  pendingCompletion?: { status: CurrentRunStatus; endedAt: number };
+  /** Loaded for control access; shutdown preserves untouched historical records. */
   loadedIdle?: boolean;
 };
+type ExecutingRun = ManagedRun & { run: CurrentExecution };
+
+function requireCurrentExecution(entry: ManagedRun): asserts entry is ExecutingRun {
+  const run = entry.run;
+  if (run.version !== 3 || !run.turnId || !run.resourceState || !run.deliveryMode
+    || ["排队中", "等待批准"].includes(run.status)) {
+    throw new Error("执行需要完整的 v3 轮次；历史记录请先明确 resume。");
+  }
+}
 const owned = new Map<string, ManagedRun>();
 const listeners = new Set<(event: RunNotification) => void>();
 const TERMINAL = new Set<RunStatus>(["已完成", "失败", "已取消", "已停止", "失联"]);
@@ -51,10 +58,10 @@ export const isTerminalStatus = (status: RunStatus): boolean => TERMINAL.has(sta
 export function subscribeRunEvents(listener: (event: RunNotification) => void): () => void {
   listeners.add(listener); return () => { listeners.delete(listener); };
 }
-function emit(entry: ManagedRun, kind: RunNotification["kind"]): void {
+function emit(entry: ManagedRun, kind: "state" | "result"): void {
   notify(entry.run, kind);
 }
-function notify(run: PersistedRun, kind: RunNotification["kind"]): void {
+function notify(run: PersistedRun, kind: "state" | "result"): void {
   const notification = { kind, run: structuredClone(run) };
   for (const listener of listeners) listener(notification);
 }
@@ -77,39 +84,9 @@ function save(entry: ManagedRun): Promise<void> {
   return write;
 }
 function manage(run: PersistedRun, request: RunnerRequest, loadedIdle = false): ManagedRun {
-  const entry: ManagedRun = { run, request, ready: false, busy: false, abort: new AbortController(), messages: [], serial: 0, liveMessages: [], writes: Promise.resolve(), loadedIdle };
+  const entry: ManagedRun = { run, request, ready: false, busy: false, abort: new AbortController(), messages: [], serial: 0, liveMessages: [], replies: [], writes: Promise.resolve(), loadedIdle };
   owned.set(run.runId, entry);
   return entry;
-}
-
-export function runsRoot(): string {
-  return path.join(getAgentDir(), "agent-deck", "runs");
-}
-
-export function runDirectory(runId: string): string {
-  if (!/^[a-zA-Z0-9_-]+$/.test(runId)) throw new Error("无效的任务编号");
-  return path.join(runsRoot(), runId);
-}
-
-export function statusPath(runId: string): string {
-  return path.join(runDirectory(runId), "status.json");
-}
-
-export async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-  await withFileMutationQueue(filePath, () => atomicJson(filePath, value));
-  runCache.delete(filePath);
-}
-
-function parentIndex(parent: string): string {
-  return path.join(getAgentDir(), "agent-deck", "parents", createHash("sha256").update(parent).digest("hex"));
-}
-async function registerParent(run: RunDetails): Promise<void> {
-  return registerParentIdentity(run.parentSessionId, run.runId);
-}
-async function registerParentIdentity(parentSessionId: string, runId: string): Promise<void> {
-  const directory = parentIndex(parentSessionId);
-  await fs.promises.mkdir(directory, { recursive: true });
-  await fs.promises.writeFile(path.join(directory, runId), "");
 }
 
 export async function initializeRun(details: RunDetails, request: RunnerRequest, background: boolean): Promise<PersistedRun> {
@@ -118,7 +95,7 @@ export async function initializeRun(details: RunDetails, request: RunnerRequest,
   const persisted = adaptStoredRun({ ...details, cwd: details.cwd || request.cwd, deliveryMode: background ? "background" : "foreground", ownerPid: process.pid, attemptStartedAt: details.startedAt, updatedAt: Date.now() });
   await writeJsonAtomic(path.join(directory, "request.json"), request);
   await writeJsonAtomic(path.join(directory, "status.json"), persisted);
-  await registerParent(details);
+  await registerParentIdentity(details.parentSessionId, details.runId);
   manage(persisted, request);
   return persisted;
 }
@@ -126,89 +103,16 @@ export async function initializeRun(details: RunDetails, request: RunnerRequest,
 /** Remove only artifacts from a creation attempt that never returned a task. */
 export async function discardUninitializedRun(runId: string, parentSessionId: string): Promise<void> {
   owned.delete(runId);
-  const directory = runDirectory(runId);
-  runCache.delete(path.join(directory, "status.json"));
-  const marker = path.join(parentIndex(parentSessionId), runId);
-  const results = await Promise.allSettled([
-    fs.promises.rm(directory, { recursive: true, force: true }),
-    fs.promises.unlink(marker).catch((error: NodeJS.ErrnoException) => {
-      if (error.code !== "ENOENT") throw error;
-    }),
-  ]);
-  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-  if (failures.length) throw new AggregateError(failures.map((failure) => failure.reason), `无法清理未完成的任务 ${runId}`);
+  await discardStoredRun(runId, parentSessionId);
 }
 
 export async function readRun(runId: string, strict = false): Promise<PersistedRun | undefined> {
   const live = owned.get(runId);
-  if (live) return structuredClone(live.run);
-  try {
-    const file = statusPath(runId);
-    const stat = await fs.promises.stat(file);
-    const cached = runCache.get(file);
-    if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) return structuredClone(cached.run);
-    const run = adaptStoredRun(JSON.parse(await fs.promises.readFile(file, "utf8")));
-    if (runCache.size >= 500) runCache.delete(runCache.keys().next().value!);
-    runCache.set(file, { mtime: stat.mtimeMs, size: stat.size, run: structuredClone(run) });
-    return run;
-  } catch (error) {
-    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`无法读取任务记录 ${runId}，请先修复记录：${error instanceof Error ? error.message : error}`);
-    return undefined;
-  }
+  return live ? structuredClone(live.run) : readStoredRun(runId, strict);
 }
 
-const runCache = new Map<string, { mtime: number; size: number; run: PersistedRun }>();
-
 export async function listRuns(limit = 50, parentSessionId?: string, strict = Boolean(parentSessionId)): Promise<PersistedRun[]> {
-  try {
-    let ids: string[];
-    if (parentSessionId) {
-      const index = parentIndex(parentSessionId);
-      const marker = path.join(index, ".indexed-v2");
-      try { await fs.promises.access(marker); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        // Build the parent index from raw identity first. A relevant unknown
-        // version is indexed and then rejected explicitly; a damaged record
-        // prevents the marker so repairing it can never leave it hidden forever.
-        let scanError: unknown;
-        let scanIncomplete = false;
-        const entries = await fs.promises.readdir(runsRoot(), { withFileTypes: true }).catch((failure) => {
-          if ((failure as NodeJS.ErrnoException).code === "ENOENT") return [];
-          throw failure;
-        });
-        for (const item of entries.filter((item) => item.isDirectory())) {
-          let raw: any;
-          try {
-            raw = JSON.parse(await fs.promises.readFile(statusPath(item.name), "utf8"));
-          } catch (failure) {
-            // A damaged record cannot be attributed to this parent from its
-            // contents. Do not block an unrelated parent, but also do not
-            // write the scan marker so repairing the record makes it visible.
-            scanIncomplete = true;
-            continue;
-          }
-          if (raw?.parentSessionId !== parentSessionId) continue;
-          try {
-            await registerParentIdentity(parentSessionId, item.name);
-            adaptStoredRun(raw);
-          } catch (failure) {
-            scanError ??= new Error(`无法索引任务记录 ${item.name}：${failure instanceof Error ? failure.message : failure}`);
-          }
-        }
-        await fs.promises.mkdir(index, { recursive: true });
-        if (!scanError && !scanIncomplete) await fs.promises.writeFile(marker, "1");
-        else if (scanError && strict) throw scanError;
-      }
-      ids = (await fs.promises.readdir(index)).filter((name) => !name.startsWith("."));
-    } else ids = (await fs.promises.readdir(runsRoot(), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
-    const runs = (await Promise.all(ids.map((id) => readRun(id, strict))))
-      .filter((item): item is PersistedRun => Boolean(item) && (!parentSessionId || item?.parentSessionId === parentSessionId));
-    return runs.sort((a, b) => (b.updatedAt ?? b.startedAt) - (a.updatedAt ?? a.startedAt)).slice(0, limit);
-  } catch (error) {
-    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return [];
-  }
+  return listStoredRuns(limit, parentSessionId, strict, readRun);
 }
 
 function rpcArgs(args: string[]): string[] {
@@ -216,15 +120,21 @@ function rpcArgs(args: string[]): string[] {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--mode") { i++; continue; }
     if (args[i] === "--print" || args[i] === "-p") continue;
+    // Role tools select work capabilities; the child bridge supplies communication.
+    if (args[i] === "--tools") {
+      output.push(args[i], [...new Set([...args[++i].split(",").filter(Boolean), "SendMessage"])].join(","));
+      continue;
+    }
     output.push(args[i]);
   }
   return [...output, "--mode", "rpc"];
 }
 
-async function finish(entry: ManagedRun, status: RunStatus, error?: string, notifyResult = true): Promise<void> {
+async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: string, notifyResult = true): Promise<void> {
   if (!entry.busy) return;
   entry.busy = false;
   entry.ready = false;
+  entry.run.pendingQuestion = undefined;
   clearTimeout(entry.timer);
   const completion = entry.pendingCompletion ?? { status, endedAt: Date.now() };
   entry.pendingCompletion = completion;
@@ -316,15 +226,6 @@ async function finish(entry: ManagedRun, status: RunStatus, error?: string, noti
   if (notifyResult) notify(entry.run, "result");
 }
 
-/** Fresh control-plane read: bypass this process's owned entry and display cache. */
-async function readRunFresh(runId: string, strict = false): Promise<PersistedRun | undefined> {
-  try { return adaptStoredRun(JSON.parse(await fs.promises.readFile(statusPath(runId), "utf8"))); }
-  catch (error) {
-    if (strict && (error as NodeJS.ErrnoException).code !== "ENOENT") throw new Error(`无法读取任务记录 ${runId}，请先修复记录：${error instanceof Error ? error.message : error}`);
-    return undefined;
-  }
-}
-
 function inTask<T>(runId: string, action: () => Promise<T>): Promise<T> {
   runDirectory(runId); // validate before the lock helper creates any parent directory
   const control = path.join(getAgentDir(), "agent-deck", "control", `${runId}.lock`);
@@ -333,7 +234,7 @@ function inTask<T>(runId: string, action: () => Promise<T>): Promise<T> {
   return withFileMutationQueue(control, () => withDiskLock(control, action));
 }
 
-function handleEvent(entry: ManagedRun, data: any): void {
+function handleEvent(entry: ExecutingRun, data: any): void {
   if (data.type === "extension_error") {
     const message = `子扩展加载或执行失败：${data.error?.message ?? data.error ?? data.message ?? "未知错误"}`;
     // An extension failure is an operational failure, not a model outcome. A
@@ -344,7 +245,27 @@ function handleEvent(entry: ManagedRun, data: any): void {
     return;
   }
   if (data.type === "extension_ui_request") {
-    if (["input", "select", "confirm", "editor"].includes(data.method)) void entry.rpc?.cancelUiRequest(data.id).catch(() => {});
+    const turnId = entry.run.turnId;
+    const rpc = entry.rpc;
+    void inTask(entry.run.runId, async () => {
+      if (!rpc || entry.rpc !== rpc || entry.run.turnId !== turnId || !entry.busy || entry.abort.signal.aborted) return;
+      const message = parseParentMessage(data);
+      if (!message) {
+        if (["input", "select", "confirm", "editor"].includes(data.method)) await rpc.cancelUiRequest(data.id);
+        return;
+      }
+      if (message.waitForReply) {
+        if (entry.run.pendingQuestion) throw new Error("已有一个问题正在等待主 Agent 回答。");
+        entry.run.pendingQuestion = { id: message.id, message: message.message };
+        entry.run.status = "等待决定";
+        entry.run.currentAction = "等待主 Agent 回答";
+        await save(entry);
+        emit(entry, "result");
+      } else {
+        for (const listener of listeners) listener({ kind: "message", run: structuredClone(entry.run), message });
+        await rpc.answerUiRequest(message.id, "queued");
+      }
+    }).catch((error) => failExecution(entry, turnId, error));
     return;
   }
   if (entry.busy && !entry.abort.signal.aborted && data.message && ["message_start", "message_update", "message_end"].includes(data.type)) {
@@ -364,7 +285,11 @@ function handleEvent(entry: ManagedRun, data: any): void {
   } else if (data.type === "message_end" && data.message?.role === "assistant") {
     const message = data.message;
     const text = typeof message.content === "string" ? message.content : (message.content ?? []).filter((part: any) => part.type === "text").map((part: any) => part.text).join("\n");
-    entry.run.finalText = text;
+    // Steering can add another assistant answer before settled. Keep the whole
+    // delivery in order; tool-call narration stays in the native transcript.
+    const toolCalls = Array.isArray(message.content) && message.content.some((part: any) => part.type === "toolCall");
+    if (text && !toolCalls) entry.replies.push(text);
+    entry.run.finalText = entry.replies.join("\n\n---\n\n");
     // Pi may retry a failed request automatically; only the last assistant outcome matters.
     entry.error = ["error", "aborted"].includes(message.stopReason) ? message.errorMessage ?? "模型执行未完成" : undefined;
     entry.interrupted = message.stopReason === "aborted";
@@ -389,13 +314,14 @@ function handleEvent(entry: ManagedRun, data: any): void {
   }
 }
 
-function failExecution(entry: ManagedRun, turnId: string | undefined, error: unknown): void {
+function failExecution(entry: ExecutingRun, turnId: string, error: unknown): void {
   void inTask(entry.run.runId, async () => {
     if (entry.busy && !entry.abort.signal.aborted && entry.run.turnId === turnId) await finish(entry, "失败", error instanceof Error ? error.message : String(error));
   }).catch((failure) => { event(entry, "错误", String(failure)); });
 }
 
-function beginTurn(entry: ManagedRun): void {
+function beginTurn(entry: ManagedRun): asserts entry is ExecutingRun {
+  if (entry.run.version !== 3) throw new Error("历史记录只能通过明确 resume 开始执行。");
   entry.abort = new AbortController();
   entry.busy = true;
   // The previous process has exited; this turn has not submitted its first prompt.
@@ -404,17 +330,19 @@ function beginTurn(entry: ManagedRun): void {
   entry.extensionError = undefined;
   entry.interrupted = false;
   entry.liveMessages = [];
+  entry.replies = [];
   entry.pendingCompletion = undefined;
   Object.assign(entry.run, {
     turnId: randomUUID(), ownerPid: process.pid,
     resourceState: "starting",
     status: entry.request.routing && !entry.request.routingDecision && !entry.request.routing.immediate ? "选配中" : "运行中",
     attemptStartedAt: Date.now(), endedAt: undefined, exitCode: undefined, stderr: undefined,
-    finalText: undefined, completionSource: undefined, failureReason: undefined, persistenceError: undefined, events: [], stopRequested: false, currentAction: "正在启动", usage: emptyUsage(),
+    finalText: undefined, pendingQuestion: undefined, completionSource: undefined, failureReason: undefined, persistenceError: undefined, events: [], stopRequested: false, currentAction: "正在启动", usage: emptyUsage(),
   });
+  requireCurrentExecution(entry);
 }
 
-async function execute(entry: ManagedRun): Promise<void> {
+async function execute(entry: ExecutingRun): Promise<void> {
   const turnId = entry.run.turnId;
   const cancelled = () => entry.abort.signal.aborted || entry.run.turnId !== turnId;
   try {
@@ -466,7 +394,7 @@ async function execute(entry: ManagedRun): Promise<void> {
   }
 }
 
-function startExecution(entry: ManagedRun): void {
+function startExecution(entry: ExecutingRun): void {
   const starting = execute(entry);
   entry.starting = starting;
   void starting.catch((error) => { event(entry, "错误", String(error)); }).finally(() => {
@@ -491,6 +419,7 @@ export async function launchRunner(runId: string): Promise<number> {
       }
     }
     if (!entry.starting && !entry.ready) {
+      requireCurrentExecution(entry);
       startExecution(entry);
     }
     return entry.rpc?.child.pid ?? 0;
@@ -540,31 +469,34 @@ async function refreshOwnedFromDisk(entry: ManagedRun, allowUnreadableDuringClea
   return entry;
 }
 
-/** QueueOnly: information never starts a model turn. */
-export async function sendToRun(runId: string, message: string, _summary?: string): Promise<{ run: PersistedRun; delivery: "queued" | "deferred" }> {
+/** One control boundary for steering, answering, and resuming the saved session. */
+export async function sendToRun(runId: string, message: string, summary?: string, replyTo?: string): Promise<{ run: PersistedRun; delivery: "queued" | "answered" | "resumed" }> {
   if (!message.trim()) throw new Error("请提供补充要求。");
   if (["停止中", "停止未确认"].includes(owned.get(runId)?.run.status ?? "")) throw new Error("任务正在停止，暂不接受消息。");
   return inTask(runId, async () => {
     const entry = await obtainIdleRun(runId);
     if (["停止中", "停止未确认"].includes(entry.run.status) || (entry.busy && entry.abort.signal.aborted)) throw new Error("任务正在停止，暂不接受消息。");
+    const question = entry.run.pendingQuestion;
+    if (replyTo && (question?.id !== replyTo || !entry.busy)) throw new Error("该问题已结束；请读取当前问题后回答，或发送新的任务要求。");
+    if (entry.busy && question) {
+      await entry.rpc!.answerUiRequest(question.id, message);
+      entry.run.pendingQuestion = undefined;
+      entry.run.status = "运行中";
+      entry.run.currentAction = "已收到主 Agent 回答，继续执行";
+      await save(entry);
+      return { run: structuredClone(entry.run), delivery: "answered" };
+    }
     if (entry.busy) {
       if (!entry.ready) entry.messages.push(message);
       else await entry.rpc!.request("steer", { message });
       await save(entry);
       return { run: structuredClone(entry.run), delivery: "queued" };
     }
-    entry.messages.push(message);
-    // Idle mail is intentionally volatile. Publishing the in-memory count is
-    // useful to the current UI, but writing it would rewrite v1 records and
-    // leave a ghost count after reload even though the message is gone.
-    entry.run.updatedAt = Date.now();
-    entry.run.queuedMessageCount = entry.messages.length;
-    emit(entry, "state");
-    return { run: structuredClone(entry.run), delivery: "deferred" };
+    return { run: await resumeOwned(entry, message, summary, true), delivery: "resumed" };
   });
 }
 
-/** TriggerTurn: only an explicit resume may start the next execution. */
+/** Compatibility entry point; SendMessage uses the same resume implementation. */
 export async function resumeRun(runId: string, prompt: string, description?: string, background = false, expectedTurnId?: string | null): Promise<PersistedRun> {
   if (!prompt.trim()) throw new Error("resume 必须提供本次任务要求。");
   return inTask(runId, async () => {
@@ -572,68 +504,71 @@ export async function resumeRun(runId: string, prompt: string, description?: str
     if (expectedTurnId !== undefined && (entry.run.turnId ?? null) !== expectedTurnId) {
       throw new Error(`任务 ${runId} 已进入其他执行轮次；期望 ${expectedTurnId ?? "历史轮次"}，实际 ${entry.run.turnId ?? "历史轮次"}。请读取最新结果后再决定是否续接。`);
     }
-    const resumable = isTerminalStatus(entry.run.status) || entry.run.status === "等待决定";
-    if (entry.busy || !resumable || entry.rpc) throw new Error("任务仍在运行或释放中；补充要求请用 SendMessage，结束后才能 resume。");
-    try {
-      await entry.starting;
-      await fs.promises.access(entry.run.childSessionPath).catch(() => { throw new Error("保存的子会话不存在，无法 resume；请明确新建任务。"); });
-      let header: any;
-      try { header = JSON.parse((await fs.promises.readFile(entry.run.childSessionPath, "utf8")).split(/\r?\n/, 1)[0]); }
-      catch { throw new Error("保存的子会话无法读取，不能创建空白替代；请修复会话或明确新建任务。"); }
-      if (header?.type !== "session" || typeof header.id !== "string") throw new Error("保存的子会话缺少有效会话头，无法 resume。");
-      const nextRequest = structuredClone(entry.request);
-      const nextRun = structuredClone(entry.run);
-      nextRun.childSessionId = header.id;
-      await persistCompletion(runDirectory(runId), entry.run);
-      const toolsAt = nextRequest.argsPrefix.indexOf("--tools");
-      if (toolsAt >= 0) {
-        const oldTools = nextRequest.argsPrefix[toolsAt + 1].split(",").filter(Boolean);
-        const tools = oldTools.filter((tool) => !["agent_question", "agent_report"].includes(tool));
-        nextRequest.argsPrefix[toolsAt + 1] = tools.join(",");
-        nextRun.tools = tools;
-      }
-      // Old records migrate only when explicitly resumed. Preserve the saved
-      // Pi execution arguments while removing retired internal tools.
-      const systemAt = nextRequest.argsPrefix.indexOf("--append-system-prompt");
-      let systemUpdate: { file: string; content: string } | undefined;
-      if (systemAt >= 0 && path.resolve(nextRequest.argsPrefix[systemAt + 1]) === path.join(runDirectory(runId), "SYSTEM.md")) {
-        const file = nextRequest.argsPrefix[systemAt + 1];
-        const old = await fs.promises.readFile(file, "utf8");
-        systemUpdate = { file, content: old.split("# 统一运行规则")[0] + childRuntimeRules() };
-      }
-      nextRequest.prompt = [...entry.messages, prompt].join("\n\n");
-      nextRequest.version = 3;
-      nextRun.version = 3;
-      nextRun.deliveryMode = background ? "background" : "foreground";
-      if (systemUpdate) await fs.promises.writeFile(systemUpdate.file, systemUpdate.content);
-      entry.request = nextRequest;
-      Object.assign(entry.run, nextRun);
-      entry.messages = [];
-      entry.loadedIdle = false;
-      beginTurn(entry);
-      entry.run.instruction = prompt;
-      entry.run.objective = prompt.trim().split(/\r?\n/, 1)[0].slice(0, 80);
-      entry.run.description = description ?? entry.run.objective;
-      try { await save(entry); }
-      catch (error) {
-        await finish(entry, "失败", `续接启动失败：${String(error)}`, false);
-        return structuredClone(entry.run);
-      }
-      startExecution(entry);
-      return structuredClone(entry.run);
-    } catch (error) {
-      if (entry.busy) {
-        await finish(entry, "失败", `续接启动失败：${String(error)}`, false);
-        return structuredClone(entry.run);
-      }
-      throw error;
-    }
+    return resumeOwned(entry, prompt, description, background);
   });
+}
+
+async function resumeOwned(entry: ManagedRun, prompt: string, description?: string, background = false): Promise<PersistedRun> {
+  const runId = entry.run.runId;
+  const resumable = isTerminalStatus(entry.run.status) || entry.run.status === "等待决定";
+  if (entry.busy || !resumable || entry.rpc) throw new Error("任务仍在运行或释放中；补充要求请用 SendMessage，结束后才能 resume。");
+  try {
+    await entry.starting;
+    await fs.promises.access(entry.run.childSessionPath).catch(() => { throw new Error("保存的子会话不存在，无法 resume；请明确新建任务。"); });
+    let header: any;
+    try { header = JSON.parse((await fs.promises.readFile(entry.run.childSessionPath, "utf8")).split(/\r?\n/, 1)[0]); }
+    catch { throw new Error("保存的子会话无法读取，不能创建空白替代；请修复会话或明确新建任务。"); }
+    if (header?.type !== "session" || typeof header.id !== "string") throw new Error("保存的子会话缺少有效会话头，无法 resume。");
+    const nextRequest = structuredClone(entry.request);
+    const nextRun = structuredClone(entry.run);
+    nextRun.childSessionId = header.id;
+    await persistCompletion(runDirectory(runId), entry.run);
+    const toolsAt = nextRequest.argsPrefix.indexOf("--tools");
+    if (toolsAt >= 0) {
+      const oldTools = nextRequest.argsPrefix[toolsAt + 1].split(",").filter(Boolean);
+      const tools = oldTools.filter((tool) => !["agent_question", "agent_report"].includes(tool));
+      nextRequest.argsPrefix[toolsAt + 1] = tools.join(",");
+      nextRun.tools = tools;
+    }
+    // Old records migrate only when explicitly resumed. Preserve the saved
+    // Pi execution arguments while removing retired internal tools.
+    const systemAt = nextRequest.argsPrefix.indexOf("--append-system-prompt");
+    let systemUpdate: { file: string; content: string } | undefined;
+    if (systemAt >= 0 && path.resolve(nextRequest.argsPrefix[systemAt + 1]) === path.join(runDirectory(runId), "SYSTEM.md")) {
+      const file = nextRequest.argsPrefix[systemAt + 1];
+      const old = await fs.promises.readFile(file, "utf8");
+      systemUpdate = { file, content: old.split("# 统一运行规则")[0] + childRuntimeRules() };
+    }
+    nextRequest.prompt = [...entry.messages, prompt].join("\n\n");
+    nextRequest.version = 3;
+    nextRun.version = 3;
+    nextRun.deliveryMode = background ? "background" : "foreground";
+    if (systemUpdate) await fs.promises.writeFile(systemUpdate.file, systemUpdate.content);
+    entry.request = nextRequest;
+    Object.assign(entry.run, nextRun);
+    entry.messages = [];
+    entry.loadedIdle = false;
+    beginTurn(entry);
+    Object.assign(entry.run, buildTaskText(prompt, description));
+    try { await save(entry); }
+    catch (error) {
+      await finish(entry, "失败", `续接启动失败：${String(error)}`, false);
+      return structuredClone(entry.run);
+    }
+    startExecution(entry);
+    return structuredClone(entry.run);
+  } catch (error) {
+    if (entry.busy) {
+      await finish(entry, "失败", `续接启动失败：${String(error)}`, false);
+      return structuredClone(entry.run);
+    }
+    throw error;
+  }
 }
 
 export function liveConversation(runId: string): any[] { return structuredClone(owned.get(runId)?.liveMessages ?? []); }
 
-async function stopOwned(entry: ManagedRun, status: RunStatus = "已停止", error?: string, source: "tool-stop" | "panel-stop" | "shutdown" | "execution" = "panel-stop"): Promise<PersistedRun> {
+async function stopOwned(entry: ManagedRun, status: CurrentRunStatus = "已停止", error?: string, source: "tool-stop" | "panel-stop" | "shutdown" | "execution" = "panel-stop"): Promise<PersistedRun> {
   const wasBusy = entry.busy || !isTerminalStatus(entry.run.status);
   if (wasBusy && !entry.busy) entry.busy = true;
   if (entry.run.status === "排队中" && status === "已停止") status = "已取消";
@@ -648,6 +583,7 @@ async function stopOwned(entry: ManagedRun, status: RunStatus = "已停止", err
   if (wasBusy) { entry.run.status = "停止中"; await save(entry).catch((error) => { entry.run.persistenceError = String(error); }); }
   if (entry.rpc) {
     try {
+      if (entry.run.pendingQuestion) await entry.rpc.cancelUiRequest(entry.run.pendingQuestion.id);
       await entry.rpc.request("clear_queue");
       await entry.rpc.request("abort", {}, 3000);
     } catch { /* Closing the owned process is the final cancellation boundary. */ }
@@ -680,6 +616,7 @@ export async function stopRun(runId: string, source: "tool-stop" | "panel-stop" 
       ...run, status: isTerminalStatus(run.status) ? run.status : "已停止", completionSource: source,
       resourceState: "released",
       ownerPid: undefined, runnerPid: undefined, childPid: undefined, currentAction: undefined,
+      pendingQuestion: undefined,
       endedAt: run.endedAt ?? Date.now(), updatedAt: Date.now(), queuedMessageCount: 0,
     };
     await persistCompletion(runDirectory(runId), stopped);
@@ -690,8 +627,8 @@ export async function stopRun(runId: string, source: "tool-stop" | "panel-stop" 
 
 export async function shutdownRuns(parentSessionId?: string): Promise<void> {
   await Promise.all([...owned.values()].filter((entry) => !parentSessionId || entry.run.parentSessionId === parentSessionId).map(async (entry) => {
-    // A completed task loaded only to hold volatile SendMessage mail has no
-    // process or admission to clean up. Dropping it must not rewrite a v1 file.
+    // Historical records opened for a control request have no process to clean
+    // up. Dropping an untouched record preserves its original format.
     if (!entry.busy && !entry.rpc && (entry.loadedIdle || isTerminalStatus(entry.run.status))) {
       owned.delete(entry.run.runId);
       return;
@@ -728,6 +665,7 @@ export async function reconcileRun(runId: string): Promise<PersistedRun | undefi
       resourceState: "released", ownerPid: undefined, runnerPid: undefined, childPid: undefined,
       failureReason: run.failureReason ?? (isTerminalStatus(run.status) ? undefined : "宿主进程已不存在，启动核对将任务标记为失联。"),
       currentAction: undefined, updatedAt: Date.now(), endedAt: run.endedAt ?? Date.now(), queuedMessageCount: 0,
+      pendingQuestion: undefined,
     };
     await persistCompletion(runDirectory(runId), lost);
     await writeJsonAtomic(statusPath(runId), lost);
@@ -751,6 +689,18 @@ export async function waitForRunTurn(runId: string, turnId: string, options: { s
     if (run.turnId !== turnId) throw new Error(`任务 ${runId} 已进入其他执行轮次；期望 ${turnId}，实际 ${run.turnId ?? "无"}。`);
     if (run.updatedAt !== updated) { updated = run.updatedAt; options.onUpdate?.(run); }
     if (isTerminalStatus(run.status) || run.status === "停止未确认") return run;
+    if (run.pendingQuestion) {
+      const waiting = await inTask(runId, async () => {
+        const entry = owned.get(runId);
+        if (!entry || entry.run.turnId !== turnId || entry.run.pendingQuestion?.id !== run.pendingQuestion?.id) return;
+        // The foreground tool returns the question so its caller can answer.
+        // Subsequent questions and the final result use background delivery.
+        entry.run.deliveryMode = "background";
+        await save(entry);
+        return structuredClone(entry.run);
+      });
+      if (waiting) return waiting;
+    }
     await new Promise((resolve) => setTimeout(resolve, options.pollMs ?? 100));
   }
 }

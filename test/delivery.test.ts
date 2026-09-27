@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { labelHistoricalMessage, resultMessage, taskOutput } from "../src/delivery.ts";
+import { resultMessage, taskOutput } from "../src/delivery.ts";
 import agentDeck from "../src/index.ts";
-import { initializeRun } from "../src/runtime.ts";
+import { initializeRun, shutdownRuns } from "../src/runtime.ts";
+import { createBackgroundDelivery } from "../src/background-delivery.ts";
+import { taskToolResult } from "../src/tool-contract.ts";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { normalizeContext } from "@earendil-works/pi-ai";
 
 const run: any = {
   version: 2, runId: "test-delivery", turnId: "first", deliveryMode: "background",
@@ -12,6 +16,53 @@ const run: any = {
   childSessionId: "child", childSessionPath: "child.jsonl", startedAt: 1, endedAt: 2, events: [], finalText: "找到原因",
   usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 };
+
+test("模型可见回执保留任务身份、状态和操作信息，选配中不报告未确定模型", () => {
+  for (const status of ["选配中", "运行中", "已完成", "失败", "停止未确认", "已停止"]) {
+    const current = { ...run, version: 3, status, instanceName: "login-check", routingPending: status === "选配中" };
+    const result = taskToolResult(current, "操作正文", "queued");
+    const text = result.content.map((block) => block.text).join("\n");
+    assert.match(text, /^agentId: test-delivery$/m);
+    assert.match(text, /^name: login-check$/m);
+    assert.ok(text.includes(status === "已完成" ? "已返回结果" : status));
+    assert.match(text, /queued/);
+    assert.ok(text.endsWith("操作正文"));
+    if (current.routingPending) assert.ok(!text.includes(current.model));
+    else assert.ok(text.includes(current.model));
+    assert.equal(result.details.publicResult.agentId, run.runId);
+  }
+});
+
+test("真实 Pi 消息转换后模型仍可从后台回执寻址，不依赖 details", () => {
+  const current = { ...run, status: "运行中", version: 3 };
+  const result = taskToolResult(current, "后台执行中");
+  const model: any = { id: "model", provider: "fixture", api: "openai-responses", input: ["text"], reasoning: false };
+  const messages: any[] = [
+    { role: "assistant", content: [{ type: "toolCall", id: "call_receipt", name: "Agent", arguments: { description: "检查", prompt: "检查入口", run_in_background: true } }],
+      api: model.api, provider: model.provider, model: model.id, usage: run.usage, stopReason: "toolUse", timestamp: 1 },
+    { role: "toolResult", toolCallId: "call_receipt", toolName: "Agent", ...result, isError: false, timestamp: 2 },
+  ];
+  const converted = convertResponsesMessages(model, normalizeContext({ messages }), new Set(["fixture"]));
+  const output = converted.find((item) => item.type === "function_call_output");
+  assert.ok(output && "output" in output);
+  assert.equal(typeof output.output, "string");
+  assert.match(output.output as string, /^agentId: test-delivery$/m);
+  assert.ok(!JSON.stringify(output).includes("childSessionPath"), "内部运行记录不应注入模型正文");
+});
+
+test("工具终态与后台通知只有一个身份头，保留完整结果和停止失败原因", () => {
+  const current = { ...run, version: 3, status: "停止未确认", resourceState: "releasing", failureReason: "CLOSE_ERROR", persistenceError: "SAVE_ERROR", finalText: "x".repeat(30000) + "TAIL" };
+  const text = taskToolResult(current, taskOutput(current)).content[0].text;
+  assert.equal((text.match(/^agentId:/gm) ?? []).length, 1);
+  assert.doesNotMatch(text, /\[Agent test-delivery/);
+  assert.ok(text.endsWith(current.finalText));
+  const stopped = taskToolResult(current, "停止未确认；请重试。").content[0].text;
+  for (const marker of ["CLOSE_ERROR", "SAVE_ERROR", "releasing"]) assert.ok(stopped.includes(marker));
+  const notice = resultMessage(current, "parent")!;
+  assert.equal((notice.content.match(/^agentId:/gm) ?? []).length, 1);
+  assert.doesNotMatch(notice.content, /\[Agent test-delivery/);
+  assert.ok(notice.details.evidence.endsWith("TAIL"));
+});
 
 test("结果只交给所属会话，执行编号保留在通知元数据", () => {
   const message = resultMessage(run, "parent")!;
@@ -23,68 +74,27 @@ test("结果只交给所属会话，执行编号保留在通知元数据", () =>
   assert.equal(resultMessage({ ...run, deliveryMode: "foreground" }, "parent"), undefined);
 });
 
-test("排队旧结果和已回答的问题标为历史，不修改保存的原消息", () => {
-  const message = resultMessage(run, "parent")!;
-  const current = { ...run, turnId: "second", status: "运行中", finalText: undefined };
-  const labeled = labelHistoricalMessage(message, current);
-  assert.match(String(labeled.content), /历史通知/);
-  assert.match(String(labeled.content), /当前任务状态：运行中/);
-  assert.doesNotMatch(message.content, /历史通知/);
-  assert.equal(labelHistoricalMessage(message, run), message);
-  const question = { ...run, version: 1, status: "等待决定", legacy: { pendingQuestion: { id: "q1", turnId: "first", question: "选哪个？", options: ["A", "B"] } } };
-  const asked = resultMessage(question, "parent")!;
-  assert.doesNotMatch(asked.content, /Agent\(\{resume:/);
-  assert.match(String(labelHistoricalMessage(asked, { ...run, status: "运行中" }).content), /历史通知/);
-});
-
-test("旧通知上下文保留完整失败证据但不带旧续接指令，原消息不变", () => {
-  const old = { ...run, status: "失败", failureReason: "ROOT_CAUSE", persistenceError: "DISK_ERROR", events: [{ at: 2, kind: "错误", text: "EXTRA_ERROR" }], finalText: "PARTIAL_ARTIFACT", resultCompleteness: "执行失败" };
-  const message = resultMessage(old, "parent")!;
-  const current = { ...run, turnId: "new", status: "运行中" };
-  const projection = labelHistoricalMessage(message, current);
-  for (const marker of ["ROOT_CAUSE", "DISK_ERROR", "EXTRA_ERROR", "PARTIAL_ARTIFACT"]) assert.match(String(projection.content), new RegExp(marker));
-  assert.doesNotMatch(String(projection.content), /Agent\(\{resume:/);
-  const legacy = { ...message, details: { ...message.details, evidence: undefined }, content: `${message.content}\n\n同一任务返工请明确调用 Agent({resume: "old", prompt: "本次要求"})；新目标请新建任务。` };
-  assert.doesNotMatch(String(labelHistoricalMessage(legacy, current).content), /Agent\(\{resume:/);
-  assert.match(legacy.content, /Agent\(\{resume:/);
-});
-
-test("0.11 旧问题及文本块投影去插件生成的 SendMessage/reply_to 尾部，保留证据块", () => {
-  const current = { ...run, turnId: "new", status: "运行中" };
-  const tail = "\n\nSendMessage 的 to 使用 test-delivery。回答此问题必须填写 reply_to: q-old；普通补充不填写 reply_to，不能解除等待。";
-  const legacy: any = { content: `Agent 任务结果\nagentId: test-delivery\nturn_id: first\n本次执行状态：等待决定\n\n问题证据：FILE_A\nERROR_LOG${tail}`, details: { taskId: run.runId, turnId: "first", questionId: "q-old" } };
-  const text = String(labelHistoricalMessage(legacy, current).content);
-  assert.match(text, /FILE_A/); assert.match(text, /ERROR_LOG/);
-  assert.doesNotMatch(text, /SendMessage 的 to|reply_to: q-old/);
-  const blocks = { ...legacy, content: [{ type: "text", text: legacy.content.slice(0, 50) }, { type: "text", text: legacy.content.slice(50) }] };
-  const projected = labelHistoricalMessage(blocks, current).content as unknown;
-  assert.match(JSON.stringify(projected), /FILE_A|ERROR_LOG/);
-  assert.doesNotMatch(JSON.stringify(projected), /reply_to: q-old|SendMessage 的 to/);
-  assert.match(JSON.stringify(blocks.content), /reply_to: q-old/);
-});
-
-test("同一turn清理状态已改变，旧停止未确认通知也不是当前待办", () => {
-  const old = resultMessage({ ...run, status: "停止未确认", resourceState: "releasing", failureReason: "CLOSE_ERROR" }, "parent")!;
-  const projected = labelHistoricalMessage(old, { ...run, resourceState: "released" });
-  assert.match(String(projected.content), /历史通知/);
-  assert.match(String(projected.content), /CLOSE_ERROR/);
-  assert.match(taskOutput({ ...run, failureReason: "RECOVERED_CLOSE_ERROR" }), /RECOVERED_CLOSE_ERROR/);
-});
-
-test("历史投影保留非文本附件；模型摘要有边界但完整证据仍保存", () => {
-  const image = { type: "image", data: "evidence-image", mimeType: "image/png" };
-  const current = { ...run, turnId: "next" };
-  const old = { ...resultMessage(run, "parent")!, content: [{ type: "text", text: "ARTIFACT" }, image] };
-  const projection = labelHistoricalMessage(old, current);
-  assert.ok(Array.isArray(projection.content));
-  assert.deepEqual((projection.content as any[]).at(-1), image);
+test("通知保留完整证据与可读取的子会话入口", () => {
   const long = resultMessage({ ...run, finalText: "x".repeat(30000) + "TAIL_EVIDENCE", childSessionPath: "C:/fixture/session.jsonl" }, "parent")!;
   assert.ok(long.content.length < 26000);
-  assert.match(long.content, /完整.*证据|完整.*结果/);
+  assert.match(long.content, /C:\/fixture\/session.jsonl/);
   assert.match(long.details.evidence, /TAIL_EVIDENCE/);
-  const history = labelHistoricalMessage(long, current);
-  assert.ok(String(history.content).length < 26000);
-  assert.equal(history.details.evidence, long.details.evidence);
+  for (const field of ["failureReason", "persistenceError"] as const) {
+    const failed = resultMessage({ ...run, status: "失败", [field]: "x".repeat(30000) + "TAIL_ERROR" }, "parent")!;
+    assert.ok(failed.content.length < 26000);
+    assert.match(failed.details.evidence, /TAIL_ERROR/);
+  }
+});
+
+test("问题通知带回答地址，连续问题和最终交付有各自的投递编号", () => {
+  const waiting = { ...run, version: 3, status: "等待决定", pendingQuestion: { id: "q1", message: "需要哪种格式？" } };
+  const first = resultMessage(waiting, "parent")!;
+  assert.match(first.content, /需要哪种格式/);
+  assert.match(first.content, /reply_to=q1/);
+  const second = resultMessage({ ...waiting, pendingQuestion: { id: "q2", message: "补充目标路径" } }, "parent")!;
+  const final = resultMessage({ ...waiting, status: "已完成", pendingQuestion: undefined }, "parent")!;
+  assert.equal(new Set([first, second, final].map(x => x.details.deliveryId)).size, 3);
+  assert.equal(resultMessage({ ...waiting, deliveryMode: "foreground" }, "parent"), undefined);
 });
 
 test("v3 当前最终文本不会被旧问题或旧最终报告替代", () => {
@@ -96,6 +106,34 @@ test("v3 当前最终文本不会被旧问题或旧最终报告替代", () => {
   assert.doesNotMatch(taskOutput(completed), /旧问题|OLD_FINAL_REPORT/);
   const currentMessage = resultMessage({ ...completed, legacy: { ...completed.legacy, pendingQuestion: { id: "old-question", turnId: "old-turn", question: "旧问题", options: [] } } }, "parent")!;
   assert.equal(currentMessage.details.questionId, undefined);
+});
+
+test("后台通知核对期间切换父会话不会串投，重复结果仍只交付一次", async (t) => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-context-switch", resourceState: "released" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  t.after(() => shutdownRuns("parent"));
+  const messages: unknown[] = [];
+  const parent: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  let context: any = parent;
+  const delivery = createBackgroundDelivery({ sendMessage: (message) => { messages.push(message); } }, () => context);
+  const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+  delivery.notify(current);
+  context = { ...parent, sessionManager: { getSessionId: () => "other-parent" } };
+  await flush();
+  assert.equal(messages.length, 0);
+  context = parent;
+  delivery.notify(current);
+  delivery.notify(current);
+  await flush();
+  assert.equal(messages.length, 1);
+  delivery.notify({ ...current, turnId: "outdated-turn" });
+  await flush();
+  assert.equal(messages.length, 1, "旧轮通知不能作为新结果发送");
+  context = undefined;
+  delivery.reset();
+  delivery.notify(current);
+  await flush();
+  assert.equal(messages.length, 1, "关闭所属会话后不再发送");
 });
 
 test("重载不补送旧结果或重放旧任务；当前会话边界仍有效", async () => {
@@ -115,8 +153,6 @@ test("重载不补送旧结果或重放旧任务；当前会话边界仍有效",
     const other = { ...ctx, sessionManager: { getSessionId: () => "other" } };
     await assert.rejects(tools.get("SendMessage").execute("id", { to: run.runId, message: "继续" }, undefined, undefined, other), /当前会话/);
     await assert.rejects(tools.get("TaskStop").execute("id", { task_id: run.runId }, undefined, undefined, other), /当前会话/);
-    const previous = resultMessage(run, "parent")!;
-    const result = await handlers.get("context")({ messages: [{ role: "custom", ...previous, details: { ...previous.details, turnId: "old" } }] });
-    assert.match(String(result.messages[0].content), /历史通知/);
+    assert.equal(handlers.has("context"), false, "历史消息保持原文，当前状态由新回执说明");
   } finally { await handlers.get("session_shutdown")(); }
 });

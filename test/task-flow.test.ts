@@ -261,24 +261,25 @@ test("Agent 公共入口显式后台立即返回，RPC 完成后自动交付结�
   assert.equal(messages.length, noticesBeforeFailure, "同步返回的启动失败不能再发送后台结果通知");
 });
 
-test("其他同目录任务运行时仍可明确 resume，暂存消息只送一次", async (t) => {
+test("其他同目录任务运行时消息仍可续接，补充只送一次", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-resume-admission-"));
   t.after(async () => { await shutdownRuns("flow-parent"); await fs.rm(cwd, { recursive: true, force: true }); });
   const original = await fixture(cwd, true);
   await launchRunner(original);
   const completed = await finished(original);
-  await sendToRun(original, "KEEP_AFTER_REJECT");
+  await fs.writeFile(completed.childSessionPath, JSON.stringify({ type: "session", id: completed.childSessionId }) + "\n");
   const blocker = await fixture(cwd, true, { DECK_RPC_HANG: "1" });
   await launchRunner(blocker);
   await until(async () => (await readRun(blocker))?.childPid, "并行任务启动");
-  const resumed = await resumeFixtureRun(original, "ACCEPTED_RESUME");
+  const sent = await sendToRun(original, "ACCEPTED_RESUME");
+  assert.equal(sent.delivery, "resumed");
+  const resumed = sent.run;
   assert.notEqual(resumed.turnId, completed.turnId);
   const result = await until(async () => {
     const run = await readRun(original);
     return run?.status === "已完成" && run.turnId === resumed.turnId ? run : undefined;
-  }, "拒绝后重新续接");
-  assert.match(result.finalText ?? "", /KEEP_AFTER_REJECT\s+ACCEPTED_RESUME/);
-  assert.equal((result.finalText ?? "").split("KEEP_AFTER_REJECT").length, 2);
+  }, "消息续接完成");
+  assert.equal((result.finalText ?? "").split("ACCEPTED_RESUME").length, 2);
   assert.equal(result.queuedMessageCount, 0);
   await stopRun(blocker);
 });

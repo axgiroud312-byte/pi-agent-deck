@@ -11,7 +11,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import { discoverAgentCandidates, discoverAgents, validateAgentDefinition } from "./agents.ts";
-import { buildChildSystemPrompt } from "./instruction.ts";
+import { buildChildSystemPrompt, buildTaskText, taskSummary } from "./instruction.ts";
+import { imageSettingsDiagnostic } from "./image-settings.ts";
 import {
   sendToRun,
   resumeRun,
@@ -29,10 +30,10 @@ import {
   stopRun,
   waitForRunTurn,
   type RunnerRequest,
-  type PersistedRun,
 } from "./runtime.ts";
 import { showAgentPanel, type AgentPanelAction } from "./ui.ts";
-import { RESULT_MESSAGE, resultMessage, statusLabel, labelHistoricalMessage, taskOutput } from "./delivery.ts";
+import { RESULT_MESSAGE, PARENT_MESSAGE, statusLabel, taskOutput } from "./delivery.ts";
+import { createBackgroundDelivery } from "./background-delivery.ts";
 import { readDeckConfig, writeDeckConfig } from "./config.ts";
 import { registerConfiguration } from "./configuration-ui.ts";
 import { createAgentFromDescription } from "./agent-creation.ts";
@@ -40,12 +41,13 @@ import { renderFleet } from "./presentation.ts";
 import { prepareRouting } from "./routing.ts";
 import { canPrepareChildProvider, prepareChildProviders, saveChildProviders } from "./child-providers.ts";
 import { registerRouting } from "./routing-ui.ts";
-import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, taskToolResult, runTitle, runRoleLabel } from "./tool-contract.ts";
+import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, taskToolResult, taskMessage, runTitle, runRoleLabel } from "./tool-contract.ts";
 import { resolveTaskTarget, withTaskCreation } from "./task-identity.ts";
 import { AGENT_DECK_VERSION } from "./version.ts";
 import type {
   AgentDefinition,
   RunDetails,
+  PersistedRun,
   RunStatus,
 } from "./types.ts";
 
@@ -63,11 +65,6 @@ function emptyUsage(): Usage {
   };
 }
 
-function shortTask(text: string, max = 54): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
-}
-
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -83,7 +80,9 @@ function childRuntimePath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), "child-runtime.ts");
 }
 
-export function agentToolDescription(agents: AgentDefinition[]): string {
+const BACKGROUND_WAIT = "结果会自动通知并唤醒主 Agent。可以继续独立工作；当前只需等待时，结束本轮回复即可，收到通知后继续验收。";
+
+export function agentToolDescription(agents: AgentDefinition[], environmentWarning?: string): string {
   const roles = agents.map((agent) => {
     const aliases = agent.id === "worker" ? " / general-purpose" : agent.id === "scout" ? " / Explore" : "";
     const tools = agent.tools === undefined ? "Pi 默认工具" : agent.tools.length ? agent.tools.join(", ") : "无";
@@ -91,11 +90,13 @@ export function agentToolDescription(agents: AgentDefinition[]): string {
     return `- ${agent.id}${aliases}（${agent.name}）：${agent.description}；tools=${tools}；排除=${excluded}；extensions=${agent.extensions.length}`;
   }).join("\n");
   return [
-    "创建或明确续接一个独立 Pi 子会话。主模型自行决定是否委派、选择角色、任务数量、前后台和最终验收；简单工作可直接完成。",
-    "适合独立处理的任务才委派，prompt 应自包含目标、范围和期望结果。同一模型轮次可发起多个互不依赖的 Agent 调用，运行时可并行执行。",
-    "同一工作目录同一时间只安排一个修改源码、项目配置等正式交付文件的实施者；scout/reviewer 即使可用 Bash 也仍按角色提示只读。这个协作边界由你安排，不是运行时写锁。",
-    "省略 run_in_background 或传 false 时前台等待并返回子 Agent 最终文本；true 时立即返回任务 ID，完成后通知父会话。",
-    "运行中用 SendMessage 补充信息；结束后用 Agent({resume, prompt}) 明确续接原任务、角色、生效配置和 Pi 上下文。completed 只表示子运行正常结束，不表示任务要求已验收。",
+    "创建独立 Pi 子会话来完成适合委派的工作。主 Agent 负责目标、任务安排、进度与验收；简单工作可直接完成。",
+    "prompt 交代目标、范围、当前有效背景、资料入口和期望交付。独立任务可并行派发；同目录的源码和项目配置修改按实施者顺序进行，主 Agent 的修改也纳入安排。审查和调查可使用 Bash 与临时产物验证证据。",
+    "省略 run_in_background 或传 false 时前台等待结果；true 时后台执行并通知所属父会话。子 Agent 提出澄清问题时，前台调用先返回问题，回答后由原子会话继续并在完成时通知。",
+    "SendMessage 用于补充要求、回答澄清和续接已结束的任务，沿用原角色、模型与 Pi 上下文。Agent({resume, prompt}) 是兼容的显式续接入口。completed 表示执行已结束，主 Agent 根据交付内容验收。",
+    BACKGROUND_WAIT,
+    "收到结果后对照用户目标决定接受、续接、补充验证或等待必要依赖，在授权范围内推进到约定终点。审查范围按改动风险和用户要求安排，修复后优先复查原问题和受影响部分；需要扩大范围时再扩大。",
+    ...(environmentWarning ? [environmentWarning] : []),
     "可用 subagent_type：",
     roles || "- 当前没有可用角色。",
   ].join("\n");
@@ -143,54 +144,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   let unsubscribe: (() => void) | undefined;
   let refreshScheduled = false;
   let fleetRefresh = 0;
-  // This registry is scoped to the current Pi process; message acceptance is not model consumption.
-  const delivered = new Set<string>();
-  type DeliveryGate = { holders: number; pending?: PersistedRun };
-  const deliveryGates = new Map<string, DeliveryGate>();
-
-  const acquireDeliveryGate = (runId: string): DeliveryGate => {
-    const existing = deliveryGates.get(runId);
-    if (existing) { existing.holders++; return existing; }
-    const gate: DeliveryGate = { holders: 1 };
-    deliveryGates.set(runId, gate);
-    return gate;
-  };
-
-  const discardDeliveryGate = (runId: string, gate: DeliveryGate): void => {
-    if (deliveryGates.get(runId) !== gate) return;
-    gate.holders = Math.max(0, gate.holders - 1);
-    if (gate.holders > 0) return;
-    deliveryGates.delete(runId);
-    if (gate.pending) void deliverBackgroundResult(gate.pending).catch((error) => activeContext?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
-  };
-
-  const deliverBackgroundResult = async (run: PersistedRun): Promise<void> => {
-    const ctx = activeContext;
-    if (!ctx || run.parentSessionId !== ctx.sessionManager.getSessionId()) return;
-    const current = await readRun(run.runId);
-    if (!current || current.turnId !== run.turnId || current.status !== run.status || ctx !== activeContext) return;
-    const message = resultMessage(run, run.parentSessionId);
-    if (!message) return;
-    const key = message.details.deliveryId;
-    if (delivered.has(key)) return;
-    pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
-    delivered.add(key);
-  };
-
-  const releaseDeliveryGate = (run: PersistedRun, expectedGate: DeliveryGate): void => {
-    const gate = deliveryGates.get(run.runId);
-    if (!gate || gate !== expectedGate) return;
-    gate.holders = Math.max(0, gate.holders - 1);
-    // A successful Agent call owns the initial delivery. Remove the shared gate
-    // synchronously so later failed contenders cannot discard or publish it.
-    deliveryGates.delete(run.runId);
-    if (isTerminalStatus(run.status) || run.status === "停止未确认") {
-      const message = resultMessage(run, run.parentSessionId);
-      if (message) delivered.add(message.details.deliveryId); // the Agent tool result owns this delivery
-      return;
-    }
-    if (gate.pending) void deliverBackgroundResult(gate.pending).catch((error) => activeContext?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
-  };
+  const backgroundDelivery = createBackgroundDelivery(pi, () => activeContext);
 
   const refreshFleet = async (ctx: any): Promise<void> => {
     const refreshId = ++fleetRefresh;
@@ -209,7 +163,8 @@ export default function agentDeck(pi: ExtensionAPI) {
     refreshAgentTool(ctx);
     applyDeckState(ctx);
     unsubscribe?.();
-    unsubscribe = subscribeRunEvents(({ kind, run }) => {
+    unsubscribe = subscribeRunEvents((notification) => {
+      const { kind, run } = notification;
       if (run.parentSessionId !== activeContext?.sessionManager.getSessionId()) return;
       if (!refreshScheduled) {
         refreshScheduled = true;
@@ -218,11 +173,13 @@ export default function agentDeck(pi: ExtensionAPI) {
           void refreshFleet(activeContext).catch((error) => activeContext?.ui.setStatus("agent-deck-error", String(error)));
         });
       }
-      if (kind === "result" && run.completionSource !== "shutdown" && run.completionSource !== "tool-stop") {
-        const gate = deliveryGates.get(run.runId);
-        if (gate) gate.pending = run;
-        else void deliverBackgroundResult(run).catch((error) => activeContext?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
-      }
+      if (kind === "result") backgroundDelivery.notify(run);
+      if (notification.kind === "message") pi.sendMessage({
+        customType: PARENT_MESSAGE,
+        content: taskMessage(run, `子 Agent 消息：\n${notification.message.message}`),
+        display: true,
+        details: { taskId: run.runId, turnId: run.turnId, messageId: notification.message.id },
+      }, { deliverAs: "followUp", triggerTurn: true });
     });
     await reconcileRuns(ctx.sessionManager.getSessionId());
     await refreshFleet(ctx);
@@ -232,18 +189,10 @@ export default function agentDeck(pi: ExtensionAPI) {
     unsubscribe?.();
     unsubscribe = undefined;
     activeContext = undefined;
-    delivered.clear();
-    deliveryGates.clear();
+    backgroundDelivery.reset();
     await shutdownRuns();
   });
 
-  pi.on("context", async (event) => ({
-    messages: await Promise.all(event.messages.map(async (message) => {
-      if (message.role !== "custom" || message.customType !== RESULT_MESSAGE) return message;
-      const id = (message.details as { taskId?: string } | undefined)?.taskId;
-      return id ? labelHistoricalMessage(message, await readRun(id)) : message;
-    })),
-  }));
   pi.on("before_agent_start", async (_event, ctx) => { refreshAgentTool(ctx); });
 
   pi.registerMessageRenderer("agent-created", (message, _options, theme) =>
@@ -261,20 +210,31 @@ export default function agentDeck(pi: ExtensionAPI) {
       const params = parseStopInput(raw);
       const run = await resolveTaskTarget(params.task_id, ctx.sessionManager.getSessionId());
       const stopped = await stopRun(run.runId, "tool-stop", run.turnId ?? null);
-      return taskToolResult(stopped, stopped.status === "停止未确认" ? "停止未确认；仍需核对进程状态。" : isTerminalStatus(run.status) ? `任务已经结束，保留原状态：${stopped.status}；排队消息已清除。` : `任务${stopped.status}；排队消息已清除。`, undefined, stopped.status !== "停止未确认");
+      return taskToolResult(stopped, stopped.status === "停止未确认" ? "停止未确认；仍需核对进程状态。" : isTerminalStatus(run.status) ? `任务已经结束，保留原状态：${stopped.status}；排队消息已清除。` : `任务${stopped.status}；排队消息已清除。`);
     },
   });
 
   pi.registerTool({
-    name: "SendMessage", label: "联系 Agent", description: "向任务 ID 或实例名称补充信息。运行中在 Pi 工具边界接收；已结束时仅暂存，不启动任务。开始下一次执行请明确调用 Agent({resume, prompt})。",
+    name: "SendMessage", label: "联系 Agent", description: `向任务 ID 或实例名称发送补充要求、澄清回答或续接要求。运行中在消息边界接收；等待决定时交付回答；已结束时恢复原 Pi 会话并在后台执行。回答问题时可用 reply_to 对准问题编号。${BACKGROUND_WAIT}`,
     parameters: SendMessageParameters,
     async execute(_id, raw, _signal, _update, ctx) {
       if (!deckEnabled) throw new Error("Agent 已关闭，请在 /agent-deck 开启后重试。");
       const params = parseMessageInput(raw);
       const run = await resolveTaskTarget(params.to, ctx.sessionManager.getSessionId());
       await reconcileRun(run.runId);
-      const sent = await sendToRun(run.runId, params.message, params.summary);
-      return taskToolResult(sent.run, (sent.delivery === "deferred" ? "信息已暂存于当前主 Pi 进程，任务未启动；继续请调用 Agent({resume, prompt})。退出或重载不会重放暂存消息。" : "补充已接收或排队，将在 Pi 消息边界送入；这不表示模型已经读到。") + ` 摘要：${params.summary}`, sent.delivery, true);
+      const gate = backgroundDelivery.acquire(run.runId);
+      try {
+        const sent = await sendToRun(run.runId, params.message, params.summary, params.reply_to);
+        const current = (await readRun(run.runId)) ?? sent.run;
+        backgroundDelivery.release(current, gate);
+        const receipt = sent.delivery === "resumed" ? "已恢复原 Pi 子会话，在后台继续执行。"
+          : sent.delivery === "answered" ? "回答已交付，子 Agent 在原会话继续。" : "消息已接收或排队，将在 Pi 消息边界送入。";
+        return taskToolResult(current, current.pendingQuestion || isTerminalStatus(current.status) || current.status === "停止未确认"
+          ? taskOutput(current) : `${receipt} 摘要：${params.summary}${current.deliveryMode === "background" ? `\n${BACKGROUND_WAIT}` : ""}`, sent.delivery);
+      } catch (error) {
+        backgroundDelivery.discard(run.runId, gate);
+        throw error;
+      }
     },
   });
 
@@ -282,7 +242,7 @@ export default function agentDeck(pi: ExtensionAPI) {
     name: "Agent",
     label: "派遣子 Agent",
     description: agentToolDescription(discoverAgents(process.cwd(), { projectTrusted: false })),
-    promptSnippet: "适合独立处理时派发；resume 续接，SendMessage 只补充，TaskStop 停止",
+    promptSnippet: "Agent 派发；SendMessage 补充、回答和续接；TaskStop 停止",
     executionMode: "parallel" as const,
     parameters: AgentParameters,
 
@@ -291,26 +251,26 @@ export default function agentDeck(pi: ExtensionAPI) {
       const params = parseAgentInput(raw);
       if (params.resume !== undefined) {
         const original = await resolveTaskTarget(params.resume, ctx.sessionManager.getSessionId());
-        const deliveryGate = params.run_in_background ? acquireDeliveryGate(original.runId) : undefined;
+        const deliveryGate = params.run_in_background ? backgroundDelivery.acquire(original.runId) : undefined;
         let resumed: PersistedRun;
         try {
           const started = await resumeRun(original.runId, params.prompt, params.description, params.run_in_background, original.turnId ?? null);
           resumed = (await readRun(original.runId)) ?? started;
-          if (deliveryGate) releaseDeliveryGate(resumed, deliveryGate);
+          if (deliveryGate) backgroundDelivery.release(resumed, deliveryGate);
         } catch (error) {
-          if (deliveryGate) discardDeliveryGate(original.runId, deliveryGate);
+          if (deliveryGate) backgroundDelivery.discard(original.runId, deliveryGate);
           throw error;
         }
-        if (isTerminalStatus(resumed.status) || resumed.status === "停止未确认") {
-          return taskToolResult(resumed, taskOutput(resumed), "resumed", resumed.status !== "停止未确认");
+        if (isTerminalStatus(resumed.status) || resumed.status === "停止未确认" || (params.run_in_background && resumed.pendingQuestion)) {
+          return taskToolResult(resumed, taskOutput(resumed), "resumed");
         }
-        if (params.run_in_background) return taskToolResult(resumed, "已明确续接原任务和 Pi 子会话；本轮在后台执行，结果会自动返回。", "resumed", true);
+        if (params.run_in_background) return taskToolResult(resumed, `已续接原任务和 Pi 子会话，本轮在后台执行。${BACKGROUND_WAIT}`, "resumed");
         if (!resumed.turnId) throw new Error("续接后缺少 turnId，无法前台等待。");
         const completed = await waitForRunTurn(resumed.runId, resumed.turnId, {
           signal, stopOnAbort: true,
           onUpdate: (run) => onUpdate?.(taskToolResult(run, `前台等待中：${run.status}`)),
         });
-        return taskToolResult(completed, taskOutput(completed), "resumed", completed.status !== "停止未确认");
+        return taskToolResult(completed, taskOutput(completed), "resumed");
       }
       const agents = discoverAgents(contextCwd(ctx), { projectTrusted: isProjectTrusted(ctx) });
       const agent = resolveAgentRole(params.subagent_type, agents);
@@ -357,14 +317,13 @@ export default function agentDeck(pi: ExtensionAPI) {
             id: childSessionId,
             parentSession: parentSessionPath,
           });
-          childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`);
+          childManager.appendSessionInfo(`子Agent｜${params.name ?? agent.name}｜${taskSummary(params.description, 36)}`);
           childSessionPath = childManager.getSessionFile();
           if (!childSessionPath) throw new Error("无法创建持久化子 Session");
           // Pi defers the first disk write until an assistant message. Materialize
           // its native header before another process opens this new session.
           await fs.promises.writeFile(childSessionPath, [childManager.getHeader(), ...childManager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "wx" });
           childSessionCreated = true;
-          const instruction = params.prompt;
           const details: RunDetails = {
             version: 3,
             runId,
@@ -372,9 +331,7 @@ export default function agentDeck(pi: ExtensionAPI) {
             agentName: agent.name,
             agentSource: agent.source,
             instanceName: params.name,
-            description: params.description,
-            objective: shortTask(params.prompt, 80),
-            instruction,
+            ...buildTaskText(params.prompt, params.description),
             status: routing.immediate ? "运行中" : "选配中",
             model: resolved.model,
             thinking: resolved.thinking,
@@ -400,7 +357,7 @@ export default function agentDeck(pi: ExtensionAPI) {
           const childArgs = [
             "--mode", "rpc",
             "--session", childSessionPath,
-            "--name", `子Agent｜${params.name ?? agent.name}｜${shortTask(params.description, 36)}`,
+            "--name", `子Agent｜${params.name ?? agent.name}｜${taskSummary(params.description, 36)}`,
             "--model", details.model,
             "--thinking", details.thinking,
             "--no-extensions",
@@ -416,7 +373,7 @@ export default function agentDeck(pi: ExtensionAPI) {
             cwd,
             command: invocation.command,
             argsPrefix: invocation.args,
-            prompt: instruction,
+            prompt: details.instruction,
             timeoutMs: agent.timeoutMs ?? config.timeoutMs,
             routing,
             env: {
@@ -443,34 +400,34 @@ export default function agentDeck(pi: ExtensionAPI) {
           throw error;
         }
       });
-      const deliveryGate = params.run_in_background ? acquireDeliveryGate(created.runId) : undefined;
+      const deliveryGate = params.run_in_background ? backgroundDelivery.acquire(created.runId) : undefined;
       let current: PersistedRun;
       try {
         await launchRunner(created.runId);
         current = (await readRun(created.runId)) ?? created;
-        if (deliveryGate) releaseDeliveryGate(current, deliveryGate);
+        if (deliveryGate) backgroundDelivery.release(current, deliveryGate);
       } catch (error) {
-        if (deliveryGate) discardDeliveryGate(created.runId, deliveryGate);
+        if (deliveryGate) backgroundDelivery.discard(created.runId, deliveryGate);
         throw error;
       }
-      if (isTerminalStatus(current.status) || current.status === "停止未确认") {
-        return taskToolResult(current, taskOutput(current), undefined, current.status !== "停止未确认");
+      if (isTerminalStatus(current.status) || current.status === "停止未确认" || (params.run_in_background && current.pendingQuestion)) {
+        return taskToolResult(current, taskOutput(current));
       }
       if (params.run_in_background) {
-        return taskToolResult(current, `${current.status === "选配中" ? "Jev 正在选配模型与思考强度。" : `当前状态：${current.status}。`} 本轮在后台执行，结果会自动返回；可以继续其他独立工作。`);
+        return taskToolResult(current, `${current.status === "选配中" ? "Jev 正在选配模型与思考强度。 " : ""}本轮在后台执行；可用上述 agentId 调用 SendMessage 或 TaskStop。${BACKGROUND_WAIT}`);
       }
       if (!current.turnId) throw new Error("任务启动后缺少 turnId，无法前台等待。");
       const completed = await waitForRunTurn(current.runId, current.turnId, {
         signal, stopOnAbort: true,
         onUpdate: (run) => onUpdate?.(taskToolResult(run, `前台等待中：${run.status}`)),
       });
-      return taskToolResult(completed, taskOutput(completed), undefined, completed.status !== "停止未确认");
+      return taskToolResult(completed, taskOutput(completed));
     },
 
     renderCall(args, theme) {
       return new Text([
         theme.fg("toolTitle", theme.bold(`↗ 派遣 Agent：${args.resume ?? args.name ?? args.subagent_type ?? "general-purpose"}`)),
-        theme.fg("muted", `  ${shortTask(args.description ?? "等待任务", 100)}`),
+        theme.fg("muted", `  ${taskSummary(args.description ?? "等待任务", 100)}`),
       ].join("\n"), 0, 0);
     },
 
@@ -486,13 +443,15 @@ export default function agentDeck(pi: ExtensionAPI) {
         : theme.fg("error", "✗");
       return new Text([
         `${icon} ${theme.fg("toolTitle", theme.bold(runRoleLabel(details)))} · ${statusLabel(details.status)}`,
-        theme.fg("muted", `  ${shortTask(runTitle(details), 100)}`),
+        theme.fg("muted", `  ${taskSummary(runTitle(details), 100)}`),
       ].join("\n"), 0, 0);
     },
   };
   pi.registerTool(agentTool);
   refreshAgentTool = (ctx: any) => {
-    agentTool.description = agentToolDescription(discoverAgents(contextCwd(ctx), { projectTrusted: isProjectTrusted(ctx) }));
+    const cwd = contextCwd(ctx), projectTrusted = isProjectTrusted(ctx);
+    const images = imageSettingsDiagnostic(cwd, projectTrusted);
+    agentTool.description = agentToolDescription(discoverAgents(cwd, { projectTrusted }), images.warning ? images.text : undefined);
     pi.registerTool(agentTool);
   };
 
@@ -598,18 +557,20 @@ export default function agentDeck(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const agents = discoverAgents(contextCwd(ctx), { projectTrusted: isProjectTrusted(ctx) });
       const definitionProblems = agents.flatMap((agent) => validateAgentDefinition(agent).map((error) => `${agent.id}：${error}`));
+      const images = imageSettingsDiagnostic(contextCwd(ctx), isProjectTrusted(ctx));
       const runs = await listRuns(Number.MAX_SAFE_INTEGER, ctx.sessionManager.getSessionId());
       const lines = [
         `Agent Deck ${AGENT_DECK_VERSION} · 主 Pi 管理 RPC 子会话`,
         `Pi 宿主：${process.execPath} · ${process.version} · 模式：${ctx.mode}`,
         `项目：${contextCwd(ctx)} · 信任：${isProjectTrusted(ctx) ? "已信任" : "未信任（项目 Agent 已忽略）"}`,
+        images.text,
         `当前会话任务：${runs.length} · 需求澄清与验收由主 Agent 负责`,
         `并发数量由主 Agent 与实际环境决定，不设产品级固定上限 · Jev 只选模型/思考：${readDeckConfig().routing.enabled ? "开启" : "关闭"}`,
         "正常结束只表示子运行完成；最终文本、失败、中断与进程资源分开记录，由主 Agent 阅读结果并验收。",
         "关闭或重载主 Pi 会结束它管理的子进程；会话记录保留，之后可由主 Agent 明确 resume 原任务。",
         ...definitionProblems.map((problem) => `• ${problem}`),
       ];
-      ctx.ui.notify(lines.join("\n"), definitionProblems.length ? "warning" : "info");    },
+      ctx.ui.notify(lines.join("\n"), definitionProblems.length || images.warning ? "warning" : "info");    },
   });
 
   pi.registerCommand("agents", {
@@ -649,7 +610,7 @@ export default function agentDeck(pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const rows = await listRuns(20, ctx.sessionManager.getSessionId());
       const text = rows.length
-        ? rows.map((item) => `${item.runId}｜${item.agentName}｜${item.status}｜${item.childSessionId.slice(0, 8)}\n  ${shortTask(item.objective, 90)}`).join("\n\n")
+        ? rows.map((item) => `${item.runId}｜${item.agentName}｜${item.status}｜${item.childSessionId.slice(0, 8)}\n  ${taskSummary(item.objective, 90)}`).join("\n\n")
         : "还没有子 Agent 运行记录。";
       ctx.ui.notify(text, "info");
     },

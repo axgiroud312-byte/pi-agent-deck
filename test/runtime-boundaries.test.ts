@@ -127,7 +127,8 @@ test("未归属且进程已死的任务会清 PID、标 released 并保存完成
     const directory = runDirectory(id);
     const raw: any = {
       version: 3, runId: id, roleId: "worker", agentName: "dead", agentSource: "内置",
-      objective: "dead", instruction: "dead", status: "运行中", resourceState: "running",
+      objective: "dead", instruction: "dead", status: "等待决定", resourceState: "running",
+      pendingQuestion: { id: "orphan-question", message: "尚未回答" },
       model: "fake/model", thinking: "off", tools: [], disallowedTools: [], extensions: [], parentSessionId: id,
       childSessionId: id, childSessionPath: "dead.jsonl", cwd: process.cwd(), childPid: 2147483000,
       startedAt: 1, updatedAt: 2, events: [], usage,
@@ -139,6 +140,7 @@ test("未归属且进程已死的任务会清 PID、标 released 并保存完成
     assert.equal(finished.status, mode === "stop" ? "已停止" : "失联");
     assert.equal(finished.resourceState, "released");
     assert.equal(finished.childPid, undefined);
+    assert.equal(finished.pendingQuestion, undefined, "死进程中的问题已不能接收回答");
     assert.equal(finished.legacy?.writePermission, undefined);
     const history = await readCompletions(directory);
     assert.equal(history.length, 1);
@@ -201,7 +203,7 @@ test("异常终态记录仍有存活 childPid 时不能假装已经释放", asyn
   assert.equal((await readRun(id, true))?.childPid, process.pid);
 });
 
-test("空闲 SendMessage 只更新进程内邮箱，不改写 v1 或持久化幽灵计数", async (t) => {
+test("缺失子会话时消息续接失败，v1 原始记录保持完整", async (t) => {
   const id = `legacy-mail-${randomUUID()}`;
   const directory = runDirectory(id), cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-legacy-mail-"));
   const raw: any = {
@@ -215,16 +217,21 @@ test("空闲 SendMessage 只更新进程内邮箱，不改写 v1 或持久化幽
   await fs.writeFile(path.join(directory, "request.json"), JSON.stringify({ version: 1, cwd, command: process.execPath, argsPrefix: [], prompt: "old" }));
   const source = await fs.readFile(statusPath(id), "utf8");
   t.after(async () => { await shutdownRuns(id); await fs.rm(directory, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  const sent = await sendToRun(id, "仅在本进程暂存");
-  assert.equal(sent.delivery, "deferred");
-  assert.equal(sent.run.queuedMessageCount, 1);
+  await assert.rejects(sendToRun(id, "继续原任务"), /保存的子会话不存在/);
+  assert.equal(await fs.readFile(statusPath(id), "utf8"), source);
+  await assert.rejects(launchRunner(id), /历史记录只能通过明确 resume/);
+  const idle = (await readRun(id))!;
+  assert.equal(idle.version, 1);
+  assert.equal(idle.status, "等待决定");
+  assert.equal(idle.queuedMessageCount, 0);
+  assert.equal(idle.childPid, undefined);
   assert.equal(await fs.readFile(statusPath(id), "utf8"), source);
   await shutdownRuns(id);
   assert.equal((await readRun(id, true))?.queuedMessageCount, undefined);
   assert.equal(await fs.readFile(statusPath(id), "utf8"), source);
 });
 
-test("v1 已结束任务暂存消息后 TaskStop 仍不改写历史记录", async (t) => {
+test("v1 消息续接失败后 TaskStop 保留原结果和历史记录", async (t) => {
   const id = `legacy-terminal-${randomUUID()}`;
   const directory = runDirectory(id), cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-legacy-terminal-"));
   const raw: any = {
@@ -238,7 +245,7 @@ test("v1 已结束任务暂存消息后 TaskStop 仍不改写历史记录", asyn
   await fs.writeFile(path.join(directory, "request.json"), JSON.stringify({ version: 1, cwd, command: process.execPath, argsPrefix: [], prompt: "old" }));
   const source = await fs.readFile(statusPath(id), "utf8");
   t.after(async () => { await shutdownRuns(id); await fs.rm(directory, { recursive: true, force: true }); await fs.rm(cwd, { recursive: true, force: true }); });
-  assert.equal((await sendToRun(id, "仅暂存")).delivery, "deferred");
+  await assert.rejects(sendToRun(id, "继续原任务"), /保存的子会话不存在/);
   const stopped = await stopRun(id);
   assert.equal(stopped.status, "已完成");
   assert.equal(stopped.queuedMessageCount, 0);
@@ -548,6 +555,10 @@ test("v2 生效配置只在明确 resume 时迁移为 v3 直接字段", async t 
 
   const resumed = await resumeRun(id, "plain", undefined, false, old.turnId ?? null);
   assert.equal(resumed.version, 3);
+  assert.ok(resumed.turnId);
+  assert.notEqual(resumed.turnId, old.turnId);
+  assert.ok(["starting", "running", "releasing", "released"].includes(resumed.resourceState!));
+  assert.equal(resumed.deliveryMode, "foreground");
   assert.deepEqual(resumed.tools, [], "显式空 allowlist 在 resume 后仍必须是空数组");
   assert.deepEqual(resumed.disallowedTools, ["write"]);
   const completed = await settled(id);

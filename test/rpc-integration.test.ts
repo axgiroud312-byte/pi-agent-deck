@@ -19,6 +19,91 @@ const providerExtension = fileURLToPath(new URL("./fixtures/rpc-faux-provider.ts
 const childExtension = fileURLToPath(new URL("../src/child-runtime.ts", import.meta.url));
 const roleProbeExtension = fileURLToPath(new URL("./fixtures/role-probe-extension.ts", import.meta.url));
 
+test("真实 Pi：完整报告后消费排队收口消息，报告与摘要按顺序交付", async (t) => {
+  const fixture = await createRun(t, "DECK_FULL_REPORT_CASE");
+  await runtime.launchRunner(fixture.runId);
+  await until(async () => (await lines(fixture.log)).some(x => x.type === "full_report_started") ? true : undefined, "完整报告生成中");
+  await runtime.sendToRun(fixture.runId, "DECK_LATE_WRAP_UP");
+  const done = await until(async () => {
+    const run = await runtime.readRun(fixture.runId);
+    return run?.resourceState === "released" ? run : undefined;
+  }, "报告交付");
+  assert.match(done.finalText!, /^FULL_REPORT:/);
+  assert.match(done.finalText!, /END_OF_FULL_REPORT\n\n---\n\nLATE_SUMMARY$/);
+  assert.equal(done.finalText?.split("FULL_REPORT:").length, 2);
+  assert.equal((await readCompletions(runtime.runDirectory(fixture.runId)))[0].finalText, done.finalText);
+  assert.ok(resultMessage(done, fixture.parentSessionId)?.details.evidence.includes("END_OF_FULL_REPORT"));
+});
+
+test("真实 Pi：前台问题交回控制权，两次回答沿用原进程和会话", async (t) => {
+  const fixture = await createRun(t, "DECK_QUESTION_CASE", { tools: ["read"] });
+  await runtime.launchRunner(fixture.runId);
+  const initial = (await runtime.readRun(fixture.runId))!;
+  const first = await runtime.waitForRunTurn(fixture.runId, initial.turnId!);
+  assert.equal(first.status, "等待决定", first.failureReason);
+  assert.equal(first.deliveryMode, "background");
+  assert.match(taskOutput(first), /使用哪种格式/);
+  assert.ok(alive(first.childPid));
+  const q1 = first.pendingQuestion!.id;
+  await assert.rejects(runtime.sendToRun(fixture.runId, "错误回复", undefined, "stale-question"), /该问题已结束/);
+  assert.equal((await runtime.readRun(fixture.runId))?.pendingQuestion?.id, q1);
+  assert.equal((await runtime.sendToRun(fixture.runId, "JSON", undefined, q1)).delivery, "answered");
+  const second = await until(async () => {
+    const run = await runtime.readRun(fixture.runId);
+    return run?.pendingQuestion && run.pendingQuestion.id !== q1 ? run : undefined;
+  }, "第二个问题");
+  assert.equal(second.childPid, first.childPid);
+  await assert.rejects(runtime.sendToRun(fixture.runId, "重复回复", undefined, q1), /该问题已结束/);
+  await runtime.sendToRun(fixture.runId, "output.json", undefined, second.pendingQuestion!.id);
+  const done = await until(async () => {
+    const run = await runtime.readRun(fixture.runId);
+    return run?.status === "已完成" ? run : undefined;
+  }, "问答后完成");
+  assert.equal(done.childSessionId, fixture.childSessionId);
+  assert.equal(done.turnId, first.turnId);
+  assert.equal(done.pendingQuestion, undefined);
+  assert.match(done.finalText!, /JSON/);
+  assert.match(done.finalText!, /output.json/);
+  const calls = (await lines(fixture.log)).filter(x => x.type === "provider_call");
+  assert.ok((await lines(fixture.log)).find(x => x.type === "active_tools").tools.includes("SendMessage"), "通信工具随子运行桥提供，与角色工作工具分开");
+  const sent = await runtime.sendToRun(fixture.runId, "DECK_QUESTION_RESUME");
+  assert.equal(sent.delivery, "resumed");
+  const resumed = await runtime.waitForRunTurn(fixture.runId, sent.run.turnId!);
+  assert.equal(resumed.childSessionId, first.childSessionId);
+  assert.match((await lines(fixture.log)).filter(x => x.type === "provider_call").at(-1).transcript, /output.json/);
+});
+
+test("真实 Pi：等待回答时停止，再续接原子会话", async (t) => {
+  const fixture = await createRun(t, "DECK_QUESTION_CASE");
+  await runtime.launchRunner(fixture.runId);
+  const initial = (await runtime.readRun(fixture.runId))!;
+  const waiting = await runtime.waitForRunTurn(fixture.runId, initial.turnId!);
+  const stopped = await runtime.stopRun(fixture.runId);
+  assert.equal(stopped.status, "已停止");
+  assert.equal(stopped.resourceState, "released");
+  assert.equal(stopped.pendingQuestion, undefined);
+  assert.equal(alive(waiting.childPid), false);
+  const sent = await runtime.sendToRun(fixture.runId, "DECK_QUESTION_RESUME");
+  const done = await runtime.waitForRunTurn(fixture.runId, sent.run.turnId!);
+  assert.equal(done.status, "已完成");
+  assert.equal(done.childSessionId, waiting.childSessionId);
+  assert.match(done.finalText!, /RESUMED_WITH_QUESTION_CONTEXT/);
+});
+
+test("真实 Pi：普通进度单独交付，最终结果保持完整", async (t) => {
+  const fixture = await createRun(t, "DECK_PROGRESS_CASE");
+  const messages: string[] = [];
+  const unsubscribe = runtime.subscribeRunEvents(event => {
+    if (event.run.runId === fixture.runId && event.kind === "message") messages.push(event.message.message);
+  });
+  t.after(unsubscribe);
+  await runtime.launchRunner(fixture.runId);
+  const run = (await runtime.readRun(fixture.runId))!;
+  const done = await runtime.waitForRunTurn(fixture.runId, run.turnId!);
+  assert.deepEqual(messages, ["已找到入口，正在验证"]);
+  assert.equal(done.finalText, "PROGRESS_DONE");
+});
+
 interface RunOptions {
   tools?: string[];
   disallowedTools?: string[];
@@ -102,7 +187,7 @@ async function createRun(t: any, prompt: string, options: RunOptions = {}) {
   return { runId, parentSessionId, childSessionId, childSessionPath, cwd, log };
 }
 
-test("真实 Pi RPC：自然文本完成、运行中补充、空闲不暗启及明确 resume", async (t) => {
+test("真实 Pi RPC：自然文本完成、运行中补充和消息续接原会话", async (t) => {
   const fixture = await createRun(t, "DECK_TOOL_CASE", { tools: ["deck_pause"] });
   await runtime.launchRunner(fixture.runId);
   const live = await until(async () => (await lines(fixture.log)).some((item) => item.type === "long_tool_start") ? runtime.readRun(fixture.runId) : undefined, "工具开始");
@@ -152,11 +237,8 @@ test("真实 Pi RPC：自然文本完成、运行中补充、空闲不暗启及�
   } as any);
   assert.equal(await fs.readFile(fixture.childSessionPath, "utf8"), sessionBefore, "只读查看不能改写子会话");
 
-  const deferred = await runtime.sendToRun(fixture.runId, "DECK_IDLE_INFORMATION");
-  assert.equal(deferred.delivery, "deferred");
-  assert.equal(deferred.run.resourceState, "released");
-  assert.equal((await lines(fixture.log)).filter((item) => item.type === "provider_call").length, 2, "SendMessage 不暗中启动新轮次");
-  await runtime.resumeRun(fixture.runId, "DECK_CONTINUE_CASE", "补充验证");
+  const sent = await runtime.sendToRun(fixture.runId, "DECK_CONTINUE_CASE", "补充验证");
+  assert.equal(sent.delivery, "resumed");
   const resumed = await until(async () => {
     const run = await runtime.readRun(fixture.runId);
     return run?.resourceState === "released" && run.turnId !== result.turnId ? run : undefined;
@@ -167,8 +249,12 @@ test("真实 Pi RPC：自然文本完成、运行中补充、空闲不暗启及�
   assert.equal(resumed.childSessionPath, fixture.childSessionPath);
   assert.equal(resumed.description, "补充验证");
   const last = (await lines(fixture.log)).filter((item) => item.type === "provider_call").at(-1);
-  assert.match(last.transcript, /DECK_IDLE_INFORMATION/);
+  assert.match(last.transcript, /DECK_TOOL_DONE/);
   assert.match(last.transcript, /DECK_CONTINUE_CASE/);
+  const lastUser = (await lines(fixture.childSessionPath)).filter((entry) => entry.type === "message" && entry.message.role === "user").at(-1).message;
+  const actualInput = lastUser.content.map((block: any) => block.text ?? "").join("");
+  assert.equal(actualInput, "DECK_CONTINUE_CASE");
+  assert.equal(resumed.instruction, "DECK_CONTINUE_CASE", "暂存补充不是本轮任务要求的展示副本");
   assert.equal(resumed.queuedMessageCount, 0);
 });
 

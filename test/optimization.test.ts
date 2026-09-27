@@ -55,15 +55,15 @@ lines.on("close", () => process.exit(0));
 `);
   const now = Date.now();
   const run: any = {
-    version: 1, autoDeliver: true, runId: id,
-    agentId: options.role ?? "probe", agentName: "probe", objective: "probe", instruction: "probe", acceptanceCriteria: [],
-    status: options.completed ? "已完成" : "运行中", model: "fake/model", thinking: "off", tools: [], writePermission: false,
+    version: 3, runId: id,
+    roleId: options.role ?? "probe", agentName: "probe", agentSource: "内置", objective: "probe", instruction: "probe",
+    status: options.completed ? "已完成" : "运行中", model: "fake/model", thinking: "off", tools: [], disallowedTools: ["edit", "write"], extensions: [],
     cwd: directory, parentSessionId: id, childSessionId: "same-child", childSessionPath: path.join(directory, "child.jsonl"),
     startedAt: now - 1000, endedAt: options.completed ? now - 100 : undefined,
-    reports: [], events: [], finalText: options.final,
+    events: [], finalText: options.final,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
   };
-  await initializeRun(run, { version: 1, cwd: directory, command: process.execPath, argsPrefix: [script], prompt: "fixture" }, true);
+  await initializeRun(run, { version: 3, cwd: directory, command: process.execPath, argsPrefix: [script], prompt: "fixture" }, true);
   if (options.roleLimit) {
     const file = path.join(runDirectory(id), "request.json");
     const saved = JSON.parse(await fs.readFile(file, "utf8"));

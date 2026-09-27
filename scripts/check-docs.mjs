@@ -15,6 +15,8 @@ const documents = [
   releaseDocument,
   validationDocument,
   "docs/single-workspace-subagent-plan.md",
+  "docs/subagent-simplification-plan.md",
+  "docs/communication-fix-2026-09-27.md",
   "src/agent-authoring.md",
 ];
 

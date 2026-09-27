@@ -1,4 +1,4 @@
-import type { PersistedRun } from "./runtime.ts";
+import type { PersistedRun } from "./types.ts";
 export function adaptStoredRun(raw: unknown): PersistedRun;
 export function alive(pid: number | undefined): boolean;
 export function readJson(file: string): Promise<any>;

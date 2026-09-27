@@ -1,7 +1,7 @@
 {
   "name": "pi-agent-deck",
   "version": "0.13.0",
-  "description": "Pi 原生子会话的轻量多 Agent 编排、前后台执行、角色扩展与显式续接",
+  "description": "Pi 原生子会话的轻量多 Agent 编排、澄清问答、前后台执行与消息续接",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -20,7 +20,8 @@
     "docs/jev-routing.md",
     "docs/publishing.md",
     "docs/0.13.0-release.md",
-    "docs/single-workspace-subagent-plan.md"
+    "docs/single-workspace-subagent-plan.md",
+    "docs/communication-fix-2026-09-27.md"
   ],
   "pi": {
     "extensions": [

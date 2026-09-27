@@ -94,16 +94,16 @@ if(q.type==="prompt"){
     await new Promise(resolve=>setTimeout(resolve,5));
   }
   assert.ok(inFlight, "应先观察到旧 agent_settled 正在核对空闲状态");
+  await fs.writeFile(path.join(cwd, "session.jsonl"), JSON.stringify({ type: "session", id, version: 3 }) + "\n");
   const sent=await sendToRun(id,"FOLLOWUP");
-  assert.equal(sent.delivery,"deferred", "完成边界之后只暂存，不自动启动");
-  await resumeFixtureRun(id, "EXPLICIT_RESUME");
+  assert.equal(sent.delivery,"resumed", "完成边界之后恢复原会话");
   let result;
   for(let i=0;i<500;i++){
     const run=await readRun(id);
     if(run?.status==="已完成" && run.finalText?.includes("FOLLOWUP")){result=run;break;}
     await new Promise(resolve=>setTimeout(resolve,5));
   }
-  assert.match(result?.finalText ?? "", /FOLLOWUP/, "补充随明确 resume 送入新执行");
+  assert.match(result?.finalText ?? "", /FOLLOWUP/, "补充随 SendMessage 续接送入新执行");
 });
 
 test("执行超时进入停止流程后拒绝补充消息", async (t) => {

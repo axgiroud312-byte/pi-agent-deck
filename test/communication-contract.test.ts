@@ -9,15 +9,15 @@ import { initializeRun, runDirectory } from "../src/runtime.ts";
 import { parseAgentInput, parseMessageInput, publicTaskResult } from "../src/tool-contract.ts";
 import { showAgentPanel } from "../src/ui.ts";
 
-test("消息参数只保留收件任务、正文与摘要；旧问答参数明确拒绝", () => {
+test("消息参数支持正文、摘要与可选问题编号", () => {
   assert.deepEqual(parseMessageInput({ to: "worker", message: "补充说明" }), { to: "worker", message: "补充说明", summary: "补充说明" });
-  assert.throws(() => parseMessageInput({ to: "worker", message: "答复", reply_to: "q" }), /不再接受/);
+  assert.equal(parseMessageInput({ to: "worker", message: "答复", reply_to: "q" }).reply_to, "q");
 });
 
-test("子 Agent 运行桥不注册报告或问答工具，最终文本由 Pi 原生循环产生", () => {
+test("子 Agent 运行桥提供主 Agent 通信，最终文本由 Pi 原生循环产生", () => {
   const tools = new Map<string, any>();
-  childRuntime({ registerTool: (tool: any) => tools.set(tool.name, tool) } as any);
-  assert.deepEqual([...tools.keys()], []);
+  childRuntime({ registerTool: (tool: any) => tools.set(tool.name, tool), on() {} } as any);
+  assert.deepEqual([...tools.keys()], ["SendMessage"]);
 });
 
 test("只读面板保留旧问题记录，移除答复和续接输入，仅允许明确停止", async () => {

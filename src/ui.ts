@@ -1,10 +1,11 @@
+import type { PersistedRun } from "./types.ts";
 import * as fs from "node:fs";
 import { runTitle, runRoleLabel } from "./tool-contract.ts";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, Markdown, stripTerminalSequences, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { isTerminalStatus, listRuns, runDirectory, type PersistedRun } from "./runtime.ts";
+import { isTerminalStatus, listRuns, runDirectory } from "./runtime.ts";
 import { taskOutput } from "./delivery.ts";
 import { readCompletions } from "./persistence.mjs";
 import { readDeckConfig } from "./config.ts";
@@ -153,7 +154,7 @@ class AgentPanelComponent {
       if (selected && this.theme.bg) row = this.theme.bg("selectedBg", fit(row, width));
       lines.push(row);
       const legacyQuestion = run.version < 3 && run.status === "等待决定" ? run.legacy?.pendingQuestion : undefined;
-      const activity = legacyQuestion ? `旧版待决定：${legacyQuestion.question}` : run.currentAction ?? (isTerminalStatus(run.status) ? taskOutput(run) : run.status === "排队中" ? "历史排队记录" : run.status === "等待决定" ? "旧版待决定记录" : "等待新的活动记录");
+      const activity = run.pendingQuestion ? `等待主 Agent：${run.pendingQuestion.message}` : legacyQuestion ? `旧版待决定：${legacyQuestion.question}` : run.currentAction ?? (isTerminalStatus(run.status) ? taskOutput(run) : run.status === "排队中" ? "历史排队记录" : run.status === "等待决定" ? "旧版待决定记录" : "等待新的活动记录");
       lines.push(this.theme.fg("muted", `  ${plain(runRoleLabel(run))} · ${resourceLabel(run)} · ${plain(executionLabel(run))} · ${plain(activity)}`));
     }
     if (!this.runs.length) lines.push("还没有任务。直接告诉主 Agent 你要完成什么。", "按 N 描述并创建一个专用 Agent。");

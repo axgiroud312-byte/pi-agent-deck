@@ -1,7 +1,8 @@
+import type { PersistedRun } from "./types.ts";
 import * as fs from "node:fs";
 import { SessionManager, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { liveConversation, type PersistedRun } from "./runtime.ts";
+import { liveConversation } from "./runtime.ts";
 
 export interface ConversationBlock { key: string; text: string }
 const cache = new Map<string, { stamp: string; messages: any[] }>();

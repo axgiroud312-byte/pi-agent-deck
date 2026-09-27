@@ -1,8 +1,9 @@
+import type { PersistedRun } from "./types.ts";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { withDiskLock } from "./persistence.mjs";
-import { listRuns, readRun, type PersistedRun } from "./runtime.ts";
+import { listRuns, readRun } from "./runtime.ts";
 import { validateInstanceName } from "./tool-contract.ts";
 
 /** The persisted run is the name binding. Serialize name checking through initialization. */

@@ -77,17 +77,17 @@ async function fixture(t: any, task: string, routing = plan(task)) {
   const script = path.join(directory, "fake-pi.mjs");
   await fs.writeFile(script, rpcSource);
   const session = path.join(directory, "child.jsonl");
-  const run: any = { version: 1, autoDeliver: true, runId: id, turnId: randomUUID(),
-    agentId: routing.state.role, agentName: "fixture", agentSource: "内置",
-    objective: task, instruction: task, acceptanceCriteria: [], status: "选配中",
+  const run: any = { version: 3, runId: id, turnId: randomUUID(),
+    roleId: routing.state.role, agentName: "fixture", agentSource: "内置",
+    objective: task, instruction: task, status: "选配中",
     model: routing.fallback.model, thinking: routing.fallback.thinking, routingPending: true,
-    tools: ["read"], writePermission: false, cwd: directory,
+    tools: ["read"], disallowedTools: ["edit", "write"], extensions: [], cwd: directory,
     parentSessionId: id, childSessionId: id, childSessionPath: session,
-    startedAt: Date.now(), reports: [], events: [],
+    startedAt: Date.now(), events: [],
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
   };
-  await initializeRun(run, { version: 1, cwd: directory, command: process.execPath,
+  await initializeRun(run, { version: 3, cwd: directory, command: process.execPath,
     argsPrefix: [script, "--session", session, "--model", run.model, "--thinking", run.thinking],
     prompt: task, routing }, true);
   t.after(async () => { await shutdownRuns(id); await fs.rm(directory, { recursive: true, force: true }); });
