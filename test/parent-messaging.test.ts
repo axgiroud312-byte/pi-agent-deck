@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readMessages } from "../src/message-store.ts";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -98,6 +99,12 @@ test("真实父子 Pi：澄清后交付、消息续接与历史原文覆盖前�
       assert.deepEqual(JSON.parse(await fs.readFile(path.join(cwd, "artifact.json"), "utf8")), { ok: true });
       assert.equal(childCalls, 4);
       assert.ok(originalReport.includes(finalReport));
+      const taskId = events.find(event => event.type === "tool_execution_end" && event.toolName === "Agent")?.result?.details?.publicResult?.agentId;
+      assert.ok(taskId);
+      const records = await readMessages(taskId);
+      assert.equal(records.filter(record => record.direction === "to-child").length, 2);
+      assert.equal(records.filter(record => record.direction === "to-parent").length, 3);
+      assert.ok(records.every(record => record.state === "consumed"), "真实父子消息事件全部核对为已进入执行上下文");
       t.diagnostic(`background=${background}: question answered, artifact verified, original context resumed, report unchanged`);
     } finally { await rpc.close(); }
   }

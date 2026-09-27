@@ -220,7 +220,7 @@ test("每轮只公开当前 turn 的结果并复用同一个子会话", async (t
   assert.equal(second.childPid, childPid);
 });
 
-test("QueueOnly 恰逢 settled 时未消费信息回到邮箱；下次继续只送一次", async (t) => {
+test("QueueOnly 恰逢 settled 时自动消费补充，后续显式续接不重复发送", async (t) => {
   const fixture = await rpcFixture(t, "BOUNDARY");
   await launchRunner(fixture.runId);
   await until(async () => (await readRun(fixture.runId))?.currentAction === "子 Agent 正在执行" ? true : undefined, "首条任务已提交");
@@ -231,15 +231,16 @@ test("QueueOnly 恰逢 settled 时未消费信息回到邮箱；下次继续只�
     return run?.status === "已完成" ? run : undefined;
   }, "边界完成");
   assert.equal(first.turnId, before.turnId);
-  assert.equal(first.finalText, "BOUNDARY_DONE");
-  assert.equal(first.queuedMessageCount, 1);
+  assert.match(first.finalText ?? "", /^BOUNDARY_DONE[\s\S]*BOUNDARY_INFO$/);
+  assert.equal(first.finalText?.split("BOUNDARY_INFO").length, 2);
+  assert.equal(first.queuedMessageCount, 0);
   assert.equal(first.resourceState, "released");
   await resumeFixtureRun(fixture.runId, "CONTINUE");
   const second = await until(async () => {
     const run = await readRun(fixture.runId);
     return run?.status === "已完成" && run.turnId !== first.turnId ? run : undefined;
   }, "再次执行");
-  assert.equal(second.finalText?.split("BOUNDARY_INFO").length, 2);
-  assert.match(second.finalText ?? "", /BOUNDARY_INFO\s+CONTINUE/);
+  assert.doesNotMatch(second.finalText ?? "", /BOUNDARY_INFO/);
+  assert.match(second.finalText ?? "", /CONTINUE/);
   assert.equal(second.queuedMessageCount, 0);
 });

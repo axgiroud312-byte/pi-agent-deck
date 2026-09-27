@@ -1,14 +1,40 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PersistedRun } from "./types.ts";
 import { readRun, isTerminalStatus } from "./runtime.ts";
-import { resultMessage } from "./delivery.ts";
+import { PARENT_MESSAGE, resultMessage, taskOutput } from "./delivery.ts";
+import { taskMessage } from "./tool-contract.ts";
+import {
+  consumeMessages, inputMessageIds, messagesPath, readMessages, reconcileMessages,
+  recordMessage, settleMessages, submitMessages, unsubmitMessages,
+} from "./message-store.ts";
 
-/** Process-local delivery coordination; never replays historical results on reload. */
+/** Durable transport evidence with process-local arbitration between tool and background delivery. */
 export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, getContext: () => ExtensionContext | undefined) {
-  // This registry is scoped to the current Pi process; message acceptance is not model consumption.
   const delivered = new Set<string>();
+  const delivering = new Map<string, Promise<void>>();
   type DeliveryGate = { holders: number; pending?: PersistedRun };
   const deliveryGates = new Map<string, DeliveryGate>();
+  const reportError = (error: unknown): void => getContext()?.ui.setStatus("agent-deck-error", `Agent 消息记录或投递失败：${String(error)}`);
+  const isActiveParent = (run: PersistedRun, ctx: ExtensionContext | undefined): ctx is ExtensionContext =>
+    !!ctx && ctx === getContext() && run.parentSessionId === ctx.sessionManager.getSessionId();
+
+  // Foreground and background transports share the same identity and unformatted body.
+  const outputMessage = (run: PersistedRun) => resultMessage({ ...run, deliveryMode: "background" }, run.parentSessionId);
+  const recordOutput = async (run: PersistedRun) => {
+    const message = outputMessage(run);
+    if (!message) return;
+    const record = await recordMessage(run, "to-parent", run.pendingQuestion?.message ?? taskOutput(run), message.details.deliveryId);
+    return { message, record };
+  };
+
+  const sendOnce = (run: PersistedRun, id: string, operation: () => Promise<void>): Promise<void> => {
+    const key = `${run.runId}/${id}`;
+    const existing = delivering.get(key);
+    if (existing) return existing;
+    const pending = operation().finally(() => { if (delivering.get(key) === pending) delivering.delete(key); });
+    delivering.set(key, pending);
+    return pending;
+  };
 
   const acquireDeliveryGate = (runId: string): DeliveryGate => {
     const existing = deliveryGates.get(runId);
@@ -18,26 +44,54 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
     return gate;
   };
 
+  const retryBackgroundResult = (run: PersistedRun): void => {
+    const id = outputMessage(run)?.details.deliveryId;
+    const pending = id && delivering.get(`${run.runId}/${id}`);
+    // Gate release can race an in-flight attempt rolling back its submission.
+    // Wait for that attempt to leave sendOnce, then recheck durable state afresh.
+    void Promise.resolve(pending).catch(() => {}).then(() => deliverBackgroundResult(run)).catch(reportError);
+  };
+
   const discardDeliveryGate = (runId: string, gate: DeliveryGate): void => {
     if (deliveryGates.get(runId) !== gate) return;
     gate.holders = Math.max(0, gate.holders - 1);
     if (gate.holders > 0) return;
     deliveryGates.delete(runId);
-    if (gate.pending) void deliverBackgroundResult(gate.pending).catch((error) => getContext()?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
+    if (gate.pending) retryBackgroundResult(gate.pending);
   };
 
   const deliverBackgroundResult = async (run: PersistedRun): Promise<void> => {
-    const ctx = getContext();
-    if (!ctx || run.parentSessionId !== ctx.sessionManager.getSessionId()) return;
-    const current = await readRun(run.runId);
-    if (!current || current.turnId !== run.turnId || current.status !== run.status
-      || current.pendingQuestion?.id !== run.pendingQuestion?.id || ctx !== getContext()) return;
-    const message = resultMessage(run, run.parentSessionId);
-    if (!message) return;
-    const key = message.details.deliveryId;
-    if (delivered.has(key)) return;
-    pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
-    delivered.add(key);
+    const output = outputMessage(run);
+    if (!output) return;
+    await sendOnce(run, output.details.deliveryId, async () => {
+      const saved = await recordOutput(run);
+      if (!saved) return;
+      const { message, record } = saved;
+      const key = message.details.deliveryId;
+      if (delivered.has(key) || record.state !== "pending" || record.submittedAt) return;
+      const ctx = getContext();
+      if (!isActiveParent(run, ctx)) return;
+      const current = await readRun(run.runId);
+      if (!current || current.turnId !== run.turnId || current.status !== run.status
+        || current.pendingQuestion?.id !== run.pendingQuestion?.id || !isActiveParent(run, ctx)) return;
+      const gate = deliveryGates.get(run.runId);
+      if (gate) { gate.pending = run; return; }
+      await submitMessages(run.runId, [key]);
+      if (delivered.has(key)) return; // A foreground tool claimed this result while its record was being written.
+      const currentGate = deliveryGates.get(run.runId);
+      if (!isActiveParent(run, ctx) || currentGate) {
+        if (currentGate) currentGate.pending = run;
+        await unsubmitMessages(run.runId, [key]);
+        return;
+      }
+      try {
+        pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
+        delivered.add(key);
+      } catch (error) {
+        await settleMessages(run.runId, "to-parent", "unknown", `发送接口未确认：${String(error)}`, [key]);
+        throw error;
+      }
+    });
   };
 
   const releaseDeliveryGate = (run: PersistedRun, expectedGate: DeliveryGate): void => {
@@ -52,18 +106,81 @@ export function createBackgroundDelivery(pi: Pick<ExtensionAPI, "sendMessage">, 
       if (message) delivered.add(message.details.deliveryId); // the Agent tool result owns this delivery
       return;
     }
-    if (gate.pending) void deliverBackgroundResult(gate.pending).catch((error) => getContext()?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
+    if (gate.pending) retryBackgroundResult(gate.pending);
+  };
+
+  const deliverProgress = async (run: PersistedRun, input: { id: string; message: string }): Promise<void> => {
+    await sendOnce(run, input.id, async () => {
+      const record = await recordMessage(run, "to-parent", input.message, input.id);
+      if (record.state !== "pending" || record.submittedAt || delivered.has(input.id)) return;
+      const ctx = getContext();
+      if (!isActiveParent(run, ctx)) return;
+      await submitMessages(run.runId, [input.id]);
+      if (!isActiveParent(run, ctx)) {
+        await unsubmitMessages(run.runId, [input.id]);
+        return;
+      }
+      try {
+        pi.sendMessage({
+          customType: PARENT_MESSAGE,
+          content: taskMessage(run, `子 Agent 消息：\n${input.message}`), display: true,
+          details: { taskId: run.runId, turnId: run.turnId, messageId: input.id },
+        }, { deliverAs: "followUp", triggerTurn: true });
+        delivered.add(input.id);
+      } catch (error) {
+        await settleMessages(run.runId, "to-parent", "unknown", `发送接口未确认：${String(error)}`, [input.id]);
+        throw error;
+      }
+    });
   };
 
   return {
     acquire: acquireDeliveryGate,
     release: releaseDeliveryGate,
     discard: discardDeliveryGate,
-    notify(run: PersistedRun): void {
-      if (run.completionSource === "shutdown" || run.completionSource === "tool-stop") return;
+    async notify(run: PersistedRun): Promise<void> {
+      if (run.deliveryMode !== "background") return;
       const gate = deliveryGates.get(run.runId);
       if (gate) gate.pending = run;
-      else void deliverBackgroundResult(run).catch((error) => getContext()?.ui.setStatus("agent-deck-error", `Agent 结果通知投递失败：${String(error)}`));
+      const saved = await recordOutput(run);
+      if (!saved) return;
+      if (run.completionSource === "shutdown" || run.completionSource === "tool-stop") {
+        await settleMessages(run.runId, "to-parent", "closed", `任务结束来源：${run.completionSource}`, [saved.record.id]);
+        return;
+      }
+      if (!gate) await deliverBackgroundResult(run);
+    },
+    progress: deliverProgress,
+    async recordToolResult(run: PersistedRun): Promise<string | undefined> {
+      const saved = await recordOutput(run);
+      if (!saved) return;
+      delivered.add(saved.record.id);
+      await submitMessages(run.runId, [saved.record.id]);
+      return saved.record.id;
+    },
+    async consume(message: any, parent: string): Promise<void> {
+      const ids = inputMessageIds(message);
+      if (!ids.length) return;
+      const runId = message.details?.taskId ?? message.details?.run?.runId;
+      if (typeof runId !== "string") return;
+      const run = await readRun(runId);
+      if (run?.parentSessionId === parent) await consumeMessages(runId, "to-parent", ids);
+    },
+    async recover(runs: PersistedRun[]): Promise<string[]> {
+      const warnings: string[] = [];
+      for (const run of runs) {
+        await reconcileMessages(run, "to-parent");
+        const records = await readMessages(run.runId);
+        const output = outputMessage(run);
+        const pending = records.filter(record => record.direction === "to-parent" && record.state === "pending" && !record.submittedAt);
+        if (output && pending.some(record => record.id === output.details.deliveryId)) await deliverBackgroundResult(run);
+        if (!isTerminalStatus(run.status)) for (const record of pending) {
+          if (record.turnId === run.turnId && !record.id.includes(":")) await deliverProgress(run, { id: record.id, message: record.text });
+        }
+        const unsettled = (await readMessages(run.runId)).filter(record => ["pending", "unknown"].includes(record.state));
+        if (unsettled.length) warnings.push(`${run.runId}：${unsettled.filter(record => record.state === "pending").length} 条待消费，${unsettled.filter(record => record.state === "unknown").length} 条待核实；消息记录：${messagesPath(run.runId)}`);
+      }
+      return warnings;
     },
     reset(): void { delivered.clear(); deliveryGates.clear(); },
   };

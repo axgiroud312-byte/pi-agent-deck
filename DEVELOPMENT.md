@@ -25,13 +25,13 @@ Agent Deck 是 Pi 原生子会话的薄编排层，不是第二套 Agent runtime
 | `SendMessage` | 运行中补充、等待中回答、结束后续接原任务 |
 | `TaskStop` | 停止当前执行；失败时保留“停止未确认”状态供重试 |
 
-`taskMessage()` 是工具回执和后台通知的共同正文格式。每条正文包含 `agentId`、可选名称、角色和状态，必要时带资源状态、已确定模型、消息投递状态及错误；内部 `run` 和兼容 `publicResult` 留在 `details`。Pi 的模型消息只消费 `content`，控制任务所需信息必须出现在正文，测试也必须跨过这个边界。
+`taskMessage()` 是工具回执和后台通知的共同正文格式。每条正文包含 `agentId`、`turnId`、可选名称、角色、状态和消息记录路径，必要时带资源状态、已确定模型、消息编号、投递状态、完整报告路径及错误；内部 `run` 和兼容 `publicResult` 留在 `details`。Pi 的模型消息只消费 `content`，控制任务所需信息必须出现在正文，测试也必须跨过这个边界。消息头提供寻址和核对信息，不承载角色限制。
 
-`taskOutput()` 只生成结果与错误正文，身份头由外层添加一次；前台保留完整最终文本，后台通知继续使用原有长度边界并保存完整证据。
+`taskOutput()` 只生成结果与错误正文，身份头由外层添加一次。它与 Markdown 报告共用存储层的 `completionOutput()`，避免两套结果格式。前台保留完整最终文本；后台通知预览最多 24,000 字符，完整报告路径在截断之后追加，`details.evidence` 保留全文。
 
-回执分别表达执行 `status` 和消息 `delivery: queued | answered | resumed`。业务完成与否由主 Agent 阅读交付判断；操作条件不合法时抛出工具错误。父 `SendMessage` 接受可选 `reply_to`，防止迟到或重复回答作用于其他问题。三个父工具名称保持不变。
+回执分别表达执行 `status` 和消息 `delivery: queued | answered | resumed | existing`。`existing` 表示同一个工具调用已有持久化消息记录，返回该消息 ID 与当前状态，不再次提交。`index.ts` 用父会话 ID 和 Pi 的 `toolCallId` 派生稳定消息 ID；新调用即使正文相同也拥有独立 ID。业务完成与否由主 Agent 阅读交付判断；操作条件不合法时抛出工具错误。父 `SendMessage` 接受可选 `reply_to`，防止迟到或重复回答作用于其他问题。三个父工具名称保持不变。
 
-`Agent` 省略 `run_in_background` 或传 `false` 时前台等待；传 `true` 时通常立即回执并在完成后通知。若任务在初始工具调用返回前已经终态，工具直接返回最终结果并登记为已交付，不再发送第二次通知。前后台使用同一套 `initializeRun → startExecution → finish → persistCompletion → close` 流程。
+`Agent` 省略 `run_in_background` 或传 `false` 时前台等待；传 `true` 时通常立即回执并在完成后通知。若任务在初始工具调用返回前已经终态，工具直接返回最终结果，不再发送第二次通知；工具结果进入原生上下文后才记录消费。前后台使用同一套 `initializeRun → startExecution → finish` 流程；`finish` 先处理正常收尾的剩余输入，再确认进程退出、保存完整报告与结果、发布终态。
 
 `SendMessage` 在同一任务控制队列内根据当前状态执行：
 
@@ -39,7 +39,7 @@ Agent Deck 是 Pi 原生子会话的薄编排层，不是第二套 Agent runtime
 - 选配/启动中放入当前进程内邮箱；
 - 等待问题时回复原 RPC 请求，子工具调用继续；
 - 已结束时调用与 `Agent.resume` 共用的续接函数；
-- 内存中的排队消息只属于当前进程。
+- 消息正文和投递证据先存入 `messages.json`；内存队列只负责当前进程的发送次序，异常恢复通过原生会话核对。
 
 子桥注册 `SendMessage({to: 'main', message, wait_for_reply?})`。问答复用 Pi RPC `extension_ui_request/response` 的请求编号，`pendingQuestion` 只保存 `{id, message}`。前台遇到问题时先返回问题并转为后台交付，主 Agent 得以回答；回答继续原进程与同一轮次。普通进度独立通知，最终文本负责完整交付。工具 AbortSignal 和 TaskStop 都可取消等待。
 
@@ -75,12 +75,14 @@ interface AgentDefinition {
 
 ## 子任务结束语义
 
-Pi 发送 `agent_settled` 后，运行时再次读取 `get_state`，确认当前 turn 不是 streaming/compacting，再收口：
+Pi 发送 `agent_settled` 后，运行时读取 `get_state`，确认当前 turn 不是 streaming/compacting。正常结束时还会调用 `clear_queue` 取回未消费的 steering/follow-up，与本地待发消息一起检查，并再次核对活动序号和执行状态。有剩余输入时，通过 `prompt` 在原进程、原会话、原 `turnId` 内继续；这时不发布最终结果，也不新建轮次。最终可以收尾时：
 
 - 最后一条 assistant `stopReason: error` → `失败`；
 - `stopReason: aborted`、主动停止或取消 → 对应停止状态；
 - RPC、进程、扩展、保存、超时错误 → 运行失败或停止未确认；
 - 其他正常 settled → `已完成`。
+
+消息提交、正常结束和续接共用同一任务控制队列。正常收尾完成之后才处理到的 `SendMessage` 走原会话的新轮次续接；主动停止清空本地和 Pi 队列、关闭未消费消息，停止中的任务暂不接收新输入。
 
 `已完成/completed` 只说明执行正常结束。最终文本可以表示成功、失败、部分完成、阻塞，也可以为空；运行时不再用 `agent_report`、`TaskResult`、检查清单或证据字段做语义验收。
 
@@ -114,12 +116,16 @@ roleId（角色定义）
 
 - `request.json`：Pi 命令、参数、prompt、timeout、Jev 计划和必要环境变量；provider 环境变量只保存个人快照路径，不内嵌快照内容；
 - `status.json`：任务、当前 turn、最终文本、错误、资源和用量状态；
-- `results/*.json`：每个终态 turn 的快照；
+- `messages.json`：每条双向通信的编号、方向、轮次、正文、状态、创建/更新时间、可选提交时间和原因；
+- `results/*.json`：每个终态 turn 的快照与 `reportPath`；
+- `results/*.md`：相同 basename 的完整可读报告，由程序从最终文本和运行原因生成；
 - Pi Session JSONL：真实消息、工具调用和工具结果。
+
+`persistCompletion()` 先原子写入 Markdown，再原子保存结果 JSON，两者成功后才向运行记录发布绝对 `reportPath`。新轮次清空当前报告路径；按 turn 派生的文件名保证续接不会覆盖上一轮结果。重复保存同轮已存在结果时复用已保存文本；收尾期间明确 `overwrite` 可更新同轮运行错误。旧 JSON-only 结果保持可读，在显式持久化时使用历史快照原文补齐报告。
 
 任务记录直接保存 `tools / disallowedTools / extensions`，不再复制成第二套“生效配置”对象。resume 使用保存的请求、这些直接字段和 Session，不重新读取角色文件。
 
-`adaptStoredRun()` 是 v1/v2/v3 的集中读取边界。v3 的当前问题保留在 `pendingQuestion`；旧问答、报告、租约、结构化结果、工具证据和写权限进入 `legacy`。启动扫描只读历史。`SendMessage` 或显式 resume 续接时写为 v3，移除旧工具并刷新公共运行说明，原角色正文和 Pi Session 保留。
+`adaptStoredRun()` 是 v1/v2/v3 的集中读取边界。v3 的当前问题保留在 `pendingQuestion`；旧问答、报告、租约、结构化结果、工具证据和写权限进入 `legacy`。启动扫描按旧版本读取历史运行快照，消息恢复另行更新插件账本。`SendMessage` 或显式 resume 续接时写为 v3，移除旧工具并刷新公共运行说明，原角色正文和 Pi Session 保留。
 
 读取与执行使用不同的类型边界，磁盘结构仍保持平铺：
 
@@ -127,6 +133,16 @@ roleId（角色定义）
 - `RunDetails` / `PersistedRun` 是查看和恢复所用的兼容快照，允许旧状态和缺少旧版本未保存的字段。
 - `CurrentExecution` 只接受 v3、现行状态，并要求 `turnId / resourceState / deliveryMode`。`beginTurn` 建立完整轮次后，执行启动、Pi 事件处理和异常回调才接收它；历史记录不能直接绕过 resume 启动。
 - `ManagedRun` 管理当前进程拥有的运行和控制请求；历史任务只有经过续接校验才进入执行。会话丢失时保留历史并明确报错。
+
+## 消息消费与恢复
+
+`MessageRecord` 只描述通信证据，不承担业务验收。`pending` 表示已保存但尚无消费证据，`submittedAt` 在投递尝试前写入，不能单独证明接收方已经接受；提交成功仍然可能处于 `pending`。`consumed` 表示找到原生输入证据、消息已经进入上下文，不等于模型理解或执行完成。`closed` 保存停止、过期问题等关闭原因；`unknown` 表示投递尝试后恢复核对无法确认消费。
+
+父到子的消息使用 `[agent-deck-message:<id>]` 作为普通消息标识；结果和进度通知复用原生 `details.deliveryId / messageId`。模型无需声明“已经消费”，也无需调用额外确认工具。`message_end` 的 `user / toolResult / custom` 输入以及 Session 的 `message / custom_message` 记录可作为证据；assistant 引用编号不算消费证据。
+
+`message-store.ts` 先读原账本，再通过文件变更队列与磁盘短锁原子更新，格式损坏会明确报错。消费核对只读取原生 Session，不改写会话正文。未提交消息保持 `pending`；已提交但无证据的消息转为 `unknown`，恢复时不会盲目重放。
+
+父会话恢复时，只补投未提交且仍有效的当前结果、当前问题或活动轮次进度；已消费、已关闭、待核实及过期消息不自动重复发送。主 Agent 明确续接时，子方向确定尚未提交的消息按原顺序带入；待核实消息保留供查阅和决定。当前只读状态和消息记录路径会提示待处理数量。停止时保守关闭的消息，若后来从原会话找到实际输入证据，也会纠正为已消费。
 
 ## 关键并发与失败边界
 
@@ -149,7 +165,7 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 | 模块 | 职责 |
 | --- | --- |
 | `index.ts` | 三个公开工具、动态 Agent 描述、命令与宿主事件接线 |
-| `background-delivery.ts` | 当前父会话通知、初次回执协调和通知去重 |
+| `background-delivery.ts` | 当前父会话通知、初次回执协调、消费确认和有效未提交通知恢复 |
 | `tool-contract.ts` | 工具参数解析、角色映射、模型可见回执与公开结果投影 |
 | `task-identity.ts` | 当前父会话内的任务/名称寻址与创建时名称绑定 |
 | `types.ts` / `legacy-types.ts` | 稳定身份、兼容读取快照、严格当前执行与历史只读类型 |
@@ -157,10 +173,11 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 | `instruction.ts` / `agents/*.md` | 本轮任务文本与摘要生成、子 Agent 行为提示和内置角色职责 |
 | `runtime.ts` | 当前主 Pi 持有的任务控制器、steer、resume、停止和收口 |
 | `run-store.ts` | 记录路径、父会话索引、磁盘读取缓存、原子写入及未完成创建的清理 |
+| `message-store.ts` | 双向消息账本、投递/消费证据、原生 Session 恢复核对 |
 | `rpc-connection.ts` | Pi JSONL RPC、子进程退出确认和可重试 close |
 | `child-runtime.ts` / `child-providers.ts` | 隔离子进程加载入口与声明式 provider bridge |
 | `parent-messaging.ts` | 子 Agent 通信工具和原生 RPC 问答信封 |
-| `persistence.mjs` | 原子状态/历史保存、磁盘短锁和旧记录适配 |
+| `persistence.mjs` | 原子状态/历史/完整报告保存、磁盘短锁和旧记录适配 |
 | `delivery.ts` | 最终文本、当前问题、错误与通知投影 |
 | `conversation.ts` | 只读解析 Pi Session 当前分支与工具记录 |
 | `routing.ts` / `router.mjs` | 动态模型/思考候选、Jev 调用和软回退 |
@@ -181,6 +198,8 @@ Jev 只回答一个有限选择题：为已经定义的任务选择 `model + thi
 `parent-control.test.ts` 启动真实父 Pi 与两个真实子 Pi，使用本地 HTTP 受控 provider；父模型端只读取转换后的请求正文，提取无名称任务 ID，再调用 SendMessage/TaskStop。它验证通信与寻址，不评价在线模型的自主调度质量。续接集成测试还核对原生 Session 中两条暂存补充和本轮任务要求的顺序及消费次数。
 
 `parent-messaging.test.ts` 在真实父子 Pi 和 HTTP 模型输入边界验证前后台问答、回答后写入文件、完成后消息续接及历史原文。`rpc-integration.test.ts` 覆盖连续提问、过期回答、等待中停止/续接、进度通道、显式工具白名单与完整报告后追加摘要。
+
+`message-store.test.ts` 验证提交与消费的区别、同正文独立编号、原生 user/toolResult/custom_message 的恢复证据、assistant 引用排除、损坏账本和并发更新。`result-artifacts.test.ts` 验证长报告尾部、每轮独立文件、完整错误、写入失败不发布路径及旧记录补报告。收尾边界还应覆盖先送达后 settled、收尾期间输入、完成后续接以及明确停止后的消息去向；本地受控 provider 的结果与在线模型自主调度实验分开记录。
 
 验收命令必须在项目目录执行：
 

@@ -12,6 +12,7 @@ import { showAgentPanel } from "../src/ui.ts";
 import { conversationBlocks } from "../src/conversation.ts";
 import { parseAgentDefinition, validateAgentDefinition } from "../src/agents.ts";
 import { readCompletions } from "../src/persistence.mjs";
+import { addressedMessage, readMessages } from "../src/message-store.ts";
 
 const piMain = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const piCli = path.join(path.dirname(piMain), "bundle", "cli.js");
@@ -33,6 +34,10 @@ test("真实 Pi：完整报告后消费排队收口消息，报告与摘要按�
   assert.equal(done.finalText?.split("FULL_REPORT:").length, 2);
   assert.equal((await readCompletions(runtime.runDirectory(fixture.runId)))[0].finalText, done.finalText);
   assert.ok(resultMessage(done, fixture.parentSessionId)?.details.evidence.includes("END_OF_FULL_REPORT"));
+  const inputs = (await readMessages(fixture.runId)).filter(record => record.direction === "to-child");
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].state, "consumed", "真实 Pi user 输入事件确认补充已进入执行上下文");
+  assert.match(await fs.readFile(done.reportPath!, "utf8"), /END_OF_FULL_REPORT\n\n---\n\nLATE_SUMMARY/);
 });
 
 test("真实 Pi：前台问题交回控制权，两次回答沿用原进程和会话", async (t) => {
@@ -71,6 +76,9 @@ test("真实 Pi：前台问题交回控制权，两次回答沿用原进程和�
   const resumed = await runtime.waitForRunTurn(fixture.runId, sent.run.turnId!);
   assert.equal(resumed.childSessionId, first.childSessionId);
   assert.match((await lines(fixture.log)).filter(x => x.type === "provider_call").at(-1).transcript, /output.json/);
+  const replies = (await readMessages(fixture.runId)).filter(record => record.direction === "to-child");
+  assert.equal(replies.length, 3);
+  assert.ok(replies.every(record => record.state === "consumed"), "原生 toolResult 和续接 user 输入确认消费");
 });
 
 test("真实 Pi：等待回答时停止，再续接原子会话", async (t) => {
@@ -253,7 +261,7 @@ test("真实 Pi RPC：自然文本完成、运行中补充和消息续接原会�
   assert.match(last.transcript, /DECK_CONTINUE_CASE/);
   const lastUser = (await lines(fixture.childSessionPath)).filter((entry) => entry.type === "message" && entry.message.role === "user").at(-1).message;
   const actualInput = lastUser.content.map((block: any) => block.text ?? "").join("");
-  assert.equal(actualInput, "DECK_CONTINUE_CASE");
+  assert.equal(actualInput, addressedMessage(sent.messageId, "DECK_CONTINUE_CASE"));
   assert.equal(resumed.instruction, "DECK_CONTINUE_CASE", "暂存补充不是本轮任务要求的展示副本");
   assert.equal(resumed.queuedMessageCount, 0);
 });

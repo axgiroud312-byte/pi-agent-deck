@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { resultMessage, taskOutput } from "../src/delivery.ts";
 import agentDeck from "../src/index.ts";
-import { initializeRun, shutdownRuns } from "../src/runtime.ts";
+import { initializeRun, runDirectory, shutdownRuns } from "../src/runtime.ts";
 import { createBackgroundDelivery } from "../src/background-delivery.ts";
 import { taskToolResult } from "../src/tool-contract.ts";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { normalizeContext } from "@earendil-works/pi-ai";
+import { readMessages, recordMessage, submitMessages } from "../src/message-store.ts";
 
 const run: any = {
   version: 2, runId: "test-delivery", turnId: "first", deliveryMode: "background",
@@ -116,24 +119,168 @@ test("后台通知核对期间切换父会话不会串投，重复结果仍只�
   const parent: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
   let context: any = parent;
   const delivery = createBackgroundDelivery({ sendMessage: (message) => { messages.push(message); } }, () => context);
-  const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
-  delivery.notify(current);
+  const first = delivery.notify(current);
   context = { ...parent, sessionManager: { getSessionId: () => "other-parent" } };
-  await flush();
+  await first;
   assert.equal(messages.length, 0);
   context = parent;
-  delivery.notify(current);
-  delivery.notify(current);
-  await flush();
+  await Promise.all([delivery.notify(current), delivery.notify(current)]);
   assert.equal(messages.length, 1);
-  delivery.notify({ ...current, turnId: "outdated-turn" });
-  await flush();
+  await delivery.notify({ ...current, turnId: "outdated-turn" });
   assert.equal(messages.length, 1, "旧轮通知不能作为新结果发送");
   context = undefined;
   delivery.reset();
-  delivery.notify(current);
-  await flush();
+  await delivery.notify(current);
   assert.equal(messages.length, 1, "关闭所属会话后不再发送");
+});
+
+test("发送成功仅表示已提交，真实父输入事件才确认消费", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-consumption", resourceState: "released" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  const messages: any[] = [];
+  const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
+  await delivery.notify(current);
+  let records = await readMessages(current.runId);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].state, "pending");
+  assert.ok(records[0].submittedAt);
+  await delivery.consume({ ...messages[0], role: "assistant" }, "parent");
+  await delivery.consume({ ...messages[0], role: "custom" }, "other");
+  assert.equal((await readMessages(current.runId))[0].state, "pending");
+  await delivery.consume({ ...messages[0], role: "custom" }, "parent");
+  records = await readMessages(current.runId);
+  assert.equal(records[0].state, "consumed");
+  assert.equal(records[0].text, taskOutput(current));
+});
+
+test("工具与后台争用同一问题交付，登记后只由真实工具输入确认消费", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-question-gate", status: "等待决定", pendingQuestion: { id: "q-gate", message: "格式？" } },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  const messages: any[] = [];
+  const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
+  const gate = delivery.acquire(current.runId);
+  const pending = delivery.notify(current);
+  delivery.release(current, gate);
+  await pending;
+  const deliveryId = await delivery.recordToolResult(current);
+  await delivery.notify(current);
+  assert.equal(messages.length, 0);
+  assert.equal((await readMessages(current.runId))[0].text, "格式？");
+  assert.equal((await readMessages(current.runId))[0].state, "pending");
+  await delivery.consume({ role: "toolResult", details: { run: current, deliveryId }, content: [] }, "parent");
+  assert.equal((await readMessages(current.runId))[0].state, "consumed");
+});
+
+test("非活动父会话仍记录消息；恢复只补送未提交结果并核对原会话证据", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-recovery", resourceState: "released", parentSessionPath: path.join(runDirectory("delivery-recovery"), "parent.jsonl") },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  let ctx: any;
+  const messages: any[] = [];
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
+  await delivery.notify(current);
+  assert.equal(messages.length, 0);
+  assert.equal((await readMessages(current.runId))[0].submittedAt, undefined);
+  ctx = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  await delivery.recover([current]);
+  assert.equal(messages.length, 1);
+  const warning = await delivery.recover([current]);
+  assert.equal(messages.length, 1, "接口已提交但缺消费证据时不盲目重投");
+  assert.equal((await readMessages(current.runId))[0].state, "unknown");
+  assert.match(warning.join("\n"), /待核实.*messages\.json/);
+  await fs.writeFile(current.parentSessionPath!, JSON.stringify({ type: "custom_message", ...messages[0] }) + "\n");
+  await delivery.recover([current]);
+  assert.equal((await readMessages(current.runId))[0].state, "consumed");
+  assert.equal(messages.length, 1);
+});
+
+test("普通进度按原编号记录，子消息发送回执不替代接收证据", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-progress", status: "运行中" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  const messages: any[] = [];
+  const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
+  await recordMessage(current, "to-child", "检查", "child-message");
+  await submitMessages(current.runId, ["child-message"]);
+  await delivery.consume({ role: "toolResult", details: { run: current, messageId: "child-message" }, content: [] }, "parent");
+  await Promise.all([delivery.progress(current, { id: "progress-message", message: "检查到入口" }), delivery.progress(current, { id: "progress-message", message: "检查到入口" })]);
+  assert.equal(messages.length, 1);
+  await delivery.consume({ ...messages[0], role: "custom" }, "parent");
+  const records = await readMessages(current.runId);
+  assert.equal(records.find(record => record.id === "child-message")?.state, "pending");
+  assert.equal(records.find(record => record.id === "progress-message")?.state, "consumed");
+});
+
+test("同一上下文对象切换父会话时撤销未发送的提交标记", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-reused-context", status: "运行中" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  const messages: any[] = [];
+  let checks = 0;
+  let restored = false;
+  const ctx: any = { sessionManager: { getSessionId: () => restored || ++checks === 1 ? "parent" : "other" }, ui: { setStatus() {} } };
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); } }, () => ctx);
+  await delivery.progress(current, { id: "switch-progress", message: "已找到入口" });
+  assert.equal(messages.length, 0);
+  const [record] = await readMessages(current.runId);
+  assert.equal(record.state, "pending");
+  assert.equal(record.submittedAt, undefined, "确定没有调用发送接口的消息仍可安全投递");
+  restored = true;
+  await delivery.recover([current]);
+  assert.equal(messages.length, 1);
+});
+
+test("gate 释放发生在提交回退期间，重投等待旧尝试结束后继续", { timeout: 3000 }, async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-gate-wakeup", resourceState: "released" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, true);
+  const messages: any[] = [];
+  let received!: () => void;
+  const sent = new Promise<void>(resolve => { received = resolve; });
+  let checks = 0;
+  let gate: ReturnType<ReturnType<typeof createBackgroundDelivery>["acquire"]>;
+  const ctx: any = { sessionManager: { getSessionId: () => "parent" }, ui: { setStatus() {} } };
+  const delivery = createBackgroundDelivery({ sendMessage: message => { messages.push(message); received(); } }, () => {
+    checks++;
+    // Acquire after the pre-submit context check, then release while its
+    // rollback yields. This models a failed competing resume returning control.
+    if (checks === 3) queueMicrotask(() => { gate = delivery.acquire(current.runId); });
+    if (checks === 4) queueMicrotask(() => delivery.discard(current.runId, gate));
+    return ctx;
+  });
+  await delivery.notify(current);
+  await sent;
+  assert.equal(messages.length, 1);
+  const [record] = await readMessages(current.runId);
+  assert.equal(record.state, "pending");
+  assert.ok(record.submittedAt);
+  await delivery.notify(current);
+  assert.equal(messages.length, 1);
+});
+
+test("扩展工具结果登记与输入消费分开，恢复核对提示进入下一轮主上下文", async () => {
+  const current = await initializeRun({ ...run, version: 3, runId: "delivery-tool-hooks", resourceState: "released", deliveryMode: "foreground" },
+    { version: 3, cwd: process.cwd(), command: process.execPath, argsPrefix: [], prompt: "fixture" }, false);
+  const handlers = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const ctx: any = { sessionManager: { getSessionId: () => "parent", getBranch: () => [] }, ui: { setStatus() {}, setWidget() {}, notify() {}, theme: { fg: (_: string, text: string) => text } } };
+  agentDeck({
+    on: (name: string, fn: any) => handlers.set(name, fn), registerTool: (tool: any) => tools.set(tool.name, tool),
+    registerCommand() {}, registerMessageRenderer() {}, getActiveTools: () => [...tools.keys()], setActiveTools() {}, sendMessage() {},
+  } as any);
+  const result = taskToolResult(current, taskOutput(current));
+  const change = await handlers.get("tool_result")({ toolName: "Agent", isError: false, ...result }, ctx);
+  assert.ok(change.details.deliveryId);
+  assert.equal((await readMessages(current.runId))[0].state, "pending");
+  assert.ok((await readMessages(current.runId))[0].submittedAt);
+  try {
+    await handlers.get("session_start")({}, ctx);
+    assert.equal((await readMessages(current.runId))[0].state, "unknown");
+    const notice = await handlers.get("before_agent_start")({}, ctx);
+    assert.match(notice.message.content, /待核实.*messages\.json/);
+    assert.equal(await handlers.get("before_agent_start")({}, ctx), undefined);
+    await handlers.get("message_end")({ message: { role: "toolResult", ...result, details: change.details } }, ctx);
+    assert.equal((await readMessages(current.runId))[0].state, "consumed");
+  } finally { await handlers.get("session_shutdown")(); }
 });
 
 test("重载不补送旧结果或重放旧任务；当前会话边界仍有效", async () => {

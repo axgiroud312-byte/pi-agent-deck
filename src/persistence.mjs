@@ -10,10 +10,13 @@ export async function readJson(file) {
   return JSON.parse(await fs.readFile(file, "utf8"));
 }
 export async function atomicJson(file, value, options = {}) {
+  await atomicText(file, `${JSON.stringify(value, null, 2)}\n`, options);
+}
+async function atomicText(file, content, options = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: options.mode ?? 0o666 });
+    await fs.writeFile(temporary, content, { encoding: "utf8", mode: options.mode ?? 0o666 });
     for (let attempt = 0; ; attempt++) {
       try { await fs.rename(temporary, file); break; }
       catch (error) {
@@ -159,8 +162,37 @@ export function completionId(run) {
 function completionRecordId(run) {
   return `${run.runId}:${run.turnId ?? run.attemptStartedAt ?? run.startedAt}`;
 }
+/** Complete model-authored output and operational evidence, shared by files and notices. */
+export function completionOutput(run) {
+  // Legacy reports describe a v1/v2 execution. A resumed v3 turn owns its final text.
+  const report = run.version < 3
+    ? [...(run.legacy?.reports ?? [])].reverse().find((item) => item.type === "最终" || (run.status === "等待决定" && item.type === "问题" && item.blocking))
+    : undefined;
+  const text = report
+    ? [report.summary, report.question, ...(report.evidence ?? []), ...(report.tests ?? []), ...(report.risks ?? [])].filter(Boolean).join("\n")
+    : run.finalText;
+  const failed = ["失败", "失联", "已停止", "已取消", "停止未确认"].includes(run.status);
+  const reason = [run.failureReason, run.stderr, ...(run.events ?? []).filter((event) => event.kind === "错误").map((event) => event.text)]
+    .filter((value, index, all) => value && all.indexOf(value) === index).join("；");
+  return [
+    failed ? `运行原因：${reason || (run.status === "已停止" ? "执行被停止" : "未记录具体原因")}` : reason ? `运行记录：${reason}` : undefined,
+    run.persistenceError ? `保存记录：${run.persistenceError}` : undefined,
+    text ?? "（子 Agent 正常结束，但没有输出文本。）",
+  ].filter((item) => item !== undefined).join("\n\n");
+}
+async function writeCompletionArtifacts(file, snapshot, run) {
+  const reportPath = path.resolve(file.replace(/\.json$/, ".md"));
+  const title = snapshot.description || snapshot.objective || snapshot.runId;
+  const report = `# ${title}\n\n任务：${snapshot.runId}\n\n执行轮次：${snapshot.turnId ?? snapshot.attemptStartedAt ?? snapshot.startedAt}\n\n运行状态：${snapshot.status}\n\n${completionOutput(snapshot)}\n`;
+  // The notification path is published only after both durable artifacts succeed.
+  await atomicText(reportPath, report);
+  await atomicJson(file, { ...snapshot, reportPath });
+  run.reportPath = reportPath;
+  completionCache.delete(path.dirname(file));
+}
 export async function persistCompletion(directory, run, options = {}) {
   if (!["已完成", "失败", "已取消", "已停止", "失联", "等待决定"].includes(run.status)) return;
+  delete run.reportPath;
   const root = path.join(directory, "results");
   // A turn has one durable result record even if cleanup changes its final
   // operational status. Notification identity remains status-specific above.
@@ -168,7 +200,18 @@ export async function persistCompletion(directory, run, options = {}) {
   if (!options.overwrite) {
     const legacyFile = path.join(root, `${createHash("sha256").update(completionId(run)).digest("hex")}.json`);
     for (const existing of [file, legacyFile]) {
-      try { await fs.access(existing); return; } catch (error) { if (error.code !== "ENOENT") throw error; }
+      let snapshot;
+      try { snapshot = await readJson(existing); } catch (error) { if (error.code === "ENOENT") continue; throw error; }
+      const reportPath = path.resolve(existing.replace(/\.json$/, ".md"));
+      if (snapshot.reportPath === reportPath) {
+        try {
+          if ((await fs.stat(reportPath)).isFile()) { run.reportPath = reportPath; return; }
+        } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      // Old JSON-only results gain a readable copy on explicit persistence;
+      // the saved turn's text remains authoritative over a later caller snapshot.
+      await writeCompletionArtifacts(existing, snapshot, run);
+      return;
     }
   }
   const snapshot = {
@@ -187,8 +230,7 @@ export async function persistCompletion(directory, run, options = {}) {
     usage: structuredClone(run.usage),
     events: (run.events ?? []).filter((event) => event.kind === "错误"),
   };
-  await atomicJson(file, snapshot);
-  completionCache.delete(root);
+  await writeCompletionArtifacts(file, snapshot, run);
 }
 const completionCache = new Map();
 export async function readCompletions(directory) {

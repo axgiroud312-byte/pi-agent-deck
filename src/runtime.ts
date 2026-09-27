@@ -12,6 +12,7 @@ export { runsRoot, runDirectory, statusPath, writeJsonAtomic } from "./run-store
 export type { PersistedRun } from "./types.ts";
 import { RpcConnection } from "./rpc-connection.ts";
 import { parseParentMessage, type ParentMessage } from "./parent-messaging.ts";
+import { addressedMessage, consumeMessages, inputMessageIds, messageIds, readMessages, recordMessage, reconcileMessages, settleMessages, submitMessages, type MessageRecord } from "./message-store.ts";
 
 export interface RunnerRequest {
   version: 1 | 2 | 3;
@@ -69,8 +70,8 @@ function event(entry: ManagedRun, kind: RunDetails["events"][number]["kind"], te
   entry.run.events = [...entry.run.events, { at: Date.now(), kind, text }].slice(-200);
 }
 function queueSnapshot(entry: ManagedRun, run: PersistedRun): Promise<void> {
-  // Queued messages are deliberately process-local. Never leave a durable count
-  // that claims volatile messages will survive a reload.
+  // This count only describes the local buffer. messages.json records durable
+  // delivery evidence; the Pi queue is reconciled separately on recovery.
   const snapshot = { ...structuredClone(run), queuedMessageCount: 0 };
   entry.writes = entry.writes.catch(() => {}).then(() => writeJsonAtomic(statusPath(snapshot.runId), snapshot));
   void entry.writes.catch(() => {});
@@ -132,8 +133,37 @@ function rpcArgs(args: string[]): string[] {
 
 async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: string, notifyResult = true): Promise<void> {
   if (!entry.busy) return;
+  // A steer may be accepted just after Pi settled. Drain it while the same
+  // session is still owned, before publishing completion or closing its process.
+  if (status === "已完成" && entry.rpc && !entry.abort.signal.aborted && !entry.run.stopRequested) {
+    const serial = entry.serial;
+    const queued = await entry.rpc.request("clear_queue");
+    const pending = [...entry.messages, ...(queued?.steering ?? []), ...(queued?.followUp ?? [])];
+    entry.messages = [];
+    const state = await entry.rpc.request("get_state");
+    if (entry.serial !== serial || state?.isStreaming || state?.isCompacting) {
+      entry.messages.push(...pending);
+      return; // Pi consumed input during the check; its next settled event owns completion.
+    }
+    if (pending.length) {
+      const records = await readMessages(entry.run.runId);
+      const consumed = new Set(records.filter(record => record.state === "consumed").map(record => record.id));
+      const remaining = pending.filter(text => !messageIds(text).length || !messageIds(text).every(id => consumed.has(id)));
+      if (remaining.length) {
+        entry.run.currentAction = "继续处理已接受的补充消息";
+        await save(entry);
+        await submitMessages(entry.run.runId, remaining.flatMap(messageIds), entry.run.turnId);
+        await entry.rpc.request("prompt", { message: remaining.join("\n\n") });
+        return;
+      }
+    }
+  }
   entry.busy = false;
   entry.ready = false;
+  if (entry.run.pendingQuestion) await settleMessages(entry.run.runId, "to-parent", "closed", "本轮执行已结束，澄清问题停止等待。",
+    [`${entry.run.runId}:${entry.run.turnId}:question:${entry.run.pendingQuestion.id}`]).catch(failure => {
+      entry.run.persistenceError = `问题状态保存失败：${String(failure)}`;
+    });
   entry.run.pendingQuestion = undefined;
   clearTimeout(entry.timer);
   const completion = entry.pendingCompletion ?? { status, endedAt: Date.now() };
@@ -147,12 +177,6 @@ async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: strin
   const rpc = entry.rpc;
   let closeError: unknown;
   if (rpc) {
-    if (!entry.abort.signal.aborted && !entry.run.stopRequested) {
-      try {
-        const queue = await rpc.request("clear_queue");
-        entry.messages.push(...(queue?.steering ?? []), ...(queue?.followUp ?? []));
-      } catch { /* A dead peer cannot return a queue; no message is replayed. */ }
-    }
     try { await rpc.close(); }
     catch (failure) { closeError = failure; }
   }
@@ -168,6 +192,13 @@ async function finish(entry: ManagedRun, status: CurrentRunStatus, error?: strin
     catch (failure) { entry.run.persistenceError = [entry.run.persistenceError, `状态保存失败：${String(failure)}`].filter(Boolean).join("；"); event(entry, "错误", entry.run.persistenceError); }
   } else {
     if (entry.rpc === rpc) entry.rpc = undefined;
+    try {
+      await reconcileMessages(entry.run, "to-child");
+      if (status !== "已完成") {
+        const unsent = (await readMessages(entry.run.runId)).filter(record => record.direction === "to-child" && record.state === "pending" && !record.submittedAt).map(record => record.id);
+        if (unsent.length) await settleMessages(entry.run.runId, "to-child", "closed", error ?? `本轮执行${status}`, unsent);
+      }
+    } catch (failure) { entry.run.persistenceError = `消息消费核对失败：${String(failure)}`; }
     const lateExtensionError = entry.extensionError;
     const completed: PersistedRun = {
       ...entry.run,
@@ -254,6 +285,8 @@ function handleEvent(entry: ExecutingRun, data: any): void {
         if (["input", "select", "confirm", "editor"].includes(data.method)) await rpc.cancelUiRequest(data.id);
         return;
       }
+      await recordMessage(entry.run, "to-parent", message.message, message.waitForReply
+        ? `${entry.run.runId}:${turnId}:question:${message.id}` : message.id);
       if (message.waitForReply) {
         if (entry.run.pendingQuestion) throw new Error("已有一个问题正在等待主 Agent 回答。");
         entry.run.pendingQuestion = { id: message.id, message: message.message };
@@ -267,6 +300,9 @@ function handleEvent(entry: ExecutingRun, data: any): void {
       }
     }).catch((error) => failExecution(entry, turnId, error));
     return;
+  }
+  if (data.type === "message_end" && ["user", "toolResult"].includes(data.message?.role)) {
+    void consumeMessages(entry.run.runId, "to-child", inputMessageIds(data.message)).catch(error => failExecution(entry, entry.run.turnId, error));
   }
   if (entry.busy && !entry.abort.signal.aborted && data.message && ["message_start", "message_update", "message_end"].includes(data.type)) {
     const message = structuredClone(data.message);
@@ -337,7 +373,7 @@ function beginTurn(entry: ManagedRun): asserts entry is ExecutingRun {
     resourceState: "starting",
     status: entry.request.routing && !entry.request.routingDecision && !entry.request.routing.immediate ? "选配中" : "运行中",
     attemptStartedAt: Date.now(), endedAt: undefined, exitCode: undefined, stderr: undefined,
-    finalText: undefined, pendingQuestion: undefined, completionSource: undefined, failureReason: undefined, persistenceError: undefined, events: [], stopRequested: false, currentAction: "正在启动", usage: emptyUsage(),
+    finalText: undefined, reportPath: undefined, pendingQuestion: undefined, completionSource: undefined, failureReason: undefined, persistenceError: undefined, events: [], stopRequested: false, currentAction: "正在启动", usage: emptyUsage(),
   });
   requireCurrentExecution(entry);
 }
@@ -376,6 +412,8 @@ async function execute(entry: ExecutingRun): Promise<void> {
     if (cancelled()) return;
     entry.ready = true;
     const prompt = [request.prompt, ...entry.messages.splice(0)].join("\n\n");
+    await submitMessages(entry.run.runId, messageIds(prompt), turnId);
+    if (cancelled()) return;
     void save(entry);
     entry.run.currentAction = "子 Agent 正在执行";
     if (request.timeoutMs && request.timeoutMs > 0) entry.timer = setTimeout(() => {
@@ -437,7 +475,11 @@ async function obtainIdleRun(runId: string): Promise<ManagedRun> {
   if (!run) throw new Error("找不到任务");
   if (hasLiveOwner(run)) throw new Error("旧任务仍由另一个 Pi 进程运行，请等待它结束后再继续。");
   const request = JSON.parse(await fs.promises.readFile(path.join(runDirectory(runId), "request.json"), "utf8")) as RunnerRequest;
-  return manage({ ...run, status: idleStatus(run.status), runnerPid: undefined, childPid: undefined, resourceState: "released", queuedMessageCount: 0 }, request, true);
+  await reconcileMessages(run, "to-child");
+  const entry = manage({ ...run, status: idleStatus(run.status), runnerPid: undefined, childPid: undefined, resourceState: "released", queuedMessageCount: 0 }, request, true);
+  entry.messages = (await readMessages(runId)).filter(record => record.direction === "to-child" && record.state === "pending" && !record.submittedAt)
+    .map(record => addressedMessage(record.id, record.text));
+  return entry;
 }
 
 async function refreshOwnedFromDisk(entry: ManagedRun, allowUnreadableDuringCleanup = false): Promise<ManagedRun> {
@@ -470,29 +512,53 @@ async function refreshOwnedFromDisk(entry: ManagedRun, allowUnreadableDuringClea
 }
 
 /** One control boundary for steering, answering, and resuming the saved session. */
-export async function sendToRun(runId: string, message: string, summary?: string, replyTo?: string): Promise<{ run: PersistedRun; delivery: "queued" | "answered" | "resumed" }> {
+export async function sendToRun(runId: string, message: string, summary?: string, replyTo?: string, messageId?: string): Promise<{ run: PersistedRun; delivery: "queued" | "answered" | "resumed" | "existing"; messageId: string; messageState: MessageRecord["state"] }> {
   if (!message.trim()) throw new Error("请提供补充要求。");
   if (["停止中", "停止未确认"].includes(owned.get(runId)?.run.status ?? "")) throw new Error("任务正在停止，暂不接受消息。");
   return inTask(runId, async () => {
     const entry = await obtainIdleRun(runId);
     if (["停止中", "停止未确认"].includes(entry.run.status) || (entry.busy && entry.abort.signal.aborted)) throw new Error("任务正在停止，暂不接受消息。");
+    if (messageId) {
+      const previous = (await readMessages(runId)).find(record => record.id === messageId);
+      if (previous) {
+        if (previous.direction !== "to-child" || previous.text !== message) throw new Error("消息编号已用于另一条消息");
+        return { run: structuredClone(entry.run), delivery: "existing", messageId, messageState: previous.state };
+      }
+    }
     const question = entry.run.pendingQuestion;
     if (replyTo && (question?.id !== replyTo || !entry.busy)) throw new Error("该问题已结束；请读取当前问题后回答，或发送新的任务要求。");
-    if (entry.busy && question) {
-      await entry.rpc!.answerUiRequest(question.id, message);
-      entry.run.pendingQuestion = undefined;
-      entry.run.status = "运行中";
-      entry.run.currentAction = "已收到主 Agent 回答，继续执行";
-      await save(entry);
-      return { run: structuredClone(entry.run), delivery: "answered" };
+    const record = await recordMessage(entry.run, "to-child", message, messageId);
+    const envelope = addressedMessage(record.id, message);
+    try {
+      if (entry.busy && question) {
+        await submitMessages(runId, [record.id], entry.run.turnId);
+        await entry.rpc!.answerUiRequest(question.id, envelope);
+        await settleMessages(runId, "to-parent", "closed", "澄清回答已交付。", [`${runId}:${entry.run.turnId}:question:${question.id}`]);
+        entry.run.pendingQuestion = undefined;
+        entry.run.status = "运行中";
+        entry.run.currentAction = "已收到主 Agent 回答，继续执行";
+        await save(entry);
+        return { run: structuredClone(entry.run), delivery: "answered", messageId: record.id, messageState: "pending" };
+      }
+      if (entry.busy) {
+        if (!entry.ready) entry.messages.push(envelope);
+        else {
+          await submitMessages(runId, [record.id], entry.run.turnId);
+          await entry.rpc!.request("steer", { message: envelope });
+        }
+        await save(entry);
+        return { run: structuredClone(entry.run), delivery: "queued", messageId: record.id, messageState: "pending" };
+      }
+      return { run: await resumeOwned(entry, envelope, summary, true, message), delivery: "resumed", messageId: record.id, messageState: "pending" };
+    } catch (error) {
+      const submitted = (await readMessages(runId)).find(item => item.id === record.id)?.submittedAt;
+      if (!submitted) {
+        entry.messages = entry.messages.filter(text => !messageIds(text).includes(record.id));
+        entry.run.queuedMessageCount = entry.messages.length;
+      }
+      await settleMessages(runId, "to-child", submitted ? "unknown" : "closed", `投递失败：${String(error)}`, [record.id]);
+      throw error;
     }
-    if (entry.busy) {
-      if (!entry.ready) entry.messages.push(message);
-      else await entry.rpc!.request("steer", { message });
-      await save(entry);
-      return { run: structuredClone(entry.run), delivery: "queued" };
-    }
-    return { run: await resumeOwned(entry, message, summary, true), delivery: "resumed" };
   });
 }
 
@@ -508,7 +574,7 @@ export async function resumeRun(runId: string, prompt: string, description?: str
   });
 }
 
-async function resumeOwned(entry: ManagedRun, prompt: string, description?: string, background = false): Promise<PersistedRun> {
+async function resumeOwned(entry: ManagedRun, prompt: string, description?: string, background = false, instruction = prompt): Promise<PersistedRun> {
   const runId = entry.run.runId;
   const resumable = isTerminalStatus(entry.run.status) || entry.run.status === "等待决定";
   if (entry.busy || !resumable || entry.rpc) throw new Error("任务仍在运行或释放中；补充要求请用 SendMessage，结束后才能 resume。");
@@ -549,7 +615,7 @@ async function resumeOwned(entry: ManagedRun, prompt: string, description?: stri
     entry.messages = [];
     entry.loadedIdle = false;
     beginTurn(entry);
-    Object.assign(entry.run, buildTaskText(prompt, description));
+    Object.assign(entry.run, buildTaskText(instruction, description));
     try { await save(entry); }
     catch (error) {
       await finish(entry, "失败", `续接启动失败：${String(error)}`, false);
@@ -580,6 +646,9 @@ async function stopOwned(entry: ManagedRun, status: CurrentRunStatus = "已停�
   entry.messages = [];
   clearTimeout(entry.timer);
   entry.run.stopRequested = true;
+  await settleMessages(entry.run.runId, "to-child", "closed", source === "execution" ? error ?? "执行已停止" : `任务停止：${source}`).catch(failure => {
+    entry.run.persistenceError = `消息取消记录失败：${String(failure)}`;
+  });
   if (wasBusy) { entry.run.status = "停止中"; await save(entry).catch((error) => { entry.run.persistenceError = String(error); }); }
   if (entry.rpc) {
     try {
@@ -602,6 +671,7 @@ export async function stopRun(runId: string, source: "tool-stop" | "panel-stop" 
       if (expectedTurnId !== undefined && (entry.run.turnId ?? null) !== expectedTurnId) throw new Error(`任务 ${runId} 已进入其他执行轮次；期望 ${expectedTurnId ?? "历史轮次"}，实际 ${entry.run.turnId ?? "历史轮次"}。`);
       if (!entry.busy && !entry.rpc && isTerminalStatus(entry.run.status)) {
         entry.messages = [];
+        await settleMessages(runId, "to-child", "closed", `任务停止：${source}`);
         entry.run.queuedMessageCount = 0;
         return structuredClone(entry.run);
       }
@@ -610,8 +680,16 @@ export async function stopRun(runId: string, source: "tool-stop" | "panel-stop" 
     const run = await readRunFresh(runId, true);
     if (!run) throw new Error("找不到任务");
     if (expectedTurnId !== undefined && (run.turnId ?? null) !== expectedTurnId) throw new Error(`任务 ${runId} 已进入其他执行轮次；期望 ${expectedTurnId ?? "历史轮次"}，实际 ${run.turnId ?? "历史轮次"}。`);
-    if (isTerminalStatus(run.status) && !hasLiveOwner(run)) return run;
+    if (isTerminalStatus(run.status) && !hasLiveOwner(run)) {
+      await reconcileMessages(run, "to-child");
+      await settleMessages(runId, "to-child", "closed", `任务停止：${source}`);
+      return run;
+    }
     if (hasLiveOwner(run)) throw new Error("任务由另一个 Pi 进程管理，请在原 Pi 中停止。");
+    await reconcileMessages(run, "to-child");
+    await settleMessages(runId, "to-child", "closed", `任务停止：${source}`);
+    if (run.pendingQuestion) await settleMessages(runId, "to-parent", "closed", `问题随任务停止：${source}`,
+      [`${runId}:${run.turnId}:question:${run.pendingQuestion.id}`]);
     const stopped: PersistedRun = {
       ...run, status: isTerminalStatus(run.status) ? run.status : "已停止", completionSource: source,
       resourceState: "released",
@@ -658,6 +736,9 @@ export async function reconcileRun(runId: string): Promise<PersistedRun | undefi
     // Historical v1/v2 records are read-only on startup. An explicit resume performs
     // the one-task migration after validating its saved session and request.
     if (!run || run.version < 3 || hasLiveOwner(run)) return run;
+    await reconcileMessages(run, "to-child");
+    if (run.pendingQuestion) await settleMessages(runId, "to-parent", "closed", "原子进程已结束，问题无法继续等待。",
+      [`${runId}:${run.turnId}:question:${run.pendingQuestion.id}`]);
     if (isTerminalStatus(run.status) && run.resourceState === "released" && !run.childPid && !run.runnerPid) return run;
     const lost: PersistedRun = {
       ...run,

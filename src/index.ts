@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { Usage } from "@earendil-works/pi-ai";
 import {
@@ -32,7 +32,7 @@ import {
   type RunnerRequest,
 } from "./runtime.ts";
 import { showAgentPanel, type AgentPanelAction } from "./ui.ts";
-import { RESULT_MESSAGE, PARENT_MESSAGE, statusLabel, taskOutput } from "./delivery.ts";
+import { RESULT_MESSAGE, statusLabel, taskOutput } from "./delivery.ts";
 import { createBackgroundDelivery } from "./background-delivery.ts";
 import { readDeckConfig, writeDeckConfig } from "./config.ts";
 import { registerConfiguration } from "./configuration-ui.ts";
@@ -41,7 +41,7 @@ import { renderFleet } from "./presentation.ts";
 import { prepareRouting } from "./routing.ts";
 import { canPrepareChildProvider, prepareChildProviders, saveChildProviders } from "./child-providers.ts";
 import { registerRouting } from "./routing-ui.ts";
-import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, taskToolResult, taskMessage, runTitle, runRoleLabel } from "./tool-contract.ts";
+import { AgentParameters, SendMessageParameters, TaskStopParameters, parseAgentInput, parseMessageInput, parseStopInput, resolveAgentRole, resolveModelOverride, taskToolResult, runTitle, runRoleLabel } from "./tool-contract.ts";
 import { resolveTaskTarget, withTaskCreation } from "./task-identity.ts";
 import { AGENT_DECK_VERSION } from "./version.ts";
 import type {
@@ -144,6 +144,7 @@ export default function agentDeck(pi: ExtensionAPI) {
   let unsubscribe: (() => void) | undefined;
   let refreshScheduled = false;
   let fleetRefresh = 0;
+  let recoveryNotice: string | undefined;
   const backgroundDelivery = createBackgroundDelivery(pi, () => activeContext);
 
   const refreshFleet = async (ctx: any): Promise<void> => {
@@ -165,6 +166,9 @@ export default function agentDeck(pi: ExtensionAPI) {
     unsubscribe?.();
     unsubscribe = subscribeRunEvents((notification) => {
       const { kind, run } = notification;
+      const delivery = kind === "result" ? backgroundDelivery.notify(run)
+        : notification.kind === "message" ? backgroundDelivery.progress(run, notification.message) : undefined;
+      void delivery?.catch(error => activeContext?.ui.setStatus("agent-deck-error", `Agent 消息记录或投递失败：${String(error)}`));
       if (run.parentSessionId !== activeContext?.sessionManager.getSessionId()) return;
       if (!refreshScheduled) {
         refreshScheduled = true;
@@ -173,15 +177,11 @@ export default function agentDeck(pi: ExtensionAPI) {
           void refreshFleet(activeContext).catch((error) => activeContext?.ui.setStatus("agent-deck-error", String(error)));
         });
       }
-      if (kind === "result") backgroundDelivery.notify(run);
-      if (notification.kind === "message") pi.sendMessage({
-        customType: PARENT_MESSAGE,
-        content: taskMessage(run, `子 Agent 消息：\n${notification.message.message}`),
-        display: true,
-        details: { taskId: run.runId, turnId: run.turnId, messageId: notification.message.id },
-      }, { deliverAs: "followUp", triggerTurn: true });
     });
     await reconcileRuns(ctx.sessionManager.getSessionId());
+    const warnings = await backgroundDelivery.recover(await listRuns(Number.MAX_SAFE_INTEGER, ctx.sessionManager.getSessionId()));
+    recoveryNotice = warnings.length ? `Agent 消息恢复核对：\n${warnings.join("\n")}\n消息记录提供当前投递证据；已消费表示进入接收方上下文，任务完成情况以交付与验收为准。待核实消息可结合原会话确定后续处理。` : undefined;
+    if (recoveryNotice) ctx.ui.notify(recoveryNotice, "warning");
     await refreshFleet(ctx);
   });
 
@@ -189,11 +189,30 @@ export default function agentDeck(pi: ExtensionAPI) {
     unsubscribe?.();
     unsubscribe = undefined;
     activeContext = undefined;
+    recoveryNotice = undefined;
     backgroundDelivery.reset();
     await shutdownRuns();
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => { refreshAgentTool(ctx); });
+  pi.on("before_agent_start", async (_event, ctx) => {
+    refreshAgentTool(ctx);
+    const content = recoveryNotice;
+    recoveryNotice = undefined;
+    if (content) return { message: { customType: "agent-deck-recovery", content, display: true } };
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    if (!["Agent", "SendMessage"].includes(event.toolName) || event.isError) return;
+    const details = event.details as { run?: PersistedRun } | undefined;
+    const run = details?.run;
+    if (!run || run.parentSessionId !== ctx.sessionManager.getSessionId()) return;
+    const deliveryId = await backgroundDelivery.recordToolResult(run);
+    if (deliveryId) return { details: { ...details, deliveryId } };
+  });
+
+  pi.on("message_end", async (event, ctx) => {
+    await backgroundDelivery.consume(event.message, ctx.sessionManager.getSessionId());
+  });
 
   pi.registerMessageRenderer("agent-created", (message, _options, theme) =>
     new Text(`${theme.fg("success", "✓ ")}${typeof message.content === "string" ? message.content : "Agent 已创建"}`, 0, 0));
@@ -224,13 +243,15 @@ export default function agentDeck(pi: ExtensionAPI) {
       await reconcileRun(run.runId);
       const gate = backgroundDelivery.acquire(run.runId);
       try {
-        const sent = await sendToRun(run.runId, params.message, params.summary, params.reply_to);
+        const messageId = `m-${createHash("sha256").update(`${ctx.sessionManager.getSessionId()}:${_id}`).digest("hex")}`;
+        const sent = await sendToRun(run.runId, params.message, params.summary, params.reply_to, messageId);
         const current = (await readRun(run.runId)) ?? sent.run;
         backgroundDelivery.release(current, gate);
-        const receipt = sent.delivery === "resumed" ? "已恢复原 Pi 子会话，在后台继续执行。"
-          : sent.delivery === "answered" ? "回答已交付，子 Agent 在原会话继续。" : "消息已接收或排队，将在 Pi 消息边界送入。";
+        const receipt = sent.delivery === "existing" ? `消息已有记录，状态：${sent.messageState}。`
+          : sent.delivery === "resumed" ? "已恢复原 Pi 子会话，在后台继续执行。"
+          : sent.delivery === "answered" ? "回答已提交，子 Agent 在原会话继续处理。" : "消息已保存并排队，将在 Pi 消息边界送入。";
         return taskToolResult(current, current.pendingQuestion || isTerminalStatus(current.status) || current.status === "停止未确认"
-          ? taskOutput(current) : `${receipt} 摘要：${params.summary}${current.deliveryMode === "background" ? `\n${BACKGROUND_WAIT}` : ""}`, sent.delivery);
+          ? `${receipt}\n\n${taskOutput(current)}` : `${receipt} 摘要：${params.summary}${current.deliveryMode === "background" ? `\n${BACKGROUND_WAIT}` : ""}`, sent.delivery, sent.messageId);
       } catch (error) {
         backgroundDelivery.discard(run.runId, gate);
         throw error;

@@ -228,11 +228,12 @@ test("新建与消息续接保留完整要求，历史标题与本轮标题分�
   assert.equal(resumed.objective, first.objective);
   assert.equal(resumed.description, "续接标题");
   assert.equal(resumed.instruction, prompt);
-  assert.equal(resumed.finalText, prompt);
+  const messageId = sent.details.publicResult.messageId;
+  assert.equal(resumed.finalText, `[agent-deck-message:${messageId}]\n${prompt}`);
   assert.equal(resumed.childSessionPath, first.childSessionPath);
   assert.notEqual(resumed.turnId, first.turnId);
   const request = JSON.parse(await fs.readFile(path.join(runDirectory(id), "request.json"), "utf8"));
-  assert.equal(request.prompt, prompt);
+  assert.equal(request.prompt, `[agent-deck-message:${messageId}]\n${prompt}`);
   const history = await readCompletions(runDirectory(id));
   assert.equal(history.find((turn) => turn.turnId === first.turnId)?.description, "调用方标题");
   assert.equal(history.find((turn) => turn.turnId === resumed.turnId)?.instruction, prompt);

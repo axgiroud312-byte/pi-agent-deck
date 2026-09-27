@@ -56,7 +56,7 @@ export interface RunDetails extends TaskIdentity {
   version: 1 | 2 | 3;
   turnId?: string;
   resourceState?: ResourceState;
-  /** Informational count only; messages themselves are never persisted or replayed. */
+  /** Current process's unsent buffer size; messages.json owns durable delivery evidence. */
   queuedMessageCount?: number;
   /** Current turn's caller-supplied title, or a derived summary. */
   description?: string;
@@ -79,6 +79,8 @@ export interface RunDetails extends TaskIdentity {
   legacy?: LegacyRunView;
   events: RunEvent[];
   finalText?: string;
+  /** Absolute path to this turn's complete Markdown result, set after durable persistence. */
+  reportPath?: string;
   /** One live Pi RPC question; the answer is recorded by Pi as a tool result. */
   pendingQuestion?: { id: string; message: string };
   /** Caller/cause of the completion or cleanup notification; not the delivery outcome. */

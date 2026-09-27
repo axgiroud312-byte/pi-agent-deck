@@ -52,7 +52,7 @@ if(q.type==="prompt"||q.type==="steer"){if(busy)queue.push(q.message);else start
   }
 });
 
-test("结束边界上的补充只暂存，明确 resume 后再执行", async (t) => {
+test("结束后的补充通过 SendMessage 自动续接原会话", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "deck-review-settle-"));
   const id = "review-" + randomUUID();
   t.after(async () => { await shutdownRuns(id); await fs.rm(cwd, { recursive: true, force: true }); });
